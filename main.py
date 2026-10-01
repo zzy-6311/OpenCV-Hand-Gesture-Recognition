@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """视频处理骨架：图像/摄像头输入 -> 插件式中间处理 -> 窗口显示。
 
 设计目标
@@ -58,15 +58,60 @@ import numpy as np
 
 # --- 输入源 -----------------------------------------------------------------
 # "image"  = 读磁盘单张图片，循环反复处理（调算法时用这个）
-# "camera" = 原来的摄像头路径
+# "camera" = 摄像头实时采集
+# "video"  = 读磁盘上的**视频文件**（走和摄像头同一条 cv2.VideoCapture 路径，
+#            区别只在"读到结尾怎么办"，见下面的 VIDEO_LOOP）
 SOURCE = "image"
 
+# --- 视频文件模式（SOURCE = "video" 时生效）---------------------------------
+VIDEO_FILE = "gesture.mp4"             # 相对本文件所在目录；也可写绝对路径
+VIDEO_LOOP = True                      # True = 播完从头循环；False = 播完自动退出
+# 视频模式下每帧的等待时间：用 FRAME_DELAY_MS_CAMERA(=1)，让处理速度决定节奏。
+# 实测 1920x1440 下整条链约 62~72 ms/帧（约 14 fps）—— 见文件末尾的性能说明。
+
+# --- 手势素材数据集 ---------------------------------------------------------
+# 中国式数字手势素材。目前有**两组**：
+#   第一组  gesture_<NN>.jpg        白板干净、环境简洁
+#   第二组  gesture_<NN>_busy.jpg   同样手势，但白板周围环境更斑驳/杂
+# 两组放在同一行，方便直接对比"背景变杂之后算法有没有受影响"。
+# 按 n / p 浏览时会两组交替出现（00 → 00_busy → 01 → 01_busy …），正好对着看。
+#
+# 每项是 (手势编号, 这个手势是怎么比的, 样张文件名元组)。
+#
+# ★ 编号沿用你拍照时的编号，没改 —— 它直接当分类的标签用。
+# ★ 第 2 列（手势说明）是我**按照片实际内容**写的。如果和你的本意不符，
+#   只改文字就行，文件名不用动。
+# ★ 加新样张：在对应手势的元组里追加文件名即可，命名沿用
+#   gesture_<两位数编号>[_<场景>].jpg。
+#
+# ⚠️ gesture_03 和 gesture_33 是**两个不同的手势**（放大确认过）：
+#      gesture_03 = 食指 + 中指 + 无名指（拇指收在掌前）
+#      gesture_33 = 拇指 + 食指 + 中指（最左边那根是拇指）
+#    如果这其实是你同一次拍摄的两张、想算同一个手势，
+#    把 gesture_33* 那两行并到编号 3 的元组里就行。
+#
+# （第二组最初把"8"的文件名误写成了 7.jpg，已按你确认改为 gesture_08_busy.jpg，
+#   所以现在 9 个编号两组齐全，共 18 张。）
+GESTURE_SAMPLES = (
+    (0,  "握拳",                  ("gesture_00.jpg", "gesture_00_busy.jpg")),
+    (1,  "只伸食指",              ("gesture_01.jpg", "gesture_01_busy.jpg")),
+    (2,  "食指+中指（剪刀）",      ("gesture_02.jpg", "gesture_02_busy.jpg")),
+    (3,  "三指（西式：食+中+无名）", ("gesture_03.jpg", "gesture_03_busy.jpg")),
+    (4,  "四指",                  ("gesture_04.jpg", "gesture_04_busy.jpg")),
+    (5,  "五指张开",              ("gesture_05.jpg", "gesture_05_busy.jpg")),
+    (6,  "点赞（只伸拇指）",       ("gesture_06.jpg", "gesture_06_busy.jpg")),
+    (8,  "手枪（拇指+食指）",      ("gesture_08.jpg", "gesture_08_busy.jpg")),
+    (33, "三指（中式：拇+食+中）",  ("gesture_33.jpg", "gesture_33_busy.jpg")),
+)
+
 # 图片模式下要处理的图片（相对本文件所在目录）。按 n / p 在列表里循环切换。
-# 列表里不存在的文件会在启动时提示并跳过；一个都没有就直接报错退出。
-IMAGE_FILES = [
-    "shou1.png",
-    "shou2.png",
-]
+# 直接由上面的手势素材表展平而来 —— 这样只有一处需要维护，
+# 加素材只改 GESTURE_SAMPLES。老的 shou1/shou2（布背景、五指张开）
+# 放在最后，留着当"难例"做对比。
+IMAGE_FILES = (
+    [name for _label, _desc, names in GESTURE_SAMPLES for name in names]
+    + ["shou1.png", "shou2.png"]
+)
 IMAGE_START_INDEX = 0                  # 启动时先用列表里的第几张（从 0 开始）
 
 # --- 插件工作分辨率 ---------------------------------------------------------
@@ -84,6 +129,20 @@ CAMERA_INDEX = 0
 CAPTURE_WIDTH = 2560                   # 期望采集宽度（2K）
 CAPTURE_HEIGHT = 1440                  # 期望采集高度（2K）
 CAPTURE_FPS = 30.0
+
+# --- 图片载入时的降采样（"压到 2K"）------------------------------------------
+# 相机/手机的原图往往 4000x3000 以上，整条链直接跑会很慢：
+#   实测 4096x3072 要 360~470 ms/帧，而 2560x1440 只要 ~139 ms。
+# 这里在**载入的时候压一次**，之后每帧都直接用压好的小图，不会重复计算。
+#
+# 规则：按 (IMAGE_MAX_WIDTH, IMAGE_MAX_HEIGHT) 装框，**保持宽高比**，只缩不放。
+#   4096x3072 -> 1920x1440    （4:3 装进 16:9 的框，受高度限制）
+#   2560x1440 -> 原样不动      （本来就在框内）
+# 所以老的 shou1/shou2.png 不受影响。
+#
+# 想改大小就改这两个数（比如两个都乘 2 就回到全分辨率）。
+IMAGE_MAX_WIDTH = 2560
+IMAGE_MAX_HEIGHT = 1440
 
 DISPLAY_WIDTH = 1280                   # 显示窗口宽度（720p）
 DISPLAY_HEIGHT = 720                   # 显示窗口高度（720p）
@@ -226,6 +285,27 @@ class PluginRegistry:
 # ---------------------------------------------------------------------------
 # 图片输入：读单张图，循环反复交给流水线（用于算法调试）
 # ---------------------------------------------------------------------------
+def fit_within(image: np.ndarray, max_width: int, max_height: int) -> np.ndarray:
+    """把图片按比例缩到 (max_width, max_height) 这个框内。只缩不放。
+
+    **保持宽高比**（这一点很重要）：绝对不能用 cv2.resize 直接拉到固定尺寸，
+    那样会把 4:3 的图压成 16:9，手部被非等比拉伸，后面所有"按 R 归一化"的
+    长度判据都会失真。
+
+    用 INTER_AREA 而不是默认的 INTER_LINEAR：缩小时 INTER_AREA 是抗混叠的，
+    等价于先低通再抽取，不会在掩膜上产生锯齿/摩尔纹。
+    """
+    height, width = image.shape[:2]
+    if width <= 0 or height <= 0:
+        return image
+    scale = min(float(max_width) / float(width), float(max_height) / float(height))
+    if scale >= 1.0:                      # 本来就在框内，原样返回
+        return image
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+
 class ImageSource:
     """把磁盘上的图片伪装成"视频源"，接口与 ``cv2.VideoCapture`` 对齐。
 
@@ -264,7 +344,7 @@ class ImageSource:
 
     # --- 载入 ---
     def load(self, path: Optional[str] = None) -> bool:
-        """载入指定图片（默认当前张）。成功返回 True，失败保留原图并返回 False。"""
+        """载入指定图片（默认当前张），并按 IMAGE_MAX_* 压到 2K。成功返回 True。"""
         target = path if path is not None else self.current_path
         if not target:
             self.message = "没有可用的图片路径"
@@ -275,10 +355,18 @@ class ImageSource:
             self.message = "读不到图片：%s" % target
             return False
 
+        original_h, original_w = image.shape[:2]
+        image = fit_within(image, IMAGE_MAX_WIDTH, IMAGE_MAX_HEIGHT)
+
         self.frame = image
         self.loaded_path = target
-        self.message = "已载入 %s  %dx%d" % (
-            os.path.basename(target), image.shape[1], image.shape[0])
+        if (image.shape[1], image.shape[0]) != (original_w, original_h):
+            self.message = "已载入 %s  %dx%d -> 压到 %dx%d" % (
+                os.path.basename(target), original_w, original_h,
+                image.shape[1], image.shape[0])
+        else:
+            self.message = "已载入 %s  %dx%d" % (
+                os.path.basename(target), image.shape[1], image.shape[0])
         return True
 
     # --- 与 VideoCapture 对齐的接口 ---
@@ -442,7 +530,11 @@ def step_roi_outline(frame: np.ndarray, state: FrameState) -> np.ndarray:
 
 
 def step_info_overlay(frame: np.ndarray, state: FrameState) -> np.ndarray:
-    """在左上角显示采集分辨率、显示分辨率、FPS、帧号与插件数量。"""
+    """在**右上角**显示采集分辨率、显示分辨率、FPS、帧号与插件数量。
+
+    ⚠️ 原来画在左上角，会和插件里那块"手势分类"面板叠在一起（实测严重重叠）。
+       挪到右上角，两边各占一边，互不干扰。
+    """
     if not state.show_overlay:
         return frame
     lines = [
@@ -454,12 +546,40 @@ def step_info_overlay(frame: np.ndarray, state: FrameState) -> np.ndarray:
     ]
     if state.paused:
         lines.append("PAUSED")
-    height = frame.shape[0]
+
+    height, width = frame.shape[:2]
+    scale = 0.6
+    thickness = 1
+    line_h = 24
+    pad = 10
+    text_w = max(cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0]
+                 for t in lines)
+    panel_w = text_w + pad * 2
+    panel_h = line_h * len(lines) + pad * 2
+    x1 = width - 12
+    x0 = max(0, x1 - panel_w)
+    y0 = 12
+    y1 = min(height, y0 + panel_h)
+
+    # 半透明底衬，白底/花背景上也能看清
+    region = frame[y0:y1, x0:x1]
+    dark = np.full_like(region, 16)
+    cv2.addWeighted(region, 0.38, dark, 0.62, 0.0, dst=region)
+    cv2.rectangle(frame, (x0, y0), (x1 - 1, y1 - 1), (95, 95, 95), 1)
+
     for line_index, text in enumerate(lines):
-        cv2.putText(frame, text, (12, 26 + line_index * 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(frame, "q quit / space pause / d overlay / m mirror / f fullscreen",
-                (12, height - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+        color = (0, 140, 255) if text == "PAUSED" else (0, 255, 0)
+        baseline = y0 + pad + line_h * line_index + 18
+        cv2.putText(frame, text, (x0 + pad, baseline), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.putText(frame, text, (x0 + pad, baseline), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, thickness, cv2.LINE_AA)
+
+    # 底部按键提示（整宽，单独一条，和上面的面板不冲突）
+    hint = "q quit | space pause | 1-6 view | d overlay | m mirror | r ROI | f fullscreen | l plugins"
+    cv2.putText(frame, hint, (12, height - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(frame, hint, (12, height - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (230, 230, 230), 1, cv2.LINE_AA)
     return frame
 
@@ -560,6 +680,35 @@ def _prepare_window() -> None:
     cv2.waitKey(1)
 
 
+def _draw_paused_badge(frame: np.ndarray) -> None:
+    """在画面上方中央画一个 PAUSED 提示（就地修改）。
+
+    ⚠️ 为什么需要它：暂停时主循环不重绘，画面完全冻结 —— 用户分不清
+       "按了空格暂停"和"程序卡死"，而且按 n 换图也看不到任何变化
+       （终端提示变了、画面纹丝不动，这是实际踩到的坑）。
+       有了这个标记，暂停状态一眼可见。
+    """
+    text = "PAUSED   (press space to resume)"
+    scale, thickness = 0.85, 2
+    (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX,
+                                          scale, thickness)
+    height, width = frame.shape[:2]
+    x0 = max(0, (width - text_w) // 2 - 18)
+    x1 = min(width, x0 + text_w + 36)
+    y0 = 66
+    y1 = min(height, y0 + text_h + 28)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return
+    region = frame[y0:y1, x0:x1]
+    dark = np.full_like(region, 20)
+    cv2.addWeighted(region, 0.35, dark, 0.65, 0.0, dst=region)
+    cv2.rectangle(frame, (x0, y0), (x1 - 1, y1 - 1), (0, 165, 255), 2)
+    cv2.putText(frame, text, (x0 + 18, y1 - 14), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+    cv2.putText(frame, text, (x0 + 18, y1 - 14), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (0, 165, 255), thickness, cv2.LINE_AA)
+
+
 def _set_fullscreen(enabled: bool) -> None:
     """切换全屏；退出全屏时恢复成与图像等大的窗口。"""
     if enabled:
@@ -654,6 +803,7 @@ def main() -> int:
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     source_kind = SOURCE.strip().lower()
+    is_video = (source_kind == "video")
 
     cap: Optional[cv2.VideoCapture] = None
     image_source: Optional[ImageSource] = None
@@ -674,6 +824,25 @@ def main() -> int:
         print("[image] %s" % image_source.message)
         print("[image] 循环处理同一张；n 下一张，p 上一张，R 从磁盘重载")
         frame_delay_ms = FRAME_DELAY_MS_IMAGE
+    elif is_video:
+        video_path = VIDEO_FILE if os.path.isabs(VIDEO_FILE) \
+            else os.path.join(base_dir, VIDEO_FILE)
+        if not os.path.exists(video_path):
+            print("[error] 视频文件不存在：%s" % video_path)
+            print("        改 VIDEO_FILE，或把 SOURCE 换回 \"image\"。")
+            return 1
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("[error] 打不开视频：%s（编码可能不被 OpenCV 支持）" % video_path)
+            return 1
+        video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print("[video] %s  %dx%d  %.1f fps  共 %d 帧"
+              % (os.path.basename(video_path),
+                 int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                 int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                 cap.get(cv2.CAP_PROP_FPS), video_frames))
+        print("[video] %s" % ("播完自动循环" if VIDEO_LOOP else "播完自动退出"))
+        frame_delay_ms = FRAME_DELAY_MS_CAMERA
     else:
         try:
             cap = open_camera()
@@ -703,15 +872,20 @@ def main() -> int:
     recent_dt: collections.deque = collections.deque(maxlen=30)   # 用于平滑算 FPS
     last_time = time.perf_counter()
     failures = 0                           # 连续读帧失败计数
+    last_displayed: Optional[np.ndarray] = None    # 最近一次真正送进窗口的画面
+    paused_view: Optional[np.ndarray] = None       # 暂停时用来画 PAUSED 的复用缓冲
+    refresh_requested = False              # 暂停时按 n/p/R 也要强制刷新一帧
     print("[main] 按键：q 退出，空格暂停，1~6 切换显示模式，d 叠加，m 镜像，r ROI限制，f 全屏，l 列出插件"
           + ("，n/p 换图，R 重载" if image_source is not None else ""))
 
     try:
         while True:
-            # 5.0 暂停时跳过取帧和处理，但仍然往下走到 waitKey ——
-            #     否则界面不泵事件，按键会彻底没反应（这正是之前"暂停像死机"的原因）。
-            #     窗口会保留最后一帧画面。
-            if not state.paused:
+            # 5.0 这一轮要不要处理一帧？
+            #     没暂停                  -> 正常处理
+            #     暂停了、但刚按过 n/p/R   -> 也处理一帧，否则换了图看不到变化
+            #     （实际踩过的坑：暂停时按 n，终端文件名变了、画面纹丝不动）
+            if (not state.paused) or refresh_requested:
+                refresh_requested = False
                 # 5.1 取一帧原始图
                 if image_source is not None:
                     ok, raw = image_source.read()
@@ -722,6 +896,14 @@ def main() -> int:
                 else:
                     ok, raw = cap.read()
                     if not ok or raw is None or raw.size == 0:
+                        # 视频文件读到结尾：要么回到第一帧，要么退出
+                        if is_video:
+                            if VIDEO_LOOP:
+                                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                time.sleep(0.02)      # 防止 seek 失败时空转
+                                continue
+                            print("[video] 播放结束")
+                            return 0
                         failures += 1
                         if failures >= MAX_CONSECUTIVE_READ_FAILURES:
                             print("[error] 连续 %d 帧读取失败，退出" % failures)
@@ -758,12 +940,23 @@ def main() -> int:
                 frame = registry.run(frame, state)
                 # 5.5 有可显示的帧就送进窗口（窗口是 NORMAL，大图会按比例缩放进 1280x720）
                 if frame is not None:
+                    last_displayed = frame
                     cv2.imshow(WINDOW_NAME, frame)
 
                 # 5.6 帧号加一，然后处理键盘：waitKey 需要每帧调用一次来驱动界面事件。
             #     图片模式下用较大的延时，既避免空转烧 CPU，也保证按键能响应。
                 # 只有真正处理过一帧，帧号才加一（暂停时不涨）
                 state.index += 1
+            else:
+                # 5.6b 暂停中：**也要重绘**。
+                #      以前暂停就完全不 imshow，结果画面冻结、连"PAUSED"都画不出来，
+                #      用户分不清是暂停还是卡死；按 n 换图也只是终端变了、画面不动。
+                if last_displayed is not None:
+                    if paused_view is None or paused_view.shape != last_displayed.shape:
+                        paused_view = np.empty_like(last_displayed)
+                    np.copyto(paused_view, last_displayed)
+                    _draw_paused_badge(paused_view)
+                    cv2.imshow(WINDOW_NAME, paused_view)
 
             # 5.7 键盘。这一句在 if 外面，暂停时也要执行，否则界面会僵住。
             key = cv2.waitKey(frame_delay_ms) & 0xFF
@@ -776,7 +969,9 @@ def main() -> int:
                     image_source.step(-1)
                 else:
                     image_source.reload()
-                print("[image] %s" % image_source.message)
+                print("[image] %s%s" % (image_source.message,
+                                        "  [暂停中，已强制刷新一帧]" if state.paused else ""))
+                refresh_requested = True      # ★ 暂停时也要立刻把新图显示出来
                 continue
 
             # 5.9 _handle_key：把按键翻译成开关动作；返回 "quit"/"fullscreen" 时需额外处理

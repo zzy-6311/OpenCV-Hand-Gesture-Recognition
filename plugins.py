@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """外部插件模块：ROI 限制 + 灰度上下双阈值区间二值化。
 
 main.py 会自动 import 本文件并调用 ``register(api)``，把这里注册的处理函数
@@ -16,6 +16,8 @@ main.py 会自动 import 本文件并调用 ``register(api)``，把这里注册�
 """
 
 from __future__ import annotations
+
+import os
 
 import cv2
 import numpy as np
@@ -234,6 +236,34 @@ RECON_FILL_HOLES = True         # 重建后填内部孔洞
 RECON_MIN_SEED_PIXELS = 40      # 种子小于这么多像素就放弃重建（返回原掩膜）
 RECON_MIN_RADIUS_PX = 8         # 掌心半径小于此值也放弃
 
+# --- ★ 掌心估计的稳健化（闭运算副本）----------------------------------------
+# ⚠️ 为什么需要这一步：
+#    重建那一步是按"颜色接近掌心核心"筛的，有时会把掌区**割出一道口子**。
+#    这时最大内切圆只能塞进半块掌，**R 被严重低估** ——
+#    实测 gesture_03_busy：算出来 R=96，而按手掌实际大小应该在 163 左右。
+#    R 是全流程的归一化基准，低估 40% 等于所有"以 R 为单位"的门槛都松了 40%，
+#    理论上足以让握拳的指节凸起重新越界、被误判成指尖。
+#
+# ★ 修法：**闭运算只作用在一份副本上，专门用来估掌心**。
+#    这样两个互相打架的需求就解耦了：
+#        估 R 要"手掌实心"    -> 闭运算帮忙
+#        找指尖要"指缝锋利"  -> 指尖检测仍用**原始掩膜**，一点没动
+#
+# ⚠️ 千万不要图省事，直接对掩膜做闭运算再交给指尖检测 —— 实测不行：
+#      把口子合上需要核 ≈25px，而 shou1 的手指缝在核 ≈21px 时就被糊住了，
+#      "合口子"和"粘手指"两个区间重叠，**没有安全区间**。
+#    只用来估掌心就没有这个问题：实测 20 张素材里，核取 11~41 都是 0 错误，
+#    而且对健康图几乎无扰动（R 只差 −5%~+1%），只把坏的那张修好（+60%）。
+# ★ 核大小按**掩膜面积**算，不按 R 算 —— 这一点是实测踩出来的关键：
+#    R 本身就是"可能被低估"的那个量（掩膜被割口子时最大内切圆只能塞进半块掌）。
+#    拿错的 R 去定核，核就不够大、口子合不上，成了鸡生蛋。
+#    而**掩膜面积**几乎不受割口影响（割掉一小块对面积影响很小），
+#    所以用等效半径 sqrt(面积/π) 当尺度是稳的。实测（20 张素材）：
+#      按 R 取核（0.13*R）      -> 03_busy 核只有 12，R 仍是 103，没修好
+#      按面积取核（0.13*sqrt(A/pi)）-> 核 29，R 恢复到 162.6，修好
+#    这一规则下核大小落在 26~41，正好在"已验证安全区间"内，20 张手指数 0 错误。
+RECON_PALM_CLOSE_RATIO = 0.13   # 核边长 = 该比例 × 掩膜等效半径 sqrt(面积/π)，随尺度自适应
+
 # ---------------------------------------------------------------------------
 #  ★ 上面这组值的实测依据（shou1.png，TOL_CR=12 固定，只扫 TOL_Y_DOWN）★
 #
@@ -293,7 +323,26 @@ RECOG_TRUNCATE_LINE_HALF = 1.6     # ★只影响"截断线画多长"（× R）�
                                    #   截断本身是半平面（见 _truncate_forearm），
                                    #   那根线只是画出来给你看，画 8R 长会横穿整个画面。
 
-RECOG_TIP_MIN_DISTANCE = 1.25      # 指尖到掌心至少这么多 R（低于此的不算指尖）
+RECOG_TIP_MIN_DISTANCE = 1.0       # 指尖到掌心至少这么多 R（粗筛，防止明显不对的候选）
+                                   # ★ 真正的"是不是手指"判据是下面的**凸出长度**，
+                                   #   不要只靠这个距离门槛 —— 它单独用会两头不讨好：
+                                   #     调到 1.25：拳头的指节凸起（1.26~1.33R）会被误收
+                                   #     调到 1.60：短手指（小指）的真指尖会被误杀
+                                   #   两者在"到掌心距离"这一维上是**重叠**的，
+                                   #   必须靠凸出长度这个正交判据来分（见 _protrusion_length）。
+# ★★ 凸出长度：从指尖朝掌心走，量到"变厚成掌"为止的距离（按 R 归一化）。
+#     真手指（哪怕很短的）都是**细长凸出** -> 凸出长度大
+#     指节凸起/圆钝鼓包 -> 一出指尖就变厚 -> 凸出长度小
+#     "变厚"的判据用内部距离变换：厚度 >= RECOG_TIP_PALM_THICK * R 就算进了掌区。
+RECOG_TIP_PALM_THICK = 0.45        # 厚度达到这个比例（× R）就算"已经是掌"
+RECOG_TIP_PROTRUSION_MIN = 1.45    # 凸出长度下限（× R）。低于此的不算手指
+                                   # ★ 实测"真/假"之间有个干净间隙：
+                                   #     假（指节凸起等）0.67 ~ 1.33 R
+                                   #     真（指尖，含很短的小指）1.53 ~ 2.33 R
+                                   #   在间隙里扫过，1.35~1.50 是一个**稳定平台**
+                                   #   （11 张素材里 10 张手指数正确），取中间值。
+                                   #   1.30 会把拳头的指节凸起（1.33R）放进来；
+                                   #   1.55 会把拇指（1.53~1.55R）切掉。
 RECOG_TIP_PEAK_WINDOW = 0.45       # 找"距离剖面局部极大"的窗口（× R）
 RECOG_TIP_MIN_PROMINENCE = 0.20    # 局部极大的突出度下限（× R）
 RECOG_TIP_MIN_TURN_RATIO = 0.10    # 转折比（弯曲深度/弦长）下限，越小越尖
@@ -316,6 +365,51 @@ RECOG_GAP_DEDUP = 0.35             # 指缝去重距离（× R）
 RECOG_GAP_MAX_COUNT = 5            # 最多留几条指缝
 
 RECOG_MASK_TRUNCATE = True         # 模式 5 是否显示"截断后（只剩手）"的掩膜
+
+
+# ===========================================================================
+#
+#   ★★★★★  第七部分：手势分类（数字）就在这里改  ★★★★★
+#
+# ===========================================================================
+#
+#  分类用两个特征，都是**从图像算出来的**，没有任何按文件名/张号的映射：
+#
+#  特征① 伸出了几根手指（n）—— 主特征
+#  特征② 每根伸出的手指"偏离掌轴多少度" —— 用来认拇指
+#
+#  ── 为什么主特征选"根数" ────────────────────────────────────────────────
+#  ★ 这样 3 和 33 才能**自动归为同一类**：
+#      gesture_03 = 食指+中指+无名指（3 根）
+#      gesture_33 = 拇指+食指+中指（3 根）
+#    手指组合不同、但**根数都是 3** —— 零特判自然合并。
+#    反过来说，主特征如果选"哪几根手指"，反而会把它俩拆成两类。
+#
+#  ── 为什么还需要特征② ──────────────────────────────────────────────────
+#  ★ 数字 6 是"点赞"= **只伸拇指**，而数字 1 是"只伸食指"，**都是 1 根手指**。
+#    必须知道伸的是拇指还是食指，所以要比"这根手指偏不偏"：
+#      食指/中指/无名指 -> 基本沿掌轴朝上（偏离小）
+#      拇指 / 小指       -> 明显偏侧向      （偏离大）
+#    实测偏离角（相对"向上"方向）：
+#      食指  8.3°   中指 7~18°   无名指 2~17°    <- 朝上这一组
+#      拇指 49~60°  小指 37~52°                  <- 侧向这一组
+#    两组的间隙在 37~49 之间，取 45° 当门槛，两边都留了余量。
+#    注意：这个判据可靠地区分的是**拇指**（小指在门槛附近摇摆，但不影响判定，
+#    因为需要认小指的场合目前没有）。
+#
+#  ── 判定表 ─────────────────────────────────────────────────────────────
+#      n = 0                     -> 0   握拳
+#      n = 1  该指偏侧向(=拇指)   -> 6   点赞
+#             否则(=食指)        -> 1
+#      n = 2  没有侧向手指        -> 2   剪刀（食指+中指）
+#             有一根侧向(=拇指)   -> 8   手枪（拇指+食指）
+#             两根都侧向          -> 未知（拇指+小指，不在当前手势集里）
+#      n = 3                     -> 3   ★ 3 和 33 都落这里
+#      n = 4                     -> 4
+#      n >= 5                    -> 5
+# ---------------------------------------------------------------------------
+GESTURE_LATERAL_DEVIATION_DEG = 45.0   # 偏离掌轴超过这个角度就算"侧向手指"（拇指/小指）
+GESTURE_MAX_FINGERS = 5                # 手指数上限（超过按 5 算）
 # ===========================================================================
 
 
@@ -656,6 +750,38 @@ def step_mask_cleanup(frame: np.ndarray, state) -> np.ndarray:
 # ===========================================================================
 # 掌心重建：宽阈值保召回，再用"和掌心颜色相近"把不是手的筛掉
 # ===========================================================================
+def _estimate_palm_robust(mask: np.ndarray):
+    """估掌心 (C, R)：先对**一份副本**做闭运算，再取最大内切圆。
+
+    为什么这么做（完整理由见配置区 RECON_PALM_CLOSE_RATIO 的注释）：
+    掩膜可能被割出口子，直接用会让最大内切圆只能塞进半块掌、R 被严重低估。
+    闭运算把口子合上，R 就准了。
+
+    ★ **不会修改传入的 mask** —— 闭运算只在内部副本上做，
+      所以调用方手里的掩膜（拿去找指尖的）仍然是"指缝锋利"的原样。
+
+    ★ **核大小按掩膜面积算，不按 R 算**：R 正是可能被低估的量，用它定核会
+      陷入"核不够大 -> 口子合不上 -> R 还是小的"鸡生蛋。面积则几乎不受割口影响。
+
+    返回 ``((cx, cy), R)``。
+    """
+    area = int(np.count_nonzero(mask))
+    if area <= 0:
+        return (0, 0), 0.0
+    scale = float(np.sqrt(float(area) / np.pi))       # 等效半径，抗割口
+    size = int(round(float(RECON_PALM_CLOSE_RATIO) * scale))
+    if size >= 3:
+        if size % 2 == 0:
+            size += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+        work = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    else:
+        work = mask
+    distance = cv2.distanceTransform(work, cv2.DIST_L2, 5)
+    _, radius, _, location = cv2.minMaxLoc(distance)
+    return (int(location[0]), int(location[1])), float(radius)
+
+
 def step_palm_reconstruct(frame: np.ndarray, state) -> np.ndarray:
     """从掌心核心做「颜色约束重建」，得到干净的手部掩膜。
 
@@ -730,11 +856,21 @@ def step_palm_reconstruct(frame: np.ndarray, state) -> np.ndarray:
     if RECON_FILL_HOLES:
         result = _fill_internal_holes(result)
 
-    # ---- 7) 统计 ----
+    # ---- 7) 用"闭运算副本"重新估一次掌心 ----
+    #   ★ 这是修复"R 被低估"的关键一步。
+    #   ⚠️ 种子和重建用的仍是上面那个**未闭运算**的掌心 —— 不能换：
+    #      种子必须落在实际掩膜的厚区里；若用闭运算后的大 R，
+    #      "DT >= 0.7*R" 会直接落空（实测 03_busy 就会种不出东西）。
+    #      所以这里只把**报出去的**掌心换成稳健版，供 hand_recognize 使用。
+    (palm_cx, palm_cy), palm_radius = _estimate_palm_robust(result)
+
+    # ---- 8) 统计 ----
     segment_stats = dict(state.flags.get("segment_stats") or {})
     segment_stats["reconstructed"] = True
-    segment_stats["palm_center"] = (cx, cy)
-    segment_stats["palm_radius"] = float(radius)
+    segment_stats["palm_center"] = (palm_cx, palm_cy)
+    segment_stats["palm_radius"] = float(palm_radius)
+    # 闭运算前的粗估 R 也留着：两者差很多就说明"掩膜被割了口子、已自动补救"
+    segment_stats["palm_radius_raw"] = float(radius)
     segment_stats["seed_pixels"] = seed_pixels
     segment_stats["color_base"] = (cr0, cb0, y0)
     segment_stats["foreground_ratio"] = float(np.count_nonzero(result)) / float(result.size)
@@ -813,6 +949,37 @@ def _sample_plane(plane: np.ndarray, point: np.ndarray) -> float:
     x = int(np.clip(round(float(point[0])), 0, width - 1))
     y = int(np.clip(round(float(point[1])), 0, height - 1))
     return float(plane[y, x])
+
+
+def _protrusion_length(thickness: np.ndarray, tip_point, palm_center,
+                       radius: float) -> float:
+    """量"这根东西从指尖凸出来了多长"，按 R 归一化。
+
+    做法：从指尖沿直线朝掌心走，一路采样内部距离变换的厚度值，
+    找到**第一个"厚度 >= RECOG_TIP_PALM_THICK * R"** 的位置 —— 那里就算
+    已经进入掌区了。指尖到那里的距离就是凸出长度。
+
+    为什么需要它：真手指（哪怕小指这种很短的）都是一条**细长凸出**，
+    而拳头的指节凸起是**圆钝鼓包** —— 一出指尖厚度就上去了。
+    这个量是尺度无关的（按 R 归一化），而且语义正好就是"手指伸出来多少"。
+    """
+    tip = np.asarray(tip_point, dtype=np.float64).reshape(2)
+    palm = np.asarray(palm_center, dtype=np.float64).reshape(2)
+    total = float(np.linalg.norm(palm - tip))
+    if total < 1e-6:
+        return 0.0
+    steps = int(np.clip(total, 8, 400))
+    fractions = np.linspace(0.0, 1.0, steps)
+    xs = tip[0] + (palm[0] - tip[0]) * fractions
+    ys = tip[1] + (palm[1] - tip[1]) * fractions
+    height, width = thickness.shape[:2]
+    xi = np.clip(np.round(xs).astype(np.int32), 0, width - 1)
+    yi = np.clip(np.round(ys).astype(np.int32), 0, height - 1)
+    values = thickness[yi, xi]                 # 向量化取样，比逐点循环快得多
+    hit = np.nonzero(values >= float(RECOG_TIP_PALM_THICK) * float(radius))[0]
+    if hit.size == 0:
+        return total / float(radius)           # 一路都没变厚 -> 整条都是凸出
+    return float(fractions[int(hit[0])]) * total / float(radius)
 
 
 def _estimate_wrist(mask: np.ndarray, palm_center, radius: float):
@@ -951,12 +1118,18 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
         if angle < RECOG_TIP_MIN_ANGLE_DEG and \
                 thickness_ratio < RECOG_TIP_MIN_THICKNESS:
             continue
+        # ★主力判据：凸出长度。真手指是细长凸出，指节凸起是圆钝鼓包。
+        #   这一条同时管住了两头 —— 既排掉拳头的指节凸起，又保住很短的小指。
+        protrusion = _protrusion_length(thickness, points[index], palm_center, radius)
+        if protrusion < float(RECOG_TIP_PROTRUSION_MIN):
+            continue
         candidates.append({
             "point": points[index].copy(),
             "distance": float(distances[index]),
             "turn_ratio": float(ratio),
             "angle_deg": float(angle),
             "thickness_ratio": float(thickness_ratio),
+            "protrusion_ratio": float(protrusion),
         })
 
     # 去重：距离太近的是同一个指尖，留离掌心更远的那个
@@ -1102,15 +1275,14 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
         return None
 
     # 掌心 C 与尺度 R：优先用模式 4 已经算好的；没有就自己算一遍（兜底）
+    # 兜底这条也走"闭运算副本"的稳健估法，理由同 RECON_PALM_CLOSE_RATIO 的注释。
     segment_stats = state.flags.get("segment_stats") or {}
     palm_center = segment_stats.get("palm_center")
     radius = segment_stats.get("palm_radius")
     if palm_center is None or not radius:
-        distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-        _, radius, _, location = cv2.minMaxLoc(distance)
+        palm_center, radius = _estimate_palm_robust(mask)
         if float(radius) < float(RECON_MIN_RADIUS_PX):
             return None
-        palm_center = (int(location[0]), int(location[1]))
     palm_center = np.array([float(palm_center[0]), float(palm_center[1])], dtype=np.float64)
     radius = float(radius)
 
@@ -1185,7 +1357,7 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
 
     # 5) 尺度 R 就是 radius，直接返回，不用另算。
 
-    return {
+    result = {
         "palm_center": palm_center,
         "palm_radius": radius,
         "wrist": wrist,
@@ -1202,6 +1374,87 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
         "fingers": fingers,
         "finger_count": len(tips),
     }
+    result["gesture"] = classify_gesture(result)
+    return result
+
+
+def _lateral_deviation_deg(local) -> float:
+    """这根手指"偏离掌轴"多少度。掌轴方向（手指自然朝上的方向）在局部系里是 -90°。
+
+    食指/中指/无名指基本沿掌轴 -> 偏离小（实测 2~18°）
+    拇指 / 小指是侧向手指      -> 偏离大（实测 37~60°）
+    用环形角距，手转到大角度也不会算错。
+    """
+    angle = float(np.degrees(np.arctan2(float(local[1]), float(local[0]))))
+    return float(abs(((angle + 90.0 + 180.0) % 360.0) - 180.0))
+
+
+def _lateral_count(tips) -> int:
+    """伸出指尖里"侧向手指"（通常是拇指）的根数。"""
+    return sum(1 for t in tips
+               if _lateral_deviation_deg(t["local"]) >
+               float(GESTURE_LATERAL_DEVIATION_DEG))
+
+
+def classify_gesture(rec: dict) -> dict:
+    """把识别结果判成一个手势数字。**全部由图像算出来**，没有任何按文件名/按张号的映射。
+
+    用两个特征：
+      ① 伸出手指的**根数** n
+      ② 每根手指**偏离掌轴多少度**（用来认拇指）
+
+    判定表：
+        n=0                 -> 0  握拳
+        n=1  偏侧向(=拇指)   -> 6  点赞
+             否则(=食指)    -> 1
+        n=2  没有侧向手指    -> 2  剪刀（食指+中指）
+             有一根侧向      -> 8  手枪（拇指+食指）
+             两根都侧向      -> 未知（拇指+小指）
+        n=3                 -> 3  ★ 3 和 33 都落这里
+        n=4                 -> 4
+        n>=5                -> 5
+
+    ★ "3 和 33 归为一类"怎么做到的：主特征是**根数**，而 gesture_03
+      （食指+中指+无名指）和 gesture_33（拇指+食指+中指）都是 3 根，
+      **自然合并、零特判**。这也是主特征不能选"哪几根手指"的原因。
+
+    ★ 为什么还要特征②：数字 6 是"点赞"= **只伸拇指**，而数字 1 是"只伸食指"，
+      两者**都是 1 根手指** —— 必须知道伸的是拇指还是食指。
+    """
+    n = int(rec.get("finger_count", 0))
+    tips = rec.get("tips", [])
+    lateral = _lateral_count(tips)
+    span = float(rec.get("angle_span_deg", 0.0))
+
+    if n <= 0:
+        return {"digit": 0, "name": "握拳", "lateral": 0,
+                "reason": "伸出 0 根手指"}
+
+    if n == 1:
+        dev = _lateral_deviation_deg(tips[0]["local"]) if tips else 0.0
+        if lateral >= 1:
+            return {"digit": 6, "name": "点赞（只伸拇指）", "lateral": lateral,
+                    "reason": "1 根手指但偏离掌轴 %.0f° > %.0f° -> 是拇指不是食指"
+                              % (dev, GESTURE_LATERAL_DEVIATION_DEG)}
+        return {"digit": 1, "name": "一（只伸食指）", "lateral": lateral,
+                "reason": "1 根手指且偏离掌轴仅 %.0f° -> 沿掌轴朝上，是食指" % dev}
+
+    if n == 2:
+        if lateral == 0:
+            return {"digit": 2, "name": "剪刀（食指+中指）", "lateral": lateral,
+                    "reason": "2 根手指都沿掌轴朝上（跨度 %.0f°）-> 相邻两指" % span}
+        if lateral == 1:
+            return {"digit": 8, "name": "手枪（拇指+食指）", "lateral": lateral,
+                    "reason": "2 根手指中 1 根偏侧向（跨度 %.0f°）" % span}
+        return {"digit": None, "name": "未知（拇指+小指）", "lateral": lateral,
+                "reason": "2 根手指都是侧向手指 -> 拇指+小指，不在当前手势集里"}
+
+    digit = min(n, int(GESTURE_MAX_FINGERS))
+    note = "伸出 %d 根手指（跨度 %.0f°）" % (n, span)
+    if n == 3:
+        note += "；3 和 33 都是 3 根，归为同一类"
+    return {"digit": digit, "name": "数字 %d" % digit, "lateral": lateral,
+            "reason": note}
 
 
 def step_hand_recognize(frame: np.ndarray, state) -> np.ndarray:
@@ -1229,13 +1482,194 @@ COLOR_GAP = (255, 0, 255)        # 指缝：品红
 COLOR_LABEL = (0, 255, 0)        # 文字：绿
 COLOR_OUTLINE = (0, 0, 0)        # 文字描边：黑
 
+# --- HUD（屏幕上那块信息面板）的外观，都在这里调 ---------------------------
+HUD_MARGIN = 14                  # 面板离画面边缘多远
+HUD_PANEL_ALPHA = 0.62           # 面板底色不透明度（0=全透明，1=全黑）
+HUD_PANEL_BORDER = (95, 95, 95)  # 面板描边颜色
+HUD_TEXT_PAD_X = 16              # 面板内文字左右留白
+HUD_TEXT_PAD_Y = 12              # 面板内文字上下留白
+HUD_LINE_GAP = 8                 # 两行之间额外留的空隙
+HUD_MAX_WIDTH_RATIO = 0.46       # 面板最宽不超过画面宽度的这个比例
+
+# --- 中文字体 ---------------------------------------------------------------
+# ⚠️ cv2.putText 用的是 Hershey 矢量字体，**只支持 ASCII** —— 拿它画中文
+#    只会得到一串问号/方框。所以中文必须借 PIL 渲染。
+#    下面按顺序找，第一个存在的就用；全找不到就退回英文（并丢掉非 ASCII 字符）。
+CJK_FONT_CANDIDATES = (
+    r"C:\Windows\Fonts\msyh.ttc",       # 微软雅黑（Win7+ 基本都有）
+    r"C:\Windows\Fonts\msyhbd.ttc",     # 微软雅黑粗体
+    r"C:\Windows\Fonts\simhei.ttf",     # 黑体
+    r"C:\Windows\Fonts\simsun.ttc",     # 宋体
+    r"C:\Windows\Fonts\Deng.ttf",       # 等线
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",   # 非 Windows 兜底
+)
+_CJK_FONT_CACHE: dict = {}
+
+
+def _load_cjk_font(size: int):
+    """按需加载中文字体。找不到就返回 None（调用方必须能接受 None）。"""
+    if size in _CJK_FONT_CACHE:
+        return _CJK_FONT_CACHE[size]
+    font = None
+    try:
+        from PIL import ImageFont
+    except Exception:
+        ImageFont = None
+    if ImageFont is not None:
+        for path in CJK_FONT_CANDIDATES:
+            if os.path.exists(path):
+                try:
+                    font = ImageFont.truetype(path, int(size))
+                    break
+                except Exception:
+                    font = None
+    _CJK_FONT_CACHE[size] = font
+    return font
+
+
+def text_width(text: str, size: int) -> int:
+    """量一段文字有多宽（像素）。面板尺寸和右对齐都靠它算准。"""
+    font = _load_cjk_font(size)
+    if font is not None:
+        try:
+            return int(font.getlength(text))
+        except Exception:
+            pass
+    return int(len(text) * size * 0.62)      # 没有字体时的兜底估算
+
 
 def _put_text_outlined(image, text, origin, scale=0.7, color=COLOR_LABEL, thickness=2):
-    """带黑描边的文字，保证在黑白掩膜和彩色原图上都看得清。"""
+    """带黑描边的**英文/数字**文字（cv2 版，快）。
+
+    ⚠️ 只能画 ASCII。要画中文请用 draw_text_lines()。
+    """
     cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale,
                 COLOR_OUTLINE, thickness + 3, cv2.LINE_AA)
     cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale,
                 color, thickness, cv2.LINE_AA)
+
+
+def draw_panel(image: np.ndarray, box, alpha: float = None,
+               border=None) -> None:
+    """画一块半透明深色面板，给 HUD 文字当底衬（否则白底/花背景上字看不清）。"""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    x0 = max(0, x0); y0 = max(0, y0)
+    x1 = min(image.shape[1], x1); y1 = min(image.shape[0], y1)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return
+    region = image[y0:y1, x0:x1]
+    dark = np.full_like(region, 16)
+    cv2.addWeighted(region, 1.0 - (HUD_PANEL_ALPHA if alpha is None else alpha),
+                    dark, (HUD_PANEL_ALPHA if alpha is None else alpha),
+                    0.0, dst=region)
+    cv2.rectangle(image, (x0, y0), (x1 - 1, y1 - 1),
+                  HUD_PANEL_BORDER if border is None else border, 1)
+
+
+def draw_text_lines(image: np.ndarray, lines, origin, panel: bool = False) -> int:
+    """画多行文字，**支持中文**。返回整块画完后底部的 y 坐标。
+
+    lines: [(文字, 字号px, BGR颜色), ...]；origin 是第一行的左上角。
+    panel: True = 先在文字底下铺一块半透明面板再写字。
+
+    ★ 什么时候该用 panel：
+      小字号的中文笔画很密，**8 方向黑描边会把字内空隙填满，糊成一团黑块**。
+      这种情况用"底衬面板 + 不描边"才清楚（ROI 里那几行就是这么处理的）。
+      大字号（>=22px）可以不用面板，靠描边就够。
+
+    ★ 性能：整块只做一次 PIL 往返，而且**只转换文字覆盖的那一小块区域**。
+      如果对整幅 1920x1440 反复做 BGR<->RGB 转换，每行都要好几毫秒，
+      一屏七八行就吃掉几十毫秒 —— 视频流下这是不能接受的。
+    """
+    lines = [ln for ln in lines if ln and str(ln[0])]
+    if not lines:
+        return int(origin[1])
+
+    x0, y0 = int(origin[0]), int(origin[1])
+    sizes = [int(ln[1]) for ln in lines]
+    block_w = max(text_width(str(ln[0]), int(ln[1])) for ln in lines) + 10
+    block_h = sum(sizes) + HUD_LINE_GAP * (len(lines) - 1) + 10
+
+    bx0 = max(0, x0 - 4)
+    by0 = max(0, y0 - 4)
+    bx1 = min(image.shape[1], x0 + block_w + 4)
+    by1 = min(image.shape[0], y0 + block_h + 4)
+    if bx1 - bx0 < 2 or by1 - by0 < 2:
+        return y0 + block_h
+
+    use_pil = True
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        use_pil = False
+    if use_pil and any(_load_cjk_font(s) is None for s in sizes):
+        use_pil = False
+
+    # 底衬要在转换之前铺在**原图**上，这样文字区域才干净
+    if panel:
+        draw_panel(image, (bx0, by0, bx1, by1), alpha=0.68)
+
+    if use_pil:
+        sub = image[by0:by1, bx0:bx1]
+        pil = Image.fromarray(cv2.cvtColor(sub, cv2.COLOR_BGR2RGB))
+        painter = ImageDraw.Draw(pil)
+        cursor = y0 - by0
+        for text, size, color in lines:
+            font = _load_cjk_font(int(size))
+            px, py = x0 - bx0, cursor
+            rgb = (int(color[2]), int(color[1]), int(color[0]))
+            if not panel:                       # 有底衬就不用描边（描边会糊）
+                for dx, dy in ((1, 0), (0, 1), (1, 1)):     # 只往右下描，最省最清楚
+                    painter.text((px + dx, py + dy), str(text), font=font, fill=(0, 0, 0))
+            painter.text((px, py), str(text), font=font, fill=rgb)
+            cursor += int(size) + HUD_LINE_GAP
+        image[by0:by1, bx0:bx1] = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
+        return y0 + block_h
+
+    # 退回 cv2：画不了中文，把非 ASCII 换掉，至少不显示乱码
+    cursor = y0
+    for text, size, color in lines:
+        safe = str(text).encode("ascii", "replace").decode("ascii")
+        scale = max(0.4, int(size) / 30.0)
+        if not panel:
+            cv2.putText(image, safe, (x0, cursor + int(size)),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, COLOR_OUTLINE, 3, cv2.LINE_AA)
+        cv2.putText(image, safe, (x0, cursor + int(size)),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
+        cursor += int(size) + HUD_LINE_GAP
+    return y0 + block_h
+
+
+def draw_info_panel(image: np.ndarray, lines, anchor: str = "top-left") -> None:
+    """把一组 (文字,字号,颜色) 行画成一块带底衬的面板。
+
+    anchor: "top-left" 贴左上角，"top-right" 贴右上角（自动右对齐）。
+    会自动按画面尺寸限制面板宽度，避免和别处的文字叠在一起。
+    """
+    lines = [ln for ln in lines if ln and str(ln[0])]
+    if not lines:
+        return
+    height, width = image.shape[:2]
+    sizes = [int(ln[1]) for ln in lines]
+    natural_w = max(text_width(str(ln[0]), int(ln[1])) for ln in lines)
+    max_w = int(width * HUD_MAX_WIDTH_RATIO)
+    panel_w = min(natural_w, max_w) + HUD_TEXT_PAD_X * 2
+    panel_h = sum(sizes) + HUD_LINE_GAP * (len(lines) - 1) + HUD_TEXT_PAD_Y * 2
+
+    if anchor == "top-right":
+        x1 = width - HUD_MARGIN
+        x0 = max(HUD_MARGIN, x1 - panel_w)
+    else:
+        x0 = HUD_MARGIN
+        x1 = min(width - HUD_MARGIN, x0 + panel_w)
+    y0 = HUD_MARGIN
+    y1 = min(height - HUD_MARGIN, y0 + panel_h)
+    draw_panel(image, (x0, y0, x1, y1))
+
+    text_x = x0 + HUD_TEXT_PAD_X
+    if anchor == "top-right":                      # 右对齐
+        text_x = max(x0 + 4, x1 - HUD_TEXT_PAD_X - natural_w)
+    draw_text_lines(image, lines, (text_x, y0 + HUD_TEXT_PAD_Y))
 
 
 def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
@@ -1307,21 +1741,40 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
         _put_text_outlined(base, "%.2fR" % finger["length_ratio"],
                            (mid[0] + 12, mid[1]), 0.55, COLOR_LABEL, 1)
 
-    # 左上角信息
+    # =======================================================================
+    # HUD：左上角一块面板，装"分类结果 + 统计"
+    #   ★ 中文必须走 draw_text_lines（PIL 渲染）—— cv2.putText 画中文是乱码。
+    #   ★ 面板宽度自适应并按画面比例设上限，避免和别处的文字叠在一起。
+    # =======================================================================
+    gesture = result.get("gesture") or {}
+    digit = gesture.get("digit")
     palm_rel = result.get("palm_rel", (0.0, 0.0))
-    lines = [
-        "fingers: %d   gaps: %d" % (result["finger_count"], len(result["gaps"])),
-        "solidity: %.2f   span: %.0f deg" % (result.get("solidity", 0.0),
-                                             result.get("angle_span_deg", 0.0)),
-        "R = %.0f px   mean len: %.2fR" % (radius, result.get("mean_length_ratio", 0.0)),
-        "palm rel: (%.2f, %.2f)" % palm_rel,
-    ]
-    if wrist is not None:
-        lines.append("wrist (%d,%d)" % (int(wrist[0]), int(wrist[1])))
+
+    hud_lines = []
+    if digit is not None:
+        hud_lines.append(("GESTURE  %s" % digit, 40, (0, 230, 255)))          # 大号主结果
+        hud_lines.append((str(gesture.get("name", "")), 24, (120, 255, 120)))  # 中文名
+        hud_lines.append((str(gesture.get("reason", "")), 17, (185, 185, 185)))  # 判定依据
     else:
-        lines.append("wrist: not found -> up = image up")
-    for order, text in enumerate(lines):
-        _put_text_outlined(base, text, (20, 40 + order * 32), 0.8, COLOR_LABEL, 2)
+        hud_lines.append(("GESTURE  ?", 40, (0, 140, 255)))
+        hud_lines.append((str(gesture.get("name", "未知")), 24, (120, 200, 255)))
+        hud_lines.append((str(gesture.get("reason", "")), 17, (185, 185, 185)))
+
+    hud_lines.append((" ", 8, (0, 0, 0)))                                      # 空行分隔
+    hud_lines.append(("fingers %d    gaps %d" % (result["finger_count"], len(result["gaps"])),
+                      18, COLOR_LABEL))
+    hud_lines.append(("solidity %.2f    span %.0f deg"
+                      % (result.get("solidity", 0.0), result.get("angle_span_deg", 0.0)),
+                      18, COLOR_LABEL))
+    hud_lines.append(("R %.0f px    mean len %.2fR"
+                      % (radius, result.get("mean_length_ratio", 0.0)), 18, COLOR_LABEL))
+    hud_lines.append(("palm rel (%.2f, %.2f)" % palm_rel, 18, COLOR_LABEL))
+    if wrist is not None:
+        hud_lines.append(("wrist (%d, %d)" % (int(wrist[0]), int(wrist[1])), 18, COLOR_LABEL))
+    else:
+        hud_lines.append(("wrist not found -> up = image up", 18, (180, 180, 180)))
+
+    draw_info_panel(base, hud_lines, anchor="top-left")
     return base
 
 
@@ -1386,20 +1839,18 @@ def step_roi_boundary(frame: np.ndarray, state) -> np.ndarray:
                   (x1 - 1 - inset, y1 - 1 - inset),
                   color, thickness)
 
-    # 文字也要全部画在 ROI 内部（之前把前景占比画在 y0-12，跑到 ROI 外面去了）
-    text_y = y0 + inset + 30
-    if touched:
-        cv2.putText(frame, "TOUCHING ROI: %s" % ",".join(touched),
-                    (x0 + inset + 6, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
-        text_y += 32
-
-    # 左上角标出「当前显示模式」和前景占比，一眼知道自己在看什么
+    # 文字统一挪到 ROI 的**左下角**。
+    # ⚠️ 原来画在 ROI 左上角，实测会和识别 HUD 面板（也在左上角）叠在一起。
+    #    挪到左下角就彻底错开了；那里正好是手臂进入 ROI 的位置，底色深，更好认。
+    # ⚠️ 这里必须用 draw_text_lines 而不是 cv2.putText —— 因为 view_mode 是中文
+    #    （"原图"/"掩膜"/"识别(原图)"…），cv2 的 Hershey 字体画中文只会出乱码。
     stats = state.flags.get("segment_stats") or {}
-    lines = []
+    text_lines = []
+    if touched:
+        text_lines.append(("TOUCHING ROI: %s" % ",".join(touched), 20, COLOR_BOUNDARY_BAD))
     view_mode = state.flags.get("view_mode")
     if view_mode:
-        lines.append("view: %s" % view_mode)
+        text_lines.append(("view: %s" % view_mode, 18, COLOR_TEXT))
     if has_mask:
         piece = []
         method = stats.get("method")
@@ -1410,22 +1861,33 @@ def step_roi_boundary(frame: np.ndarray, state) -> np.ndarray:
         if stats.get("reconstructed"):
             piece.append("recon")
         if piece:
-            lines.append("method: %s" % "+".join(piece))
+            text_lines.append(("method: %s" % "+".join(piece), 18, COLOR_TEXT))
         ratio = stats.get("foreground_ratio")
         if ratio is not None:
-            lines.append("foreground %.1f%%" % (100.0 * ratio))
+            text_lines.append(("foreground %.1f%%" % (100.0 * ratio), 18, COLOR_TEXT))
         # 重建那一层额外把掌心和基准颜色显示出来，方便判断容差合不合适
         if stats.get("reconstructed"):
             palm = stats.get("palm_center")
             if palm is not None:
-                lines.append("palm C=(%d,%d) R=%.0f" % (palm[0], palm[1], stats.get("palm_radius", 0.0)))
-            base = stats.get("color_base")
-            if base is not None:
-                lines.append("base Cr=%.0f Cb=%.0f Y=%.0f" % base)
-    for text in lines:
-        cv2.putText(frame, text, (x0 + inset + 6, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_TEXT, 2, cv2.LINE_AA)
-        text_y += 28
+                palm_r = stats.get("palm_radius", 0.0)
+                raw_r = stats.get("palm_radius_raw", palm_r)
+                # 两个 R 差得多 -> 说明掩膜被割了口子、闭运算副本补救生效了，标出来
+                if raw_r and abs(palm_r - raw_r) / raw_r > 0.10:
+                    text_lines.append(("palm C=(%d,%d) R=%.0f (raw %.0f, 已按闭运算补救)"
+                                       % (palm[0], palm[1], palm_r, raw_r), 18, (0, 200, 255)))
+                else:
+                    text_lines.append(("palm C=(%d,%d) R=%.0f" % (palm[0], palm[1], palm_r),
+                                       18, COLOR_TEXT))
+            color_base = stats.get("color_base")
+            if color_base is not None:
+                text_lines.append(("base Cr=%.0f Cb=%.0f Y=%.0f" % color_base, 18, COLOR_TEXT))
+
+    if text_lines:
+        line_h = 26
+        block_h = line_h * len(text_lines) + 8
+        text_top = max(y0 + inset + 8, y1 - inset - 14 - block_h)
+        # panel=True：小字号中文笔画密，靠黑描边会糊成一团，改用底衬面板
+        draw_text_lines(frame, text_lines, (x0 + inset + 8, text_top), panel=True)
 
     # ★兜底保证：**掩膜模式下**，ROI 之外一律擦回黑色。
     #   这样"ROI 外全黑"就是结构性成立的，以后再加标注也不会破坏它。
