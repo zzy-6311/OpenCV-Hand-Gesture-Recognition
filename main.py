@@ -56,6 +56,15 @@ import numpy as np
 # 配置区
 # ---------------------------------------------------------------------------
 
+# --- 素材目录 ---------------------------------------------------------------
+# 所有图片/视频素材都放在这个子目录里（相对本文件所在目录）。
+# 代码文件和素材分开，目录看起来清爽，也避免素材文件混进 git 之类的场景。
+#
+# ⚠️ 改了这个常量，下面 GESTURE_SAMPLES 和 IMAGE_FILES 里的文件名**不用动** ——
+#    解析路径时会统一拼上这个前缀（见 resolve_image_paths 的调用处）。
+#    写成 "" 就退回"素材和代码放同一个目录"的老做法。
+DATA_DIR = "data"
+
 # --- 输入源 -----------------------------------------------------------------
 # "image"  = 读磁盘单张图片，循环反复处理（调算法时用这个）
 # "camera" = 摄像头实时采集
@@ -64,44 +73,54 @@ import numpy as np
 SOURCE = "image"
 
 # --- 视频文件模式（SOURCE = "video" 时生效）---------------------------------
-VIDEO_FILE = "gesture.mp4"             # 相对本文件所在目录；也可写绝对路径
+VIDEO_FILE = "gesture.mp4"             # 相对 DATA_DIR；也可写绝对路径
 VIDEO_LOOP = True                      # True = 播完从头循环；False = 播完自动退出
 # 视频模式下每帧的等待时间：用 FRAME_DELAY_MS_CAMERA(=1)，让处理速度决定节奏。
-# 实测 1920x1440 下整条链约 62~72 ms/帧（约 14 fps）—— 见文件末尾的性能说明。
+# 实测 1920x1440 下整条链约 115~135 ms/帧（约 8 fps）—— 见文件末尾的性能说明。
 
 # --- 手势素材数据集 ---------------------------------------------------------
-# 中国式数字手势素材。目前有**两组**：
-#   第一组  gesture_<NN>.jpg        白板干净、环境简洁
-#   第二组  gesture_<NN>_busy.jpg   同样手势，但白板周围环境更斑驳/杂
-# 两组放在同一行，方便直接对比"背景变杂之后算法有没有受影响"。
-# 按 n / p 浏览时会两组交替出现（00 → 00_busy → 01 → 01_busy …），正好对着看。
+# 中国式数字手势素材。目前有**三组**（同一个手势在不同背景/光照下各拍一次）：
+#   第一组  gesture_<NN>.jpg        白板干净背景、明亮白光、横幅
+#   第二组  gesture_<NN>_busy.jpg   斑驳桌面背景、明亮、横幅（手离镜头更近）
+#   第三组  gesture_<NN>_s3.jpg     印花床单背景 + 暗暖光、竖幅、手在画面左侧
+# 三组放在同一行，方便直接对比"换背景/换光照之后算法有没有受影响"。
+# 按 n / p 浏览时会三组依次出现（00 → 00_busy → 00_s3 → 01 → …），正好对着看。
 #
-# 每项是 (手势编号, 这个手势是怎么比的, 样张文件名元组)。
+# 每项是 (手势标签, 这个手势是怎么比的, 样张文件名元组)。
 #
-# ★ 编号沿用你拍照时的编号，没改 —— 它直接当分类的标签用。
+# ★ 标签沿用你拍照时的编号，没改 —— 它**直接当分类结果用**。
+#   ⚠️ 标签不一定是数字：不是数字手势的（比如 "ye"）就写个短名字，
+#      classify_gesture() 返回什么标签，这里就写什么。
 # ★ 第 2 列（手势说明）是我**按照片实际内容**写的。如果和你的本意不符，
 #   只改文字就行，文件名不用动。
 # ★ 加新样张：在对应手势的元组里追加文件名即可，命名沿用
-#   gesture_<两位数编号>[_<场景>].jpg。
+#   gesture_<编号>[_<场景>].jpg（编号可以是数字，也可以是短名字，如 gesture_ye.jpg）。
 #
-# ⚠️ gesture_03 和 gesture_33 是**两个不同的手势**（放大确认过）：
-#      gesture_03 = 食指 + 中指 + 无名指（拇指收在掌前）
-#      gesture_33 = 拇指 + 食指 + 中指（最左边那根是拇指）
-#    如果这其实是你同一次拍摄的两张、想算同一个手势，
-#    把 gesture_33* 那两行并到编号 3 的元组里就行。
+# ★ 编号 3/33 和 6/66 分别是**同一个数字的两种比法**，编号不同但分类结果相同：
+#      3   = 食指 + 中指 + 无名指（拇指收在掌前）
+#      33  = 拇指 + 食指 + 中指（最左边那根是拇指）        -> 也判 3
+#      6   = 点赞，只伸拇指
+#      66  = 拇指 + 小指（"六"的另一种比法）              -> 也判 6
+#    分类器的主判据是"伸出手指的根数"，所以两种比法**自然归成一类、不用写特例**。
+#    想合并成一行，把 33 / 66 的条目并到 3 / 6 的元组里即可。
 #
-# （第二组最初把"8"的文件名误写成了 7.jpg，已按你确认改为 gesture_08_busy.jpg，
-#   所以现在 9 个编号两组齐全，共 18 张。）
+# （第二组最初把"8"的文件名误写成了 7.jpg，已按你确认改为 gesture_08_busy.jpg。）
+#
+# ⚠️ 第三组的 gesture_01_s3.jpg（真值 1）已移到 ./不能识别/ 目录，**故意不加载**：
+#    它会把"只伸食指"误判成 2，原因是床单上的粉色花纹紧贴食指、颜色和肤色撞车，
+#    在掩膜里和手指连成一片、多出一个假指尖。详见 不能识别/说明.txt。
 GESTURE_SAMPLES = (
-    (0,  "握拳",                  ("gesture_00.jpg", "gesture_00_busy.jpg")),
+    (0,  "握拳",                  ("gesture_00.jpg", "gesture_00_busy.jpg", "gesture_00_s3.jpg")),
     (1,  "只伸食指",              ("gesture_01.jpg", "gesture_01_busy.jpg")),
-    (2,  "食指+中指（剪刀）",      ("gesture_02.jpg", "gesture_02_busy.jpg")),
-    (3,  "三指（西式：食+中+无名）", ("gesture_03.jpg", "gesture_03_busy.jpg")),
-    (4,  "四指",                  ("gesture_04.jpg", "gesture_04_busy.jpg")),
-    (5,  "五指张开",              ("gesture_05.jpg", "gesture_05_busy.jpg")),
-    (6,  "点赞（只伸拇指）",       ("gesture_06.jpg", "gesture_06_busy.jpg")),
-    (8,  "手枪（拇指+食指）",      ("gesture_08.jpg", "gesture_08_busy.jpg")),
-    (33, "三指（中式：拇+食+中）",  ("gesture_33.jpg", "gesture_33_busy.jpg")),
+    (2,  "食指+中指（剪刀）",      ("gesture_02.jpg", "gesture_02_busy.jpg", "gesture_02_s3.jpg")),
+    (3,  "三指（西式：食+中+无名）", ("gesture_03.jpg", "gesture_03_busy.jpg", "gesture_03_s3.jpg")),
+    (4,  "四指",                  ("gesture_04.jpg", "gesture_04_busy.jpg", "gesture_04_s3.jpg")),
+    (5,  "五指张开",              ("gesture_05.jpg", "gesture_05_busy.jpg", "gesture_05_s3.jpg")),
+    (6,  "点赞（只伸拇指）",       ("gesture_06.jpg", "gesture_06_busy.jpg", "gesture_06_s3.jpg")),
+    (8,  "手枪（拇指+食指）",      ("gesture_08.jpg", "gesture_08_busy.jpg", "gesture_08_s3.jpg")),
+    (33, "三指（中式：拇+食+中）",  ("gesture_33.jpg", "gesture_33_busy.jpg", "gesture_33_s3.jpg")),
+    (66, "六（拇指+小指）",        ("gesture_66_s3.jpg",)),
+    ("ye", "耶（食指+小指+拇指）",  ("gesture_ye.jpg",)),
 )
 
 # 图片模式下要处理的图片（相对本文件所在目录）。按 n / p 在列表里循环切换。
@@ -146,6 +165,22 @@ IMAGE_MAX_HEIGHT = 1440
 
 DISPLAY_WIDTH = 1280                   # 显示窗口宽度（720p）
 DISPLAY_HEIGHT = 720                   # 显示窗口高度（720p）
+
+# --- 显示适配（★ 必须自己做，不能交给 cv2.imshow）----------------------------
+# ⚠️ 踩过的坑：窗口客户区固定是 DISPLAY_WIDTH x DISPLAY_HEIGHT，而
+#    **cv2.imshow 会把画面拉满整个窗口**。素材宽高比五花八门
+#    （4:3 横幅 / 9:16 竖幅 / 16:9），直接丢给 imshow 就会被**非等比拉伸**：
+#      实测 810x1440 的竖幅素材在 1280x720 的窗口里被横向拉满，手明显变扁。
+#
+#    一开始以为 WINDOW_NORMAL 会保持宽高比（它的常量值确实和 WINDOW_KEEPRATIO
+#    相同，都是 0），但**后端实际并不保证** —— 实测就是拉满了。
+#    所以**不要依赖 imshow 的行为**。
+#
+# ★ 修法：先自己把画面**等比缩放**到能装进窗口，再**居中补黑边**凑满整块画布，
+#    然后才 imshow。这样无论什么宽高比都不会变形。
+DISPLAY_FIT = True                     # False = 退回老行为（直接丢给 imshow，会拉伸）
+DISPLAY_BG = (0, 0, 0)                 # 补边的颜色（BGR），黑边
+
 WINDOW_NAME = "video pipeline"
 
 MIRROR_DEFAULT = True                  # 默认水平镜像，符合照镜子式交互习惯
@@ -664,6 +699,42 @@ def load_external_plugins(registry: PluginRegistry,
 # ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
+def _display_frame(frame: np.ndarray) -> np.ndarray:
+    """把画面**等比缩放 + 居中补边**，凑成一块 DISPLAY_WIDTH x DISPLAY_HEIGHT 的画布。
+
+    ★ 为什么要自己做（而不是直接 imshow）：cv2.imshow 会把画面**拉满窗口**，
+      宽高比不一致就会**非等比拉伸**。实测 810x1440 的竖幅素材在 1280x720 的
+      窗口里被横向拉满、手明显变扁 —— 详见 DISPLAY_FIT 那段注释。
+
+    返回的一定是 (DISPLAY_HEIGHT, DISPLAY_WIDTH, 3) 的 BGR 图，
+    所以主循环里 imshow 的图像尺寸恒定，窗口不用跟着变。
+    """
+    if not DISPLAY_FIT:
+        return frame
+    canvas_h, canvas_w = int(DISPLAY_HEIGHT), int(DISPLAY_WIDTH)
+    height, width = frame.shape[:2]
+    if height <= 0 or width <= 0:
+        return frame
+    if frame.ndim == 2:                       # 单通道也允许传进来
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    scale = min(canvas_w / float(width), canvas_h / float(height))
+    new_w = max(1, int(round(width * scale)))
+    new_h = max(1, int(round(height * scale)))
+    if (new_w, new_h) == (width, height):
+        resized = frame
+    else:
+        # 缩小用 INTER_AREA（抗混叠），放大用 INTER_LINEAR
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+    if (new_w, new_h) == (canvas_w, canvas_h):
+        return resized                        # 比例刚好一致，不用补边
+    canvas = np.full((canvas_h, canvas_w, 3), DISPLAY_BG, dtype=np.uint8)
+    x0 = (canvas_w - new_w) // 2
+    y0 = (canvas_h - new_h) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return canvas
+
+
 def _prepare_window() -> None:
     """创建窗口并让它正好显示 720p 画面。
 
@@ -802,6 +873,9 @@ def main() -> int:
     add_display_plugins(registry)
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
+    # ★ 素材统一放在 DATA_DIR 子目录里（见文件开头的配置）。
+    #   DATA_DIR 写成 "" 时 os.path.join 会给回 base_dir 本身，行为退回老样子。
+    data_dir = os.path.join(base_dir, DATA_DIR) if DATA_DIR else base_dir
     source_kind = SOURCE.strip().lower()
     is_video = (source_kind == "video")
 
@@ -810,10 +884,12 @@ def main() -> int:
 
     # 3) 准备输入源
     if source_kind == "image":
-        paths = resolve_image_paths(IMAGE_FILES, base_dir)
+        paths = resolve_image_paths(IMAGE_FILES, data_dir)
         if not paths:
             print("[error] 图片模式下一张可用图片都没有。")
-            print("        检查 IMAGE_FILES 配置，或把 SOURCE 改成 \"camera\"。")
+            print("        找素材的目录是：%s" % data_dir)
+            print("        （由 main.py 开头的 DATA_DIR 决定，当前是 \"%s\"）" % DATA_DIR)
+            print("        请把素材放进去，或把 SOURCE 改成 \"camera\"。")
             return 1
         image_source = ImageSource(paths, IMAGE_START_INDEX)
         if image_source.frame is None:
@@ -826,10 +902,11 @@ def main() -> int:
         frame_delay_ms = FRAME_DELAY_MS_IMAGE
     elif is_video:
         video_path = VIDEO_FILE if os.path.isabs(VIDEO_FILE) \
-            else os.path.join(base_dir, VIDEO_FILE)
+            else os.path.join(data_dir, VIDEO_FILE)
         if not os.path.exists(video_path):
             print("[error] 视频文件不存在：%s" % video_path)
-            print("        改 VIDEO_FILE，或把 SOURCE 换回 \"image\"。")
+            print("        改 VIDEO_FILE（它是相对 DATA_DIR=\"%s\" 的），"
+                  "或把 SOURCE 换回 \"image\"。" % DATA_DIR)
             return 1
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -872,8 +949,7 @@ def main() -> int:
     recent_dt: collections.deque = collections.deque(maxlen=30)   # 用于平滑算 FPS
     last_time = time.perf_counter()
     failures = 0                           # 连续读帧失败计数
-    last_displayed: Optional[np.ndarray] = None    # 最近一次真正送进窗口的画面
-    paused_view: Optional[np.ndarray] = None       # 暂停时用来画 PAUSED 的复用缓冲
+    last_displayed: Optional[np.ndarray] = None    # 最近一帧"处理完、还没做显示适配"的画面
     refresh_requested = False              # 暂停时按 n/p/R 也要强制刷新一帧
     print("[main] 按键：q 退出，空格暂停，1~6 切换显示模式，d 叠加，m 镜像，r ROI限制，f 全屏，l 列出插件"
           + ("，n/p 换图，R 重载" if image_source is not None else ""))
@@ -938,10 +1014,12 @@ def main() -> int:
                 # 5.4 把工作帧按顺序交给所有插件；
                 #     registry.run 返回 None 表示某个插件要求丢弃本帧
                 frame = registry.run(frame, state)
-                # 5.5 有可显示的帧就送进窗口（窗口是 NORMAL，大图会按比例缩放进 1280x720）
+                # 5.5 有可显示的帧就送进窗口。
+                #     ★ 送之前先过一遍 _display_frame：等比缩放 + 补黑边，
+                #       保证任何宽高比的素材都不会被 imshow 拉变形（见该函数注释）。
                 if frame is not None:
                     last_displayed = frame
-                    cv2.imshow(WINDOW_NAME, frame)
+                    cv2.imshow(WINDOW_NAME, _display_frame(frame))
 
                 # 5.6 帧号加一，然后处理键盘：waitKey 需要每帧调用一次来驱动界面事件。
             #     图片模式下用较大的延时，既避免空转烧 CPU，也保证按键能响应。
@@ -952,11 +1030,11 @@ def main() -> int:
                 #      以前暂停就完全不 imshow，结果画面冻结、连"PAUSED"都画不出来，
                 #      用户分不清是暂停还是卡死；按 n 换图也只是终端变了、画面不动。
                 if last_displayed is not None:
-                    if paused_view is None or paused_view.shape != last_displayed.shape:
-                        paused_view = np.empty_like(last_displayed)
-                    np.copyto(paused_view, last_displayed)
-                    _draw_paused_badge(paused_view)
-                    cv2.imshow(WINDOW_NAME, paused_view)
+                    # ★ 先做显示适配，再画暂停标记 —— 这样标记是在 1280x720 的
+                    #   画布上画的，字号恒定，不会因为原图大小而忽大忽小。
+                    paused_canvas = _display_frame(last_displayed)
+                    _draw_paused_badge(paused_canvas)      # 就地修改，无返回值
+                    cv2.imshow(WINDOW_NAME, paused_canvas)
 
             # 5.7 键盘。这一句在 if 外面，暂停时也要执行，否则界面会僵住。
             key = cv2.waitKey(frame_delay_ms) & 0xFF

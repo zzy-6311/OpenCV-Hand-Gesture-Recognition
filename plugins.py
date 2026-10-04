@@ -28,18 +28,45 @@ import numpy as np
 #
 # ===========================================================================
 #
-#  ROI_RELATIVE = (左, 上, 宽, 高)，都是**相对整幅图的比例**（0~1）。
-#  默认值 (0.25, 0.10, 0.50, 0.80) 就是「居中的 50% x 80% 矩形」——
-#  和 main.py 之前画的那个示例框位置一样，但现在它是**真的会裁掉外面**的。
+#  ★ ROI 现在是**自适应**的，不再是写死的相对框。
 #
-#  按你现在的构图（2560x1440）换算成像素是： x 640~1920, y 144~1296
-#  实测这个范围能排掉：纸箱 ✓  黄T恤 ✓  下巴/脸 ✓  深色窗帘 ✓
-#  而手在 x 937~1513, y 312~1129，四边余量 168~407 像素，很安全。
+#  ⚠️ 原来这里是 ROI_RELATIVE = (0.25, 0.10, 0.50, 0.80)，即"居中的 50% x 80%"。
+#     它是在 16:9 横幅（1920x1440）上调出来的，换算成像素宽 960 px，够用。
+#     **但"宽度按画面宽度算"这件事在竖幅上会塌**：
+#        横幅 1920x1440 -> ROI 宽 960 px   ✓ 够
+#        竖幅  810x1440 -> ROI 宽只有 405 px ✗ 手一偏就被切掉
+#     实测第三批素材（2304x4096 竖幅、手在画面**左侧**）：
+#        gesture_00_s3 的拳头左边、gesture_05_s3 的**整个拇指**都落在 ROI 外，
+#        被 roi_boundary 强制擦黑 —— 手指直接从掩膜上消失。
 #
-#  想收得更紧（把背景布也少露一点），可以试着改成：
-#      ROI_RELATIVE = (0.33, 0.17, 0.30, 0.70)     # x 845~1613, y 245~1253
-#  代价是手移动的容错变小了。
+#  ★ 修法：**宽度按画面【短边】算**，这样横竖幅拿到的是同样的绝对像素量。
+#      横幅 1440 短边 -> 0.75 x 1440 = 1080 px
+#      竖幅  810 短边 -> 0.75 x  810 =  608 px   ← 手能装下了
 #
+ROI_WIDTH_VS_SHORT = 0.75   # ROI 宽度 = 该比例 x 画面短边 min(高, 宽)
+ROI_HEIGHT_RATIO = 0.80     # ROI 高度 = 该比例 x 画面高度（小臂从下方入画，竖直要留够）
+ROI_CENTER_Y = 0.50         # ROI 竖直中心（0.50 = 画面正中）
+
+# --- 再进一步：按"手的位置"自动把 ROI 挪过去罩住手 ---------------------------
+#  手在画面里的位置是会变的（第三批素材手就偏左）。打开这个就用**上一帧估出的
+#  掌心**当锚点，把 ROI 向手靠拢。
+#
+#  ⚠️⚠️ **默认关闭，而且必须等颜色阈值修好之后再开** —— 这是实测出来的：
+#      D 方案分两步，我分别量过（28 张素材）：
+#        ① 旧 ROI                                  -> 分类 22/28，掩膜贴 ROI 边界 8 张
+#        ② 只换新几何（短边定宽）                  -> 分类 22/28，贴边界 4 张  ★几何修好了
+#        ③ 新几何 + 跟踪（1 遍）                   -> 分类 22/28，贴边界 1 张
+#        ④ 新几何 + 跟踪（收敛）                   -> 分类 21/28，贴边界 4 张  ✗反而变差
+#      原因：**跟踪的锚点是"掌心"，而掌心是从掩膜里估的**。当颜色阈值把背景
+#      一起糊进来时（第三批素材），掌心本身就估偏了，ROI 会被拽到错误的位置，
+#      把手切得更狠。所以"ROI 跟手"这件事必须建立在"掌心估得准"之上。
+#      等 B 方案（两阶段自校准）把阈值修好，再把这里改成 True 复测。
+ROI_AUTO_TRACK = False
+ROI_TRACK_SMOOTH = 0.35        # 每次向掌心方向靠拢的比例（越小越稳、收敛越慢）
+ROI_TRACK_MAX_SHIFT = 0.10     # 每帧最多移动"ROI 尺寸"的这个比例，防跳变
+ROI_TRACK_MIN_RADIUS = 12.0    # 掌心 R 小于此值就认为不可靠，本次不更新锚点
+
+# 兼容旧配置：这个常量已经**不再驱动** ROI 几何，只留着方便对照。
 ROI_RELATIVE = (0.25, 0.10, 0.50, 0.80)
 
 # 是否启用 ROI 限制。改成 False 就退回「整幅图都参与识别」。
@@ -143,6 +170,42 @@ CB_LOW = 77
 CB_HIGH = 128
 Y_LOW = 40
 Y_HIGH = 245
+
+# ---------------------------------------------------------------------------
+#  ★★ 场景色度自校准（B 方案）—— 让上面这组"绝对阈值"能跟着光照平移  ★★
+#
+#  ⚠️ 为什么必须要这个：
+#     上面 CR_LOW=131 / CB_HIGH=128 这组值是在「明亮白光 + 白板/桌面」下标定的。
+#     第三批素材（印花床单 + 暗暖光）实测，ROI 内**背景**的色度中位数是：
+#          Cr 127.0 -> 139.3     Cb 128.0 -> 119.1
+#     也就是说背景整体平移了 (+12, -9)。原来它恰好卡在 CR_LOW=131 **外面**，
+#     平移之后就整个挪进肤色框里了 —— 后果：
+#          原始阈值前景   14.7% -> 77.5%
+#          噪声连通域       15 -> 341
+#     掩膜糊成一片，下游的清理/重建再努力也救不回来（掌心都是从一个糊掉的
+#     掩膜里估出来的）。
+#
+#  ★ 而且实测"单纯抬高 CR_LOW"没用 —— 131 已经是三批合计最优：
+#         CR_LOW     131   135   140   144   148
+#         s1         9/9   9/9   9/9   8/9   8/9
+#         s2         9/9   9/9   8/9   6/9   7/9
+#         s3         4/10  4/10  3/10  3/10  3/10
+#        三批合计   22    22    20    17    18
+#     原因：**手的色度也跟着平移了**。抬阈值在切背景的同时也把手切掉了。
+#
+#  ★ 所以正确做法不是改数值，而是**把整个框按本帧估计的平移量一起挪**：
+#     光照整体变化时，背景和肤色的色度是**一起平移**的；按同一个位移量平移
+#     肤色框，"背景在框外、手在框内"这个相对关系就恢复了。
+SCENE_CALIBRATE = True          # 关掉就退回原来的写死绝对阈值
+# 标定基准 = 中性背景在"标准光照"下的 Cr/Cb。
+# 实测值就是 s1（白板/桌面，明亮白光）的 ROI 中位数，所以基准场景下位移为 0。
+SCENE_BASELINE_CR = 127.0
+SCENE_BASELINE_CB = 128.0
+# 位移限幅：背景估计万一跑飞，最多平移这么多，防止把框拖到毫无意义的位置
+SCENE_SHIFT_CLAMP = 22.0
+# 估计背景色度时的下采样步长（每隔几行/列取一个点，避免每帧算 100 万像素的中位数）
+SCENE_ESTIMATE_STEP = 4
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 #  ★ 上面这组值的实测依据（别再凭感觉调了）★
@@ -398,18 +461,42 @@ RECOG_MASK_TRUNCATE = True         # 模式 5 是否显示"截断后（只剩手
 #    因为需要认小指的场合目前没有）。
 #
 #  ── 判定表 ─────────────────────────────────────────────────────────────
-#      n = 0                     -> 0   握拳
-#      n = 1  该指偏侧向(=拇指)   -> 6   点赞
+#      n = 0                     -> 0    握拳
+#      n = 1  该指偏侧向(=拇指)   -> 6    点赞（只伸拇指）
 #             否则(=食指)        -> 1
-#      n = 2  没有侧向手指        -> 2   剪刀（食指+中指）
-#             有一根侧向(=拇指)   -> 8   手枪（拇指+食指）
-#             两根都侧向          -> 未知（拇指+小指，不在当前手势集里）
-#      n = 3                     -> 3   ★ 3 和 33 都落这里
+#      n = 2  没有侧向手指        -> 2    剪刀（食指+中指）
+#             有一根侧向(=拇指)   -> 8    手枪（拇指+食指）
+#             两根都侧向          -> 6    拇指+小指（"六"的另一种比法）
+#      n = 3  跨度 <  70°         -> 3    ★ 3 和 33 都落这里
+#             跨度 >= 70°         -> ye   ★ 三指大张开（见下）
 #      n = 4                     -> 4
 #      n >= 5                    -> 5
+#
+#  ── 为什么 n=3 还要再看跨度 ─────────────────────────────────────────────
+#  "ye" 这个手势 = **食指 + 小指 + 拇指**打开，中指和无名指蜷缩。
+#  它和 3 / 33 的**手指数一模一样**（都是 3 根），光数根数分不开。
+#
+#  ★ 但两者的**结构**根本不同，这才是能分开的真正原因：
+#      3 / 33 -> 伸出的是**相邻**的手指（食+中[+拇]），挤在一起  -> 跨度小
+#      ye     -> 伸出的是**隔开**的手指（食 + 小 + 拇），绕手掌散开 -> 跨度大
+#    跨度只是这个结构差异的一个表征。
+#
+#  实测（7 张含 3 根手指的素材）：
+#      手势          跨度        侧向手指数
+#      ye            98.3°       2    （小指 + 拇指）
+#      3（西式）      43.5~47.9°  0
+#      33（中式）     40.4~45.3°  1    （拇指）
+#  跨度差了**一倍以上**，余量非常大，所以拿跨度当判据（门槛 70°）。
+#
+#  ⚠️ 本来"侧向手指数"也能分（2 / 1 / 0），但**小指的侧向偏角本身就在 45° 门槛
+#     附近摇摆**（实测 37~52°，见上面"特征②"那段），ye 里的小指实测 47.9°，
+#     离门槛太近、不稳，所以没选它。
+#  ⚠️ **必须带 n==3 这个前提**：五指张开的跨度是 106~119°、66(拇+小指) 是 107°，
+#     都远超 70°，不限定根数会直接把它们误判成 ye。
 # ---------------------------------------------------------------------------
 GESTURE_LATERAL_DEVIATION_DEG = 45.0   # 偏离掌轴超过这个角度就算"侧向手指"（拇指/小指）
 GESTURE_MAX_FINGERS = 5                # 手指数上限（超过按 5 算）
+GESTURE_YE_MIN_SPAN_DEG = 70.0         # 3 根手指时，跨度超过这个值就判 "ye"（食+小+拇 大张开）
 # ===========================================================================
 
 
@@ -456,19 +543,89 @@ COLOR_TEXT = (255, 255, 255)
 # ===========================================================================
 # ROI 相关工具
 # ===========================================================================
-def roi_rect_pixels(shape_hw: tuple) -> tuple:
-    """把 ROI_RELATIVE 换算成像素矩形 ``(x0, y0, x1, y1)``（右/下为开区间）。"""
+# ROI 的自动居中锚点（模块级，**跨帧保留**）：None 表示用画面中心。
+# 由 update_roi_anchor() 在掌心估计可靠时更新。
+_ROI_ANCHOR = None
+
+
+def set_roi_anchor(point) -> None:
+    """手动设置 / 清空 ROI 锚点（测试用；运行中由 update_roi_anchor 自动更新）。"""
+    global _ROI_ANCHOR
+    _ROI_ANCHOR = None if point is None else (float(point[0]), float(point[1]))
+
+
+def get_roi_anchor():
+    """读当前 ROI 锚点（None = 用画面中心）。"""
+    return None if _ROI_ANCHOR is None else tuple(_ROI_ANCHOR)
+
+
+def _roi_size_pixels(shape_hw: tuple) -> tuple:
+    """按【短边】定宽、按【画面高度】定高，返回 ``(宽, 高)``。
+
+    ★ 宽度按短边算是这套自适应的关键：写死"画面宽度的百分之几"的话，
+      竖幅画面（810x1440）只能拿到 405 px，手一偏就被切掉。
+    """
     height, width = int(shape_hw[0]), int(shape_hw[1])
-    left, top, rect_w, rect_h = ROI_RELATIVE
-    x0 = int(round(float(left) * width))
-    y0 = int(round(float(top) * height))
-    x1 = int(round((float(left) + float(rect_w)) * width))
-    y1 = int(round((float(top) + float(rect_h)) * height))
-    # 夹回画面内，并保证至少有 1 个像素，避免手写错比例导致空掩膜
-    x0 = max(0, min(x0, width - 1))
-    y0 = max(0, min(y0, height - 1))
-    x1 = max(x0 + 1, min(x1, width))
-    y1 = max(y0 + 1, min(y1, height))
+    short = min(height, width)
+    roi_w = int(round(float(ROI_WIDTH_VS_SHORT) * short))
+    roi_h = int(round(float(ROI_HEIGHT_RATIO) * height))
+    roi_w = max(1, min(roi_w, width))
+    roi_h = max(1, min(roi_h, height))
+    return roi_w, roi_h
+
+
+def update_roi_anchor(palm_center, palm_radius, shape_hw: tuple) -> None:
+    """用刚估出来的掌心，把 ROI 锚点朝手的方向挪一点（平滑 + 限幅）。
+
+    ⚠️ 只在掌心**看起来可靠**时才动：R 太小说明那是个噪声估计，直接跳过。
+       再加上"每次只挪一小步 + 单帧位移限幅"，即使某帧掩膜糊了、
+       掌心估偏了，ROI 也不会被一把拽跑。
+    """
+    global _ROI_ANCHOR
+    if not ROI_AUTO_TRACK or palm_center is None:
+        return
+    if palm_radius is None or float(palm_radius) < float(ROI_TRACK_MIN_RADIUS):
+        return
+    height, width = int(shape_hw[0]), int(shape_hw[1])
+    roi_w, roi_h = _roi_size_pixels((height, width))
+    if _ROI_ANCHOR is None:
+        cur_x, cur_y = width * 0.5, height * float(ROI_CENTER_Y)
+    else:
+        cur_x, cur_y = float(_ROI_ANCHOR[0]), float(_ROI_ANCHOR[1])
+    step_x = (float(palm_center[0]) - cur_x) * float(ROI_TRACK_SMOOTH)
+    step_y = (float(palm_center[1]) - cur_y) * float(ROI_TRACK_SMOOTH)
+    lim_x = roi_w * float(ROI_TRACK_MAX_SHIFT)
+    lim_y = roi_h * float(ROI_TRACK_MAX_SHIFT)
+    step_x = max(-lim_x, min(lim_x, step_x))
+    step_y = max(-lim_y, min(lim_y, step_y))
+    _ROI_ANCHOR = (cur_x + step_x, cur_y + step_y)
+
+
+def roi_rect_pixels(shape_hw: tuple, anchor=None) -> tuple:
+    """算 ROI 的像素矩形 ``(x0, y0, x1, y1)``（右/下为开区间）。
+
+    ★ 自适应三点（详见文件开头第一部分的注释）：
+      1) 宽度按**画面短边**算 —— 竖幅画面也能拿到足够的绝对像素宽度
+      2) 高度按画面高度算
+      3) 可选按锚点（一般是上一帧的掌心）居中，让 ROI 跟着手走
+
+    ``anchor`` 传 None 就用模块级锚点 ``_ROI_ANCHOR``；锚点也没设过就是画面中心。
+    """
+    height, width = int(shape_hw[0]), int(shape_hw[1])
+    roi_w, roi_h = _roi_size_pixels((height, width))
+    if anchor is None:
+        anchor = _ROI_ANCHOR
+    if anchor is None:
+        cx, cy = width * 0.5, height * float(ROI_CENTER_Y)
+    else:
+        cx, cy = float(anchor[0]), float(anchor[1])
+    x0 = int(round(cx - roi_w * 0.5))
+    y0 = int(round(cy - roi_h * 0.5))
+    # 夹回画面内：保证整个矩形都落在画面里（而不是被截断）
+    x0 = max(0, min(x0, width - roi_w))
+    y0 = max(0, min(y0, height - roi_h))
+    x1 = min(width, x0 + roi_w)
+    y1 = min(height, y0 + roi_h)
     return x0, y0, x1, y1
 
 
@@ -490,8 +647,28 @@ def roi_enabled_now(state) -> bool:
 
 
 def _roi_cache_key(shape_hw: tuple, channels: int, enabled: bool) -> tuple:
-    return (int(shape_hw[0]), int(shape_hw[1]), int(channels),
-            bool(enabled), tuple(ROI_RELATIVE))
+    # ⚠️ 键里必须包含**这个掩膜依赖的一切**，少一样就会拿到过期的旧掩膜：
+    #    · 画面尺寸、通道数
+    #    · 启用与否
+    #    · ROI 几何常量（短边比例 / 高度比例 / 竖直中心）
+    #    · 锚点 —— ROI 现在是会动的（按手的位置自动居中），不带锚点就会
+    #      用"上一帧位置"的旧掩膜，画面和掩膜对不上
+    #    锚点先量化到整数像素，避免亚像素抖动把缓存打穿（每帧重建白费性能）。
+    anchor = _ROI_ANCHOR
+    anchor_key = None if anchor is None else (int(round(anchor[0])), int(round(anchor[1])))
+    return (int(shape_hw[0]), int(shape_hw[1]), int(channels), bool(enabled),
+            float(ROI_WIDTH_VS_SHORT), float(ROI_HEIGHT_RATIO),
+            float(ROI_CENTER_Y), anchor_key)
+
+
+def clear_roi_cache() -> None:
+    """清空 ROI 掩膜缓存。
+
+    正常运行**不需要**调它。只有一种情况需要：在运行中改了 ROI 几何常量
+    （调试 / 参数扫描）。几何常量已经在缓存键里，所以正常改也安全；
+    但如果你是运行时替换函数（monkey-patch），记得调一下这个。
+    """
+    _ROI_CACHE.clear()
 
 
 def build_roi_mask(shape_hw: tuple, enabled: bool = None) -> np.ndarray:
@@ -619,11 +796,41 @@ def step_gray_threshold(frame: np.ndarray, state) -> np.ndarray:
 # ===========================================================================
 # 处理方法 B：YCbCr 色度（Cr / Cb）双通道区间二值化
 # ===========================================================================
+def _estimate_scene_shift(ycrcb: np.ndarray, state) -> tuple:
+    """估计本帧相对"标定基准"的色度平移量，返回 ``(dCr, dCb)``。
+
+    **怎么估**：取 ROI 内 Cr/Cb 的**中位数**当"本帧的中性背景色度"。
+      · ROI 里手只占一小部分（实测 s1 约 10%、s3 约 15%），中位数由背景主导
+      · 用中位数而不是均值：抗住手的污染，也抗个别高光/阴影
+      · 先下采样再取中位数，省时间（整幅上百万像素跑 median 要好几毫秒）
+
+    ⚠️ 这里**故意不**用"当前掩膜之外的像素"来估背景 —— 那是循环论证：
+       阈值已经糊掉的时候，被排除在外的只剩画面里最亮的那部分，
+       估出来的平移方向是**反的**，会把框挪得更错。整幅 ROI 的中位数才稳。
+    """
+    height, width = ycrcb.shape[:2]
+    step = max(1, int(SCENE_ESTIMATE_STEP))
+    roi = build_roi_mask((height, width), roi_enabled_now(state)) > 0
+    sub_roi = roi[::step, ::step]
+    if not np.any(sub_roi):
+        return 0.0, 0.0
+    cr_values = ycrcb[::step, ::step, 1][sub_roi].astype(np.float32)
+    cb_values = ycrcb[::step, ::step, 2][sub_roi].astype(np.float32)
+    d_cr = float(np.median(cr_values)) - float(SCENE_BASELINE_CR)
+    d_cb = float(np.median(cb_values)) - float(SCENE_BASELINE_CB)
+    limit = float(SCENE_SHIFT_CLAMP)
+    return max(-limit, min(limit, d_cr)), max(-limit, min(limit, d_cb))
+
+
 def step_color_threshold(frame: np.ndarray, state) -> np.ndarray:
     """YCbCr 色度阈值：Cr、Cb、Y 三段区间同时满足才算前景。
 
     和灰度版的区别只在判据：这里用的是**颜色**而不是亮度，
     所以对阴影不敏感（阴影改 Y、基本不改 Cr/Cb）。
+
+    ★ 打开 SCENE_CALIBRATE 时，**Cr / Cb 两个区间会先按本帧估计的场景色度
+      平移量整体挪一下**（详见配置区注释），这样换光照/换背景不用手改阈值。
+      Y 区间很宽（40~245），不参与平移。
     """
     ycrcb = cv2.cvtColor(_threshold_source(frame, state), cv2.COLOR_BGR2YCrCb)
     y_channel = ycrcb[:, :, 0]
@@ -634,11 +841,27 @@ def step_color_threshold(frame: np.ndarray, state) -> np.ndarray:
     cb_lo, cb_hi = _normalized_pair(CB_LOW, CB_HIGH, "CB_LOW/CB_HIGH")
     y_lo, y_hi = _normalized_pair(Y_LOW, Y_HIGH, "Y_LOW/Y_HIGH")
 
+    # ---- ★ 场景色度自校准：把整个框按本帧估计的平移量一起挪 ----
+    scene_dcr = scene_dcb = 0.0
+    if SCENE_CALIBRATE:
+        scene_dcr, scene_dcb = _estimate_scene_shift(ycrcb, state)
+        cr_lo = int(round(max(0.0, min(255.0, cr_lo + scene_dcr))))
+        cr_hi = int(round(max(0.0, min(255.0, cr_hi + scene_dcr))))
+        cb_lo = int(round(max(0.0, min(255.0, cb_lo + scene_dcb))))
+        cb_hi = int(round(max(0.0, min(255.0, cb_hi + scene_dcb))))
+        # 平移后仍要保证 下限 <= 上限（贴边时可能撞上，这里再纠一次）
+        cr_lo, cr_hi = _normalized_pair(cr_lo, cr_hi, "校准后 Cr")
+        cb_lo, cb_hi = _normalized_pair(cb_lo, cb_hi, "校准后 Cb")
+
     # 三个区间取交集。用 bitwise_and 而不是 numpy 的 & 再 astype，
     # 少两次全图临时数组，而且和后面的 ROI 处理风格一致。
     mask = cv2.inRange(cr_channel, cr_lo, cr_hi)
     cv2.bitwise_and(mask, cv2.inRange(cb_channel, cb_lo, cb_hi), dst=mask)
     cv2.bitwise_and(mask, cv2.inRange(y_channel, y_lo, y_hi), dst=mask)
+
+    # 记下本帧的平移量和最终生效的框，供 HUD 显示 / 事后排查
+    state.flags["scene_shift"] = (scene_dcr, scene_dcb)
+    state.flags["scene_box"] = (cr_lo, cr_hi, cb_lo, cb_hi)
 
     # ★把 YCrCb 图挂到 state 上，供下游（掌心重建）取颜色用。
     #   必须是**这一张**（和掩膜同源、同一次镜像），不能改用 state.raw_frame ——
@@ -864,6 +1087,12 @@ def step_palm_reconstruct(frame: np.ndarray, state) -> np.ndarray:
     #      所以这里只把**报出去的**掌心换成稳健版，供 hand_recognize 使用。
     (palm_cx, palm_cy), palm_radius = _estimate_palm_robust(result)
 
+    # ---- 7.5) 顺便更新 ROI 锚点，让**下一帧**的 ROI 朝手的位置靠过去 ----
+    #   放在这里的原因：ROI 是在最前面 color_threshold 那层用的，本帧早就用完了，
+    #   所以这里更新只影响下一帧。图片模式下同一张图会反复处理，一两帧就收敛；
+    #   视频模式下这相当于一个几乎零成本的轻量 ROI 跟踪。
+    update_roi_anchor((palm_cx, palm_cy), palm_radius, mask.shape[:2])
+
     # ---- 8) 统计 ----
     segment_stats = dict(state.flags.get("segment_stats") or {})
     segment_stats["reconstructed"] = True
@@ -985,7 +1214,7 @@ def _protrusion_length(thickness: np.ndarray, tip_point, palm_center,
 def _estimate_wrist(mask: np.ndarray, palm_center, radius: float):
     """手腕 W = 手掌下方**横截面最窄**的那一行。
 
-    ⚠️ 之前用的是"手部底端带状区域的质心"（solution.py 的做法）。但那个做法
+    ⚠️ 早期那版（已删除的 solution.py）用的是"手部底端带状区域的质心"。但那个做法
     默认掩膜在手腕处就结束了 —— 而我们的掩膜里含**整条小臂**，所以底端质心
     取到的是小臂尖，实测跑到 (1522,1265)，离真正的手腕差了 400 多像素。
 
@@ -1405,18 +1634,20 @@ def classify_gesture(rec: dict) -> dict:
 
     判定表：
         n=0                 -> 0  握拳
-        n=1  偏侧向(=拇指)   -> 6  点赞
+        n=1  偏侧向(=拇指)   -> 6  点赞（只伸拇指）
              否则(=食指)    -> 1
         n=2  没有侧向手指    -> 2  剪刀（食指+中指）
              有一根侧向      -> 8  手枪（拇指+食指）
-             两根都侧向      -> 未知（拇指+小指）
-        n=3                 -> 3  ★ 3 和 33 都落这里
+             两根都侧向      -> 6  拇指+小指  ★ 6 的另一种比法
+        n=3  跨度 < 70°      -> 3  ★ 3 和 33 都落这里（伸出的是相邻手指）
+             跨度 >= 70°     -> ye ★ 食+小+拇（伸出的是隔开的手指，跨度大）
         n=4                 -> 4
         n>=5                -> 5
 
     ★ "3 和 33 归为一类"怎么做到的：主特征是**根数**，而 gesture_03
       （食指+中指+无名指）和 gesture_33（拇指+食指+中指）都是 3 根，
       **自然合并、零特判**。这也是主特征不能选"哪几根手指"的原因。
+      同理 **6 也有两种比法**：只伸拇指（点赞）和 拇指+小指，都判为 6。
 
     ★ 为什么还要特征②：数字 6 是"点赞"= **只伸拇指**，而数字 1 是"只伸食指"，
       两者**都是 1 根手指** —— 必须知道伸的是拇指还是食指。
@@ -1443,11 +1674,23 @@ def classify_gesture(rec: dict) -> dict:
         if lateral == 0:
             return {"digit": 2, "name": "剪刀（食指+中指）", "lateral": lateral,
                     "reason": "2 根手指都沿掌轴朝上（跨度 %.0f°）-> 相邻两指" % span}
-        if lateral == 1:
-            return {"digit": 8, "name": "手枪（拇指+食指）", "lateral": lateral,
-                    "reason": "2 根手指中 1 根偏侧向（跨度 %.0f°）" % span}
-        return {"digit": None, "name": "未知（拇指+小指）", "lateral": lateral,
-                "reason": "2 根手指都是侧向手指 -> 拇指+小指，不在当前手势集里"}
+        if lateral >= 2:
+            # ★ 拇指+小指也是 6，只是比法不同 —— 和 3/33 归一类是同一个道理。
+            return {"digit": 6, "name": "六（拇指+小指）", "lateral": lateral,
+                    "reason": "2 根手指都是侧向手指（跨度 %.0f°）-> 拇指+小指，"
+                              "是 6 的另一种比法" % span}
+        return {"digit": 8, "name": "手枪（拇指+食指）", "lateral": lateral,
+                "reason": "2 根手指中 1 根偏侧向（跨度 %.0f°）" % span}
+
+    if n == 3 and span >= float(GESTURE_YE_MIN_SPAN_DEG):
+        # ★ "ye"（耶）= **食指 + 小指 + 拇指**打开，中指和无名指蜷缩。
+        #   也是 3 根手指，但伸出的是**隔开**的手指（不像 3/33 是相邻手指），
+        #   绕着手掌散开 -> 跨度特别大（实测 98°，而 3/33 只有 40~48°）。
+        #   ⚠️ 必须带 n==3 的前提，否则五指张开（跨度 106~119°）和 66（107°）
+        #      会被误判进来。详见配置区的判定表注释。
+        return {"digit": "ye", "name": "耶（食指+小指+拇指）", "lateral": lateral,
+                "reason": "3 根手指但跨度 %.0f° 远超 %.0f° -> 伸出的是隔开的手指"
+                          "（食+小+拇），判 ye" % (span, GESTURE_YE_MIN_SPAN_DEG)}
 
     digit = min(n, int(GESTURE_MAX_FINGERS))
     note = "伸出 %d 根手指（跨度 %.0f°）" % (n, span)
@@ -1865,6 +2108,20 @@ def step_roi_boundary(frame: np.ndarray, state) -> np.ndarray:
         ratio = stats.get("foreground_ratio")
         if ratio is not None:
             text_lines.append(("foreground %.1f%%" % (100.0 * ratio), 18, COLOR_TEXT))
+        # ★ 场景自校准：把本帧的色度平移量和"最终生效的框"显示出来。
+        #   换光照/换背景时一眼就能看出它在不在工作：平移量明显不是 0 就是在补。
+        #   （平移量为 0 说明本帧光照和标定基准一致，框按原样用）
+        shift = state.flags.get("scene_shift")
+        box = state.flags.get("scene_box")
+        if shift is not None and box is not None:
+            d_cr, d_cb = shift
+            if abs(d_cr) >= 1.0 or abs(d_cb) >= 1.0:
+                text_lines.append(("scene shift dCr%+.0f dCb%+.0f -> Cr[%d,%d] Cb[%d,%d]"
+                                   % (d_cr, d_cb, box[0], box[1], box[2], box[3]),
+                                   18, (0, 200, 255)))
+            else:
+                text_lines.append(("scene shift none, Cr[%d,%d] Cb[%d,%d]"
+                                   % (box[0], box[1], box[2], box[3]), 18, COLOR_TEXT))
         # 重建那一层额外把掌心和基准颜色显示出来，方便判断容差合不合适
         if stats.get("reconstructed"):
             palm = stats.get("palm_center")
