@@ -45,6 +45,7 @@ from __future__ import annotations
 import collections
 import importlib
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -70,10 +71,17 @@ DATA_DIR = "data"
 # "camera" = 摄像头实时采集
 # "video"  = 读磁盘上的**视频文件**（走和摄像头同一条 cv2.VideoCapture 路径，
 #            区别只在"读到结尾怎么办"，见下面的 VIDEO_LOOP）
-SOURCE = "image"
+SOURCE = "video"
 
 # --- 视频文件模式（SOURCE = "video" 时生效）---------------------------------
-VIDEO_FILE = "gesture.mp4"             # 相对 DATA_DIR；也可写绝对路径
+# ★ 视频素材清单（都放在 data/ 下，文件名相对 DATA_DIR）：
+#     gesture_video_1.mp4   1080x1920 竖幅  60fps  1863 帧  31.1 秒  手在画面里**较小**
+#     gesture_video_2.mp4    720x1280 竖幅  30fps   814 帧  27.1 秒  手**占画面很大**（旧素材）
+#     test_gestures.avi      1280x720  横幅  10fps    12 帧   1.2 秒  合成的冒烟测试片段
+#     vid_e2e_test.avi       1920x1440 横幅  10fps    16 帧   1.6 秒  合成的"0→1→2→5"片段
+#   两个 mp4 都是同一张印花床单 + 暗光下拍的，手势内容也类似，主要差别是**手占画面的大小**。
+#   实测手占比大的那个（video_2）掩膜更容易糊，所以**日常测试用 video_1**。
+VIDEO_FILE = "gesture_video_1.mp4"     # 相对 DATA_DIR；也可写绝对路径
 VIDEO_LOOP = True                      # True = 播完从头循环；False = 播完自动退出
 # 视频模式下每帧的等待时间：用 FRAME_DELAY_MS_CAMERA(=1)，让处理速度决定节奏。
 # 实测 1920x1440 下整条链约 115~135 ms/帧（约 8 fps）—— 见文件末尾的性能说明。
@@ -159,9 +167,35 @@ CAPTURE_FPS = 30.0
 #   2560x1440 -> 原样不动      （本来就在框内）
 # 所以老的 shou1/shou2.png 不受影响。
 #
+# ★★ 注意：这个降采样**只作用于图片模式** ★★
+#    视频 / 摄像头那条路径走的是 cv2.VideoCapture，**完全不经过这里** ——
+#    所以要单独用下面的 VIDEO_MAX_LONG_SIDE 限一下（见那里的说明）。
+#
 # 想改大小就改这两个数（比如两个都乘 2 就回到全分辨率）。
 IMAGE_MAX_WIDTH = 2560
 IMAGE_MAX_HEIGHT = 1440
+
+# --- ★★ 视频 / 摄像头帧的长边上限（像素）。0 = 不限制 ★★ ---------------------
+# ⚠️ 为什么必须有这个：图片模式的降采样**只在 ImageSource.load() 里做**，
+#    视频/摄像头这条路径（cv2.VideoCapture）**完全不经过它** ✗
+#    所以以前 1080x1920 的视频是整幅 **2.07 Mpx** 进流水线的。
+#
+# 实测（1080x1920 竖幅，完整链，模式 6）耗时分布：
+#     色彩阈值      8.8 ms
+#     掩膜清理     16.2 ms
+#     **掌心重建   85.6 ms  ← 占 62%，瓶颈就是它**
+#     识别骨架     16.5 ms
+#     画图 + ROI    4.0 ms
+#     合计        137 ms
+#   瓶颈按像素数线性涨，所以**降采样是最划算的一刀**：
+#     不限制 -> 1080x1920 = 2.07 Mpx -> 137 ms（7.3 fps）
+#     长边 1280 ->  720x1280 = 0.92 Mpx ->  约 50 ms（20 fps）
+#     长边  960 ->  540x960  = 0.52 Mpx ->  约 29 ms（34 fps）
+#
+# ⚠️ 1280 的取值理由：掌心半径 R 在 720x1280 下约 113 px，
+#    而指尖/指缝这些几何判据都是**按 R 归一化**的，113 px 足够稳 ✓
+#    再小就要重新验证精度了（改完记得跑 28 张静态图回归）。
+VIDEO_MAX_LONG_SIDE = 1280
 
 DISPLAY_WIDTH = 1280                   # 显示窗口宽度（720p）
 DISPLAY_HEIGHT = 720                   # 显示窗口高度（720p）
@@ -183,7 +217,11 @@ DISPLAY_BG = (0, 0, 0)                 # 补边的颜色（BGR），黑边
 
 WINDOW_NAME = "video pipeline"
 
-MIRROR_DEFAULT = True                  # 默认水平镜像，符合照镜子式交互习惯
+MIRROR_DEFAULT = False                # ★ 默认不镜像
+#   ⚠️ 用户的要求：机械手是**右手**，拍的照片/视频也**全是右手**，所以**
+#      绝对不要自动镜像** —— 镜像会把左右手弄反，拇指和小指互换。
+#      （以前这里是 True，理由是"符合照镜子式交互习惯"，现在作废。）
+#      按 m 键仍可手动切换，但默认必须是关的。
 SHOW_OVERLAY_DEFAULT = True            # 默认显示 FPS / 分辨率等信息
 MAX_CONSECUTIVE_READ_FAILURES = 30     # 连续读不到帧多少次后退出
 
@@ -872,12 +910,49 @@ def main() -> int:
     #      放在外部处理插件之后，它们画的标注才不会被后续处理吃掉。
     add_display_plugins(registry)
 
+    # 2.6) ★★ 命令行覆盖输入源 —— 方便**快速切换，不用改文件、不用重开编辑器** ★★
+    #        python main.py              用本文件里 SOURCE 的设定（默认 video）
+    #        python main.py image        强制照片流（28 张，n/p 翻页）
+    #        python main.py video        强制视频流（用 VIDEO_FILE）
+    #        python main.py video 2      直接用第 2 个视频素材（gesture_video_2.mp4）
+    #        python main.py camera       摄像头
+    #      ⚠️ 需要在函数里改全局，所以这里用 global 声明。
+    if len(sys.argv) > 1:
+        globals()  # 仅为可读性标记：下面用的是 global 语句
+    global SOURCE, VIDEO_FILE
+    if len(sys.argv) > 1:
+        want = str(sys.argv[1]).strip().lower()
+        alias = {"image": "image", "img": "image", "photo": "image", "pic": "image",
+                 "video": "video", "vid": "video", "camera": "camera", "cam": "camera"}
+        if want not in alias:
+            print("[main] 无法识别的输入源 %r；可用：image / video / camera" % sys.argv[1])
+            print("       例：python main.py image     python main.py video 2")
+            return 1
+        SOURCE = alias[want]
+        if SOURCE == "video" and len(sys.argv) > 2:
+            pick = str(sys.argv[2]).strip()
+            if os.path.isabs(pick):
+                VIDEO_FILE = pick
+            else:
+                cand = pick if pick.lower().endswith((".mp4", ".avi", ".mov", ".mkv")) \
+                    else "gesture_video_%s.mp4" % pick
+                if os.path.exists(os.path.join(DATA_DIR, cand)):
+                    VIDEO_FILE = cand
+                else:
+                    print("[main] 找不到视频素材 %r（试过 %s）" % (pick, cand))
+                    return 1
+    _kind = SOURCE.strip().lower()
+    print("[main] 输入源 = %s%s"
+          % (SOURCE, ("   视频 = %s" % VIDEO_FILE) if _kind == "video" else ""))
+    print("[main] 换输入源不用改文件：python main.py image | video [序号] | camera")
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
     # ★ 素材统一放在 DATA_DIR 子目录里（见文件开头的配置）。
     #   DATA_DIR 写成 "" 时 os.path.join 会给回 base_dir 本身，行为退回老样子。
     data_dir = os.path.join(base_dir, DATA_DIR) if DATA_DIR else base_dir
     source_kind = SOURCE.strip().lower()
     is_video = (source_kind == "video")
+    is_image = (source_kind == "image")
 
     cap: Optional[cv2.VideoCapture] = None
     image_source: Optional[ImageSource] = None
@@ -995,6 +1070,20 @@ def main() -> int:
                     recent_dt.append(state.dt)
                     average_dt = sum(recent_dt) / len(recent_dt)
                     state.fps = 1.0 / average_dt if average_dt > 0 else 0.0
+
+                # 5.2.5 ★★ 视频/摄像头帧降采样（照片流早就在载入时降过了）★★
+                #   ⚠️ 为什么需要：图片模式的 fit_within 只在 ImageSource.load() 里调用，
+                #      **视频/摄像头这条路径完全不经过它** —— 以前 1080x1920 的视频
+                #      是整幅 2.07 Mpx 进流水线的 ✗
+                #   实测（1080x1920 竖幅，完整链）：
+                #        原始 1080x1920 -> 137 ms   |  长边限 1280 -> 720x1280 -> 约 50 ms
+                #        长边限  960    -> 540x960  -> 约 29 ms
+                #   瓶颈是 palm_reconstruct（占 62%），它按像素数线性涨，所以降采样最划算。
+                #   ⚠️ 必须放在 state.raw_size 赋值【之前】，否则 ROI 会按旧尺寸算。
+                if not is_image and VIDEO_MAX_LONG_SIDE > 0:
+                    long_side = max(raw.shape[0], raw.shape[1])
+                    if long_side > VIDEO_MAX_LONG_SIDE:
+                        raw = fit_within(raw, VIDEO_MAX_LONG_SIDE, VIDEO_MAX_LONG_SIDE)
 
                 # 5.3 把本帧信息写进共享状态，插件通过 state 读取原图尺寸和裁切区
                 state.raw_frame = raw

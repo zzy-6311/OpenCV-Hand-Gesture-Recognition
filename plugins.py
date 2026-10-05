@@ -70,6 +70,17 @@ ROI_TRACK_MIN_RADIUS = 12.0    # 掌心 R 小于此值就认为不可靠，本�
 ROI_RELATIVE = (0.25, 0.10, 0.50, 0.80)
 
 # 是否启用 ROI 限制。改成 False 就退回「整幅图都参与识别」。
+#
+# ⚠️⚠️ **实测：静态图上绝对不要关！**（2026-10 实测，28 张素材）
+#      ROI 开 -> 28/28        ROI 关 -> **16/28（退化 12 张）**
+#    失败模式非常一致：**掌心半径 R 从 ~140 暴涨到 253~319**，然后全判成 0（握拳）：
+#      gesture_01: R146 -> R274      gesture_02: R129 -> R319
+#      gesture_05: R138 -> R285      gesture_06: R141 -> R270  ...
+#    原因：关掉 ROI 后白板/桌面那片背景也进了掩膜，而"掌心"取的是**距离变换最大值点**
+#      -> 最大内切圆落到背景块上 -> R 暴涨 -> 所有按 R 归一化的门槛全部松掉
+#      -> 指尖达不到 1.45R -> 数出 0 根手指 -> 判成握拳。
+#    ★ 在**视频**上关掉 ROI 看着还行（手小又居中、背景块没那么大），但照片流一关就崩。
+#      想临时对比可以按 r 键实时切换，不要改这个常量。
 ROI_ENABLED = True
 
 # 是否把 ROI 边界画在画面上。True = 你看到的框就是真正生效的框。
@@ -205,6 +216,53 @@ SCENE_BASELINE_CB = 128.0
 SCENE_SHIFT_CLAMP = 22.0
 # 估计背景色度时的下采样步长（每隔几行/列取一个点，避免每帧算 100 万像素的中位数）
 SCENE_ESTIMATE_STEP = 4
+
+# --- ★ 背景取样位置：从"整个 ROI"改成"三边环带 + 分块表决" -------------------
+#
+# ⚠️ 为什么必须改（实测翻车）：
+#    原来取 **ROI 内所有像素** 的 Cr/Cb 中位数当背景色，隐含假设"背景占一半以上"。
+#    静态图里手只占 10~15%，假设勉强成立；**但视频里手占了 ROI 的 24~37%** ——
+#    中位数被手拽偏：实测 frame 40 真实背景 Cr=137，而 ROI 中位数算出 **142**。
+#    平移方向估错 -> 肤色框被挪到反方向 -> 越校准越糟 -> 掩膜糊成一片。
+#    这是**"取样位置"的结构性错误，不是阈值数值问题**。
+#
+# ★ 改法：不再从整个 ROI 取样，改为从"手几乎不可能出现的**边缘环带**"取样；
+#    并且把每条边**切成若干小块分别估计、再对块结果取中位数（多数表决）**。
+#    底层逻辑：把"一个容易被整体污染的大估计"拆成"很多个局部小估计 + 多数表决"，
+#    污染从"按比例毒化整体"变成"要么整个丢掉一个局部、要么完全不丢"。
+#
+# ★ 为什么只用上、左、右三条边：**小臂从画面下方入画**（触边检查故意不查下边
+#    就是同一个原因），下边环带会被小臂长期占住，取样无意义。
+#  ★ **但实测结论：ring 反而更差，所以默认改回 "roi"**（保留代码和开关，随时对照）：
+#      配置              静态图 28 张   视频 8 帧   frame40 前景
+#      roi（旧）            28/28 ✓      1/8        42%
+#      ring P50（原方案）    23/28 ✗      0/8        46%
+#      ring P25             23/28 ✗      0/8        48%
+#      ring P15             28/28 ✓      1/8        45%
+#    为什么失败（实测查清）：这个方案假设"边缘环带手几乎不出现"，但——
+#      · 视频里手很大，**直接压在 ROI 右边带上**（右侧 4~5 个块是手）
+#      · 更要命的是：**环带量的那片背景本身就有大块"肤色"** ——
+#        床单的粉色印花。frame 40 的块级数据（Cr / Y）：
+#            印花块  Cr 147~155   Y 134~157   <- 亮
+#            手块    Cr 157~159   Y  71~115   <- 暗
+#        Cr 上两者**几乎重合**，所以"把背景估计修准"这件事本身没有意义 ——
+#        修准了也分不开，反而把框往错的方向挪（前景 42% -> 48%）。
+#    ★ 真正的缺口是**亮度 Y**：手的 Y 干净地低于背景（这里 71~115 vs 134~157，
+#      中间在 Y≈120~130 有空隙）。Y 是**正交线索**，现在的 Y 区间是 [40,245]，
+#      等于完全没用上。这是下一步该做的（见交接文档第 8 节问题 2 方案 A）。
+SCENE_SAMPLE_MODE = "roi"       # "roi" = 整幅 ROI 中位数（实测最好，默认）/ "ring" = 三边环带分块表决（实验性，实测更差）
+SCENE_RING_FRAC = 0.12          # 环带宽度 = 对应边长的这个比例
+SCENE_RING_TILES = 8            # 每条边切成几段（共 3 × 8 = 24 个取样块）
+SCENE_RING_MIN_TILES = 4        # 有效块少于这个数就退回旧行为（极端帧的兜底）
+# ★ 汇总 24 个块时取哪个分位数。
+#   ⚠️ 实测教训：用 **50（中位数）不行** —— 这个方案假设"边缘环带手几乎不出现"，
+#      但实测视频里手很大、**直接压在 ROI 右边带上**：24 个块里 7~8 个被污染
+#      （背景块 Cr 130~137，手块 147~159）。污染超过一半时中位数也救不了，
+#      估计值被抬高 -> dCr 变大 -> 框挪多了 -> **前景反而更糊**。
+#   ★ 所以改成取**偏低的那一簇**：手的 Cr 比背景**高**，所以背景在块分布的**低端**。
+#      取 25 分位数就稳定落在背景簇里（实测见 NOTES/CHANGELOG）。
+#      ⚠️ 不能无脑取最小值：个别块可能是阴影/暗角，取分位数比取极值稳。
+SCENE_TILE_PERCENTILE = 25.0    # 50 = 中位数（原方案）/ 25 = 背景簇（推荐）
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -436,67 +494,130 @@ RECOG_MASK_TRUNCATE = True         # 模式 5 是否显示"截断后（只剩手
 #
 # ===========================================================================
 #
-#  分类用两个特征，都是**从图像算出来的**，没有任何按文件名/张号的映射：
+#  ★★ 改版：**不再分类手势，直接输出"每根手指伸/缩"** ★★
 #
-#  特征① 伸出了几根手指（n）—— 主特征
-#  特征② 每根伸出的手指"偏离掌轴多少度" —— 用来认拇指
+#  用户的要求：机械手只控制"打开/关闭"两个状态，不需要弯曲度；
+#  而且 3 和 33 在机械手上是**不同的动作**，所以必须知道**具体哪几根**手指。
+#  数字标签（0/1/2/3/…）整套废弃，只输出 5 位手指状态。
 #
-#  ── 为什么主特征选"根数" ────────────────────────────────────────────────
-#  ★ 这样 3 和 33 才能**自动归为同一类**：
-#      gesture_03 = 食指+中指+无名指（3 根）
-#      gesture_33 = 拇指+食指+中指（3 根）
-#    手指组合不同、但**根数都是 3** —— 零特判自然合并。
-#    反过来说，主特征如果选"哪几根手指"，反而会把它俩拆成两类。
+#  ── 做法（路线 2）：不从"指尖"倒推身份，而是从掌心沿 5 个扇区向外看 ──
+#  以掌心 C 为中心，在掌心局部坐标系里划 5 个**角度扇区**，每个扇区对应一根手指：
+#      · 每个扇区里均匀打若干条射线（FINGER_PROBE_RAYS 条）
+#      · 每条射线从 r = FINGER_PROBE_R_MIN·R 走到 FINGER_PROBE_R_MAX·R
+#      · 量"从掌心往外连续有多长一段落在掩膜里" = 该射线的延伸长度
+#      · 扇区延伸长度 = 该扇区所有射线里的最大值
+#      · 延伸长度 >= FINGER_EXTENDED_MIN_R·R  ->  这根手指**伸开**
 #
-#  ── 为什么还需要特征② ──────────────────────────────────────────────────
-#  ★ 数字 6 是"点赞"= **只伸拇指**，而数字 1 是"只伸食指"，**都是 1 根手指**。
-#    必须知道伸的是拇指还是食指，所以要比"这根手指偏不偏"：
-#      食指/中指/无名指 -> 基本沿掌轴朝上（偏离小）
-#      拇指 / 小指       -> 明显偏侧向      （偏离大）
-#    实测偏离角（相对"向上"方向）：
-#      食指  8.3°   中指 7~18°   无名指 2~17°    <- 朝上这一组
-#      拇指 49~60°  小指 37~52°                  <- 侧向这一组
-#    两组的间隙在 37~49 之间，取 45° 当门槛，两边都留了余量。
-#    注意：这个判据可靠地区分的是**拇指**（小指在门槛附近摇摆，但不影响判定，
-#    因为需要认小指的场合目前没有）。
+#  ── 为什么这样比"先找指尖"好 ─────────────────────────────────────────
+#   ① **蜷着的手指也能明确判"没伸开"**（老做法只有"检出/没检出"，分不清蜷起还是没找到）
+#   ② 5 根手指**各自独立**判定，天然输出 5 位向量
+#   ③ **不存在"身份分配"问题** —— 扇区本身就是身份
+#   ④ 顺带给出**连续的延伸长度**，将来要控弯曲度也不用重做
 #
-#  ── 判定表 ─────────────────────────────────────────────────────────────
-#      n = 0                     -> 0    握拳
-#      n = 1  该指偏侧向(=拇指)   -> 6    点赞（只伸拇指）
-#             否则(=食指)        -> 1
-#      n = 2  没有侧向手指        -> 2    剪刀（食指+中指）
-#             有一根侧向(=拇指)   -> 8    手枪（拇指+食指）
-#             两根都侧向          -> 6    拇指+小指（"六"的另一种比法）
-#      n = 3  跨度 <  70°         -> 3    ★ 3 和 33 都落这里
-#             跨度 >= 70°         -> ye   ★ 三指大张开（见下）
-#      n = 4                     -> 4
-#      n >= 5                    -> 5
+#  ── 扇区角度是怎么定的（★ 实测数据，不是猜的）─────────────────────────
+#  坐标系：right = (-up.y, up.x)，y 指向手腕为正，θ = atan2(x, -y)
+#  **约定：右手 + 掌心朝镜头** —— 此时拇指在 right 侧，所以 θ 的正方向 = 拇指侧。
 #
-#  ── 为什么 n=3 还要再看跨度 ─────────────────────────────────────────────
-#  "ye" 这个手势 = **食指 + 小指 + 拇指**打开，中指和无名指蜷缩。
-#  它和 3 / 33 的**手指数一模一样**（都是 3 根），光数根数分不开。
+#  用 28 张素材（每张的手势真值已知）反推每根手指的实测角度：
+#      拇指    +46° ~ +82°   （多数 +48~+55）
+#      食指    -11° ~ +29°
+#      中指    -24° ~ +13°
+#      无名指  -38° ~  -3°
+#      小指    -62° ~ -35°
+#  ⚠️ 食指/中指/无名指的区间**互相重叠** —— 因为手指张开程度不同，角度会整体挪。
+#     所以**不能只打一根射线**，必须用扇区 + 多条射线取最大，才容得下这个漂移。
 #
-#  ★ 但两者的**结构**根本不同，这才是能分开的真正原因：
-#      3 / 33 -> 伸出的是**相邻**的手指（食+中[+拇]），挤在一起  -> 跨度小
-#      ye     -> 伸出的是**隔开**的手指（食 + 小 + 拇），绕手掌散开 -> 跨度大
-#    跨度只是这个结构差异的一个表征。
-#
-#  实测（7 张含 3 根手指的素材）：
-#      手势          跨度        侧向手指数
-#      ye            98.3°       2    （小指 + 拇指）
-#      3（西式）      43.5~47.9°  0
-#      33（中式）     40.4~45.3°  1    （拇指）
-#  跨度差了**一倍以上**，余量非常大，所以拿跨度当判据（门槛 70°）。
-#
-#  ⚠️ 本来"侧向手指数"也能分（2 / 1 / 0），但**小指的侧向偏角本身就在 45° 门槛
-#     附近摇摆**（实测 37~52°，见上面"特征②"那段），ye 里的小指实测 47.9°，
-#     离门槛太近、不稳，所以没选它。
-#  ⚠️ **必须带 n==3 这个前提**：五指张开的跨度是 106~119°、66(拇+小指) 是 107°，
-#     都远超 70°，不限定根数会直接把它们误判成 ye。
+#  ⚠️⚠️ **已知失效情况：手背朝镜头** ⚠️⚠️
+#    实测 gesture_33（三个批次）的角度**全是负的**（拇指 -60°、食指 -37°、中指 -20°），
+#    和 08/ye 的拇指 +50° 正好相反 —— 说明那几张是**手背朝镜头**拍的，左右反了。
+#    当前实现按"掌心朝镜头"写死，**手背朝镜头时拇指和小指会互换**。
+#    以后要支持得先判"手心还是手背"（可用"拇指指根离手腕最近"这个解剖学事实）。
 # ---------------------------------------------------------------------------
-GESTURE_LATERAL_DEVIATION_DEG = 45.0   # 偏离掌轴超过这个角度就算"侧向手指"（拇指/小指）
-GESTURE_MAX_FINGERS = 5                # 手指数上限（超过按 5 算）
-GESTURE_YE_MIN_SPAN_DEG = 70.0         # 3 根手指时，跨度超过这个值就判 "ye"（食+小+拇 大张开）
+FINGER_NAMES = ("thumb", "index", "middle", "ring", "pinky")
+FINGER_LABELS_CN = ("拇指", "食指", "中指", "无名指", "小指")
+
+# ★★ 定位手指身份的做法：**名义角度模板 + 允许整体旋转/缩放 + 穷举子集匹配** ★★
+#
+# 为什么不再用"固定扇区"（那是第一版，实测 10/28 失败）：
+#   ① **掌轴估计不稳，实测偏 15~30°** —— 三张都是"五指张开"的素材，扇区中心却
+#      分别是 -13° / +17° / -8°，差了 30°。固定扇区一歪就整片错位。
+#   ② **食指/中指/无名指的角度区间本身重叠约 40°**（张开程度不同，整组一起挪）：
+#         食指  -12° ~ +29°，  中指  -20° ~ +13°，  无名指  -38° ~ -3°
+#      典型翻车：gesture_08（手枪，真值 拇指+食指）伸出的食指在 -10°，
+#      正好落在"中指扇区"里 -> 食指只读到 1.6（不过门槛）、蜷着的中指读到 2.6 ✗
+#
+# ★ 关键认识：**手指的相对顺序（拇→食→中→无名→小）是解剖学固定的、绝对可靠；
+#   不可靠的只有"绝对角度"**。所以别硬定边界，改成模板匹配：
+#     ① 算径向剖面 r(θ)：每个角度上掩膜从掌心往外连续延伸多长（× R）
+#     ② 给 5 根手指一组**名义角度**（下表），允许整体**旋转 δ** 和**缩放 s**
+#     ③ 穷举"哪几根伸开"的 2^5 = 32 种组合，每根按"到伸开中心/蜷起中心的距离"打分
+#     ④ 取总分最高的组合
+#   δ 把掌轴误差整个吸收掉，s 把张开程度吸收掉，穷举把"漏检/多检"吸收掉。
+FINGER_TEMPLATE_DEG = (47.0, -2.0, -19.5, -36.0, -60.0)
+#   ↑ 顺序 = (拇指, 食指, 中指, 无名指, 小指)。取自两张"五指张开"素材的实测均值
+#     （05: +48.3/-0.7/-20.0/-33.7/-57.6   05_s3: +46.1/-3.6/-19.2/-37.6/-61.9）
+FINGER_SEARCH_SHIFT_DEG = 45.0     # 允许整体旋转 ±这个角度（覆盖掌轴估计误差）
+FINGER_SEARCH_SHIFT_STEP = 1.5     # 旋转搜索步长
+FINGER_THUMB_RANGE_DEG = (40.0, 95.0)
+# ★ 要不要用"两个手性假设比代价"来判手背朝镜头（见 _finger_states）。
+#   开启后不需要任何"缝的 x < 某个值就镜像"的魔法数字 —— 用同一套代价函数做模型选择 ✓
+FINGER_TEST_MIRROR = False   # ★ **只有落在这个角度区间里的指尖才允许占用拇指槽**
+                                        #   实测：拇指 +46°~+82°，其余四根全部在 +30° 以下。
+                                        #   ⚠️ 不加这个门槛的话，gesture_03（真值 食+中+无名，
+                                        #      指尖角 +20.9/-4.3/-26.1）会被判成"拇+食+中" ——
+                                        #      因为 {拇,食,中} 的代价 730 比 {食,中,无名} 的 853 更低 ✗
+FINGER_SEARCH_SCALES = (0.80, 0.90, 1.00, 1.10, 1.20)   # 张开程度变化。
+#   ⚠️ **只在"拇指锚定"之后才启用**：δ 被拇指钉住后缩放是安全的；
+#      如果 δ 和 s 同时自由，哪几根手指就不可辨识了（见 _assign_finger_slots 的说明）。
+#      典型收益：gesture_ye 的小指实测 -47.9°，名义 -60°，s=0.85 时才配得上 ✓
+FINGER_CONTIGUOUS_PENALTY = 900.0  # 没找到拇指时的先验惩罚（平方度）：非"食指起连续"的组合
+                                   #   900 = 30²，相当于允许 30° 的角度失配
+FINGER_EXT_CENTER = 2.70           # "伸开"时典型的延伸长度（× R），实测伸开 2.0~3.1
+FINGER_CURLED_CENTER = 1.30        # "蜷起"时典型的延伸长度（× R），实测蜷起 1.1~1.7
+FINGER_PROFILE_MIN_DEG = -115.0    # 径向剖面的角度范围（相对掌轴）
+FINGER_PROFILE_MAX_DEG = 115.0
+FINGER_PROFILE_STEP_DEG = 2.0
+FINGER_THUMB_MIN_DEG = 40.0        # 最大指尖角超过这个值就认定是拇指 -> 用它锚定角度
+                                   #   实测：拇指 +46°~+82°，其余四根都在 +30° 以下
+# ★★ 第二个判据：**手指长度**（解剖学固定，与姿势无关）★★
+#   实测（三张"五指张开"素材的"指尖到掌心距离"，单位 R）：
+#       拇指 2.15/2.01/2.39   食指 2.90/2.93/2.71   中指 3.09/3.13/2.79
+#       无名指 2.98/2.97/2.58  小指 2.70/2.72/2.21
+#   均值 -> 拇指 2.18 < 小指 2.54 < 无名指 2.84 ≈ 食指 2.85 < 中指 3.00
+#   ★ 稳定可用的结论：**拇指明显最短**（比其余短 0.3~0.8R）、**中指最长**、
+#     **小指在非拇指里最短**；⚠️ 食指和无名指几乎一样长（2.85 vs 2.84），**别指望它**。
+FINGER_TEMPLATE_LEN = (2.18, 2.85, 3.00, 2.84, 2.54)
+# 打分权重：角度项单位是 平方度，长度项是 R²，量纲差很多，靠权重拉平 ——
+#   长度误差 0.1R -> 0.01 × 2500 = 25，约等于角度误差 5°。
+FINGER_W_ANGLE = 1.0
+FINGER_W_LEN = 2500.0
+# ★ 缩放偏离 1.0 的惩罚。**这一项是必须的** ——
+#   不加的话，缩放搜索会为了迁就一根无名指/小指的名义角度而把整个模板压扁：
+#   实测 gesture_08（手枪，真值 拇+食）在 s=0.90 时，{拇,无名} 的角度代价只有 96，
+#   比正确答案 {拇,食} 的 253 还低，于是判成"拇+无名" ✗
+#   惩罚 = W × (s−1)²，W=20000 时 s=0.9 罚 200、s=0.85 罚 450，
+#   足以压掉那种"靠压扁模板换来的假匹配"，同时保留张开程度的小幅合法变化 ✓
+FINGER_W_SCALE = 20000.0
+# ★★ 第三个判据：**指缝（web）的横向位置** ★★
+#   为什么指缝比指尖靠谱：指缝离掌心只有 1.1~1.3R，而指尖在 2.7~3.0R。
+#   同样的角度误差，换算成横向位置时**在指缝处小 2.4 倍** ✓
+#   实测名义位置（单位 R，掌心为 0，正方向 = 拇指侧，已排除手背朝镜头的素材）：
+#       T-I(拇指-食指) +0.72   I-M +0.20   M-R -0.34   R-P -0.84
+#   ⚠️ I-M / M-R / R-P 三条之间仍有重叠，所以**单独用它不够**，但当"第二判据"很有力：
+#      典型收益就是 gesture_08（手枪）：实测缝在 +0.53/+0.76/+0.75，
+#      若那根手指是食指 -> 缝应落在 T-I 的 +0.72 ✓
+#      若是指中指       -> 缝应落在 T-I 与 I-M 之间（≈+0.46）✗
+FINGER_WEB_X = (0.72, 0.20, -0.34, -0.84)
+FINGER_W_WEB = 8000.0            # 权重同长度项（0.1R 误差 ≈ 25 分 ≈ 5°）
+FINGER_WEB_COUNT_PENALTY = 1.0   # 缝的**条数**对不上时的惩罚（单位 R²，会被上面权重放大）
+FINGER_CONTIGUOUS_PENALTY = 900.0  # 没找到拇指时的先验惩罚（平方度）：非"食指起连续"的组合
+                                   #   900 = 30²，相当于允许 30° 的角度失配
+FINGER_EXTENDED_MIN_R = 1.80       # 兜底阈值：只用来给"每根手指"一个独立的二值判据
+                                   #   （主判据是模板匹配；这个用于显示和交叉检查）
+FINGER_PROBE_R_MIN = 0.50          # 射线起点（× R）—— 从掌内一点开始，保证"连着掌心"
+FINGER_PROBE_R_MAX = 3.20          # 射线终点（× R）—— 实测指尖在 2.7~3.0R
+FINGER_PROBE_R_STEP = 0.05         # 采样步长（× R）
+FINGER_RUN_GAP_TOLERANCE = 0.25    # 连续段里允许的最大缺口（× R），用来吞掉小噪声
 # ===========================================================================
 
 
@@ -507,7 +628,8 @@ CLEANUP_PLUGIN_NAME = "mask_cleanup"    # 开运算 + 面积过滤 + 填洞
 RECON_PLUGIN_NAME = "palm_reconstruct"  # 从掌心核心做颜色约束重建
 RECOG_PLUGIN_NAME = "hand_recognize"    # 识别骨架：截前臂 + 指尖 + 指缝（算）
 DRAW_MASK_PLUGIN_NAME = "recognize_on_mask"      # 把识别结果画在掩膜上
-DRAW_ORIG_PLUGIN_NAME = "recognize_on_original"  # 把识别结果画在原图上
+DRAW_ORIG_PLUGIN_NAME = "recognize_on_original"
+STABILITY_PLUGIN_NAME = "stability_gate"      # ★ 稳定性门控：过渡帧不出结论
 ROI_PLUGIN_NAME = "roi_boundary"        # 画 ROI 边界 + 触边检查
 
 # 默认启用状态。真正的开关在 main.py 的 VIEW_MODES（按 1/2/3/4/5/6 切换）。
@@ -796,30 +918,144 @@ def step_gray_threshold(frame: np.ndarray, state) -> np.ndarray:
 # ===========================================================================
 # 处理方法 B：YCbCr 色度（Cr / Cb）双通道区间二值化
 # ===========================================================================
+def _sampled_median(plane: np.ndarray, y0: int, y1: int, x0: int, x1: int,
+                    step: int) -> float:
+    """在矩形区域里**隔点取样**后取中位数；没有有效像素就返回 NaN。
+
+    隔点取样是为了省时间（整幅上百万像素跑 median 要好几毫秒）。
+    """
+    if y1 <= y0 or x1 <= x0:
+        return float("nan")
+    patch = plane[y0:y1:step, x0:x1:step]
+    if patch.size == 0:
+        return float("nan")
+    return float(np.median(patch.astype(np.float32)))
+
+
+def _scene_tiles(roi_rect, shape_hw) -> list:
+    """把"上 + 左 + 右"三条边带切成小块，返回每块的矩形 ``(y0, y1, x0, x1)``。
+
+    ⚠️ 环带厚度按**对应边长**算（方案里就是这么定义的）：
+         上边带的厚度 = SCENE_RING_FRAC × ROI 高度
+         左/右边带的厚度 = SCENE_RING_FRAC × ROI 宽度
+
+    ★ 为什么不用下边带：小臂从画面下方入画，下边带被小臂长期占住，取样无意义。
+    ★ 为什么要切块：挥手时手可能短暂扫到某一小段，切块后那一段会变成少数派，
+      第二轮中位数直接无视它，估计纹丝不动。
+    """
+    height, width = int(shape_hw[0]), int(shape_hw[1])
+    x0, y0, x1, y1 = roi_rect
+    roi_w, roi_h = x1 - x0, y1 - y0
+    if roi_w <= 0 or roi_h <= 0:
+        return []
+    tiles = int(max(1, SCENE_RING_TILES))
+
+    # 画面被裁到 ROI 内部时，宽度按 ROI 算，但坐标要夹回画面
+    thick_y = int(round(float(SCENE_RING_FRAC) * roi_h))      # 上边带厚度（沿 Y）
+    thick_x = int(round(float(SCENE_RING_FRAC) * roi_w))      # 左右边带厚度（沿 X）
+    thick_y = max(1, min(thick_y, roi_h))
+    thick_x = max(1, min(thick_x, roi_w))
+    # ROI 被截断的画幅上（比如 ROI 高 = 画面高），环带仍然落在画面内
+    thick_y = min(thick_y, max(1, height - y0))
+    thick_x = min(thick_x, max(1, width - x0))
+
+    out = []
+    # ---- 上边带：横向整条，切 tiles 段 ----
+    for k in range(tiles):
+        sx0 = x0 + int(round(roi_w * k / tiles))
+        sx1 = x0 + int(round(roi_w * (k + 1) / tiles))
+        out.append((y0, min(y0 + thick_y, y1), sx0, sx1))
+    # ---- 左边带：纵向整条，切 tiles 段（含与上边带重叠的角，重复取样无害）----
+    for k in range(tiles):
+        sy0 = y0 + int(round(roi_h * k / tiles))
+        sy1 = y0 + int(round(roi_h * (k + 1) / tiles))
+        out.append((sy0, sy1, x0, min(x0 + thick_x, x1)))
+    # ---- 右边带：同上 ----
+    for k in range(tiles):
+        sy0 = y0 + int(round(roi_h * k / tiles))
+        sy1 = y0 + int(round(roi_h * (k + 1) / tiles))
+        out.append((sy0, sy1, max(x1 - thick_x, x0), x1))
+    return out
+
+
 def _estimate_scene_shift(ycrcb: np.ndarray, state) -> tuple:
     """估计本帧相对"标定基准"的色度平移量，返回 ``(dCr, dCb)``。
 
-    **怎么估**：取 ROI 内 Cr/Cb 的**中位数**当"本帧的中性背景色度"。
-      · ROI 里手只占一小部分（实测 s1 约 10%、s3 约 15%），中位数由背景主导
-      · 用中位数而不是均值：抗住手的污染，也抗个别高光/阴影
-      · 先下采样再取中位数，省时间（整幅上百万像素跑 median 要好几毫秒）
+    两种取样模式（由 ``SCENE_SAMPLE_MODE`` 选）：
 
-    ⚠️ 这里**故意不**用"当前掩膜之外的像素"来估背景 —— 那是循环论证：
+    **"ring"（默认，抗污染）**：
+        从"上 + 左 + 右"三条边带取样，每条边切 8 段 -> 24 个块，
+        每块各算 Cr/Cb 中位数，最后 **对所有块的中位数再取一次中位数**
+        （中位数的中位数 = 多数表决）。手扫到一两个块时，它们变成少数派，直接被无视。
+
+    **"roi"（旧行为，留作对照）**：
+        取整个 ROI 的 Cr/Cb 中位数。静态图上够用，但手占 ROI 比例大时会估偏。
+
+    ⚠️ 两种模式都**故意不**用"当前掩膜之外的像素"来估背景 —— 那是循环论证：
        阈值已经糊掉的时候，被排除在外的只剩画面里最亮的那部分，
-       估出来的平移方向是**反的**，会把框挪得更错。整幅 ROI 的中位数才稳。
+       估出来的平移方向是**反的**。必须在固定位置上取样。
+
+    诊断信息写进 ``state.flags["scene_bg_estimate"]``（块值、最终估计、块间离散度）。
     """
     height, width = ycrcb.shape[:2]
     step = max(1, int(SCENE_ESTIMATE_STEP))
-    roi = build_roi_mask((height, width), roi_enabled_now(state)) > 0
-    sub_roi = roi[::step, ::step]
-    if not np.any(sub_roi):
-        return 0.0, 0.0
-    cr_values = ycrcb[::step, ::step, 1][sub_roi].astype(np.float32)
-    cb_values = ycrcb[::step, ::step, 2][sub_roi].astype(np.float32)
-    d_cr = float(np.median(cr_values)) - float(SCENE_BASELINE_CR)
-    d_cb = float(np.median(cb_values)) - float(SCENE_BASELINE_CB)
+    enabled = roi_enabled_now(state)
+    roi_rect = roi_rect_pixels((height, width))
+    x0, y0, x1, y1 = roi_rect
+
+    bg_cr = bg_cb = float("nan")
+    tile_cr: list = []
+    tile_cb: list = []
+    mode_used = "roi"
+
+    if str(SCENE_SAMPLE_MODE).lower() == "ring":
+        cr_plane = ycrcb[:, :, 1]
+        cb_plane = ycrcb[:, :, 2]
+        for (ty0, ty1, tx0, tx1) in _scene_tiles(roi_rect, (height, width)):
+            cr_med = _sampled_median(cr_plane, ty0, ty1, tx0, tx1, step)
+            if cr_med != cr_med:            # NaN -> 空块
+                continue
+            cb_med = _sampled_median(cb_plane, ty0, ty1, tx0, tx1, step)
+            if cb_med != cb_med:
+                continue
+            tile_cr.append(cr_med)
+            tile_cb.append(cb_med)
+        if len(tile_cr) >= int(SCENE_RING_MIN_TILES):
+            pct = float(SCENE_TILE_PERCENTILE)
+            pct = max(0.0, min(100.0, pct))
+            bg_cr = float(np.percentile(np.array(tile_cr, dtype=np.float32), pct))
+            bg_cb = float(np.percentile(np.array(tile_cb, dtype=np.float32), pct))
+            mode_used = "ring"
+
+    if mode_used == "roi":
+        # 环带块不够（极端帧）或显式选了旧模式 -> 退回整幅 ROI 中位数
+        roi = build_roi_mask((height, width), enabled) > 0
+        sub_roi = roi[::step, ::step]
+        if not np.any(sub_roi):
+            return 0.0, 0.0
+        bg_cr = float(np.median(ycrcb[::step, ::step, 1][sub_roi].astype(np.float32)))
+        bg_cb = float(np.median(ycrcb[::step, ::step, 2][sub_roi].astype(np.float32)))
+
+    d_cr = bg_cr - float(SCENE_BASELINE_CR)
+    d_cb = bg_cb - float(SCENE_BASELINE_CB)
     limit = float(SCENE_SHIFT_CLAMP)
-    return max(-limit, min(limit, d_cr)), max(-limit, min(limit, d_cb))
+    d_cr = max(-limit, min(limit, d_cr))
+    d_cb = max(-limit, min(limit, d_cb))
+
+    # 诊断：块值、最终估计、块间离散度（离散度大 = 背景花色多/不均匀，估计可信度低）
+    spread_cr = float(np.max(tile_cr) - np.min(tile_cr)) if len(tile_cr) >= 2 else float("nan")
+    spread_cb = float(np.max(tile_cb) - np.min(tile_cb)) if len(tile_cb) >= 2 else float("nan")
+    state.flags["scene_bg_estimate"] = {
+        "mode": mode_used,
+        "tiles": len(tile_cr),
+        "tile_cr": [round(v, 1) for v in tile_cr],
+        "tile_cb": [round(v, 1) for v in tile_cb],
+        "bg_cr": round(bg_cr, 1),
+        "bg_cb": round(bg_cb, 1),
+        "spread_cr": round(spread_cr, 1) if spread_cr == spread_cr else None,
+        "spread_cb": round(spread_cb, 1) if spread_cb == spread_cb else None,
+    }
+    return d_cr, d_cb
 
 
 def step_color_threshold(frame: np.ndarray, state) -> np.ndarray:
@@ -1498,6 +1734,62 @@ def _build_fingers(tips, gaps, palm_center, radius: float, up):
     return fingers
 
 
+RECOG_AXIS_FROM_ARM = False        # ★ 掌轴优先用【前臂主轴】估计，而不是"掌心-手腕"
+#   ⚠️ 为什么改这个（**前期处理的关键一步**）：
+#     原来 up = 掌心 - 手腕，而"手腕"取的是**掩膜横截面最窄的那一行** ——
+#     单行决策、很脆，实测掌轴误差能到 ±20°。而**所有角度判据都建立在 up 上** ✗
+#
+#   验证方法：张开的手里，**中指应当基本沿着掌轴**（解剖学事实）。
+#   用 8 张含中指的素材、拿真值取出中指，量它相对掌轴的角度：
+#        现用 up（掌心-手腕）：均值 -3.0°  标准差 12.4°  范围 -20.0°~+13.2°
+#        前臂主轴（PCA）      ：均值 +3.4°  标准差  7.7°  范围  -3.1°~+23.5°
+#   去掉同一个离群样本（gesture_05_busy）之后：
+#        现用 up：标准差 11.6°          前臂主轴：标准差 **3.2°** ★
+#   逐张看最清楚（04 / 05 / 05_s3 三张"张开的手"）：
+#        现用 up  下中指 = -13.7° / -20.0° / -19.2°   ✗
+#        前臂主轴 下中指 =  +0.4° /  +1.5° /  +4.2°   ✓✓
+#
+#   做法：前臂是一条细长带，取"沿 up 投影超过手腕"的像素做 PCA，主轴方向就是掌轴。
+#         拿不到足够前臂像素时自动退回原来的手腕方向。
+
+
+def _arm_principal_axis(mask: np.ndarray, palm_center, up, wrist):
+    """用**前臂区域的主轴方向**估计掌轴（比"掌心-手腕"稳，见 RECOG_AXIS_FROM_ARM）。
+
+    前臂区域 = 掩膜里"沿 up 的投影超过手腕"的那些像素。
+    返回朝掌心方向的单位向量；像素不够时返回 None（调用方退回原做法）。
+    """
+    ys, xs = np.nonzero(mask)
+    if xs.size < 64:
+        return None
+    pts = np.stack([xs, ys], axis=1).astype(np.float64)
+    center = np.asarray(palm_center, dtype=np.float64).reshape(2)
+    up = np.asarray(up, dtype=np.float64).reshape(2)
+    proj = (pts - center[None, :]) @ up
+    if wrist is not None:
+        cut = float((np.asarray(wrist, dtype=np.float64).reshape(2) - center) @ up)
+    else:
+        cut = 60.0                      # 没有手腕估计时用个固定下限兜底
+    sel = pts[proj > cut]
+    if sel.shape[0] < 64:
+        return None
+    centroid = sel.mean(axis=0)
+    delta = sel - centroid
+    cov = (delta.T @ delta) / float(sel.shape[0])
+    try:
+        vals, vecs = np.linalg.eigh(cov)
+    except np.linalg.LinAlgError:
+        return None
+    axis = vecs[:, int(np.argmax(vals))]
+    norm = float(np.linalg.norm(axis))
+    if norm < 1e-9:
+        return None
+    axis = axis / norm
+    if float(axis @ up) < 0:            # 统一朝掌心方向
+        axis = -axis
+    return axis
+
+
 def _recognize(mask: np.ndarray, state) -> Optional[dict]:
     """跑一遍识别骨架，返回结果字典；失败返回 None。"""
     if mask is None or int(np.count_nonzero(mask)) == 0:
@@ -1523,6 +1815,12 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
         direction = palm_center - wrist
         norm = float(np.linalg.norm(direction))
         up = direction / norm if norm > 1e-6 else np.array([0.0, -1.0], dtype=np.float64)
+    # ★ 用前臂主轴把掌轴精修一遍（实测标准差 12.4° -> 3.2°，见 RECOG_AXIS_FROM_ARM）
+    arm_axis = None
+    if RECOG_AXIS_FROM_ARM:
+        arm_axis = _arm_principal_axis(mask, palm_center, up, wrist)
+        if arm_axis is not None:
+            up = arm_axis
     hand = _truncate_forearm(mask, palm_center, up, radius) if RECOG_MASK_TRUNCATE else mask
     if int(np.count_nonzero(hand)) == 0:
         hand = mask
@@ -1603,101 +1901,377 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
         "fingers": fingers,
         "finger_count": len(tips),
     }
-    result["gesture"] = classify_gesture(result)
+    # ★ 主输出：5 根手指各自的「伸开 / 蜷起」（径向剖面 + 模板匹配）
+    #   顺序 = FINGER_NAMES = (拇指, 食指, 中指, 无名指, 小指)
+    #   原来的 classify_gesture（数字标签）整套已删除，不再用。
+    states, extensions, angles_used, match_detail = _finger_states(
+        hand, palm_center, up, radius, tips, gaps)
+    result["finger_states"] = states                 # 5 个 bool（主判据：模板匹配）
+    result["finger_extensions"] = extensions         # 5 个 float（× R），连续量
+    result["finger_ray_angles"] = angles_used        # 5 个 float（度），画射线用
+    result["finger_match"] = match_detail            # 匹配到的旋转/缩放/得分，调试用
+    result["finger_names"] = list(FINGER_NAMES)
+    result["finger_text"] = finger_states_text(states)
     return result
 
 
-def _lateral_deviation_deg(local) -> float:
-    """这根手指"偏离掌轴"多少度。掌轴方向（手指自然朝上的方向）在局部系里是 -90°。
+def _extend_along_ray(mask: np.ndarray, origin, direction, radius: float,
+                      r_min: float, r_max: float, r_step: float) -> float:
+    """沿一条射线量「从掌心往外连续有多长一段落在掩膜里」，返回长度（× R）。
 
-    食指/中指/无名指基本沿掌轴 -> 偏离小（实测 2~18°）
-    拇指 / 小指是侧向手指      -> 偏离大（实测 37~60°）
-    用环形角距，手转到大角度也不会算错。
+    做法：从 r_min 走到 r_max 采样掩膜，找**与内端相连**的那一段连续命中，
+    允许 ``FINGER_RUN_GAP_TOLERANCE`` 的小缺口（吞掉掩膜边缘的抖动），
+    遇到更长的空洞就停 —— 这样孤立的小噪声块不会被当成手指。
     """
-    angle = float(np.degrees(np.arctan2(float(local[1]), float(local[0]))))
-    return float(abs(((angle + 90.0 + 180.0) % 360.0) - 180.0))
+    height, width = mask.shape[:2]
+    rs = np.arange(r_min, r_max + 1e-9, r_step, dtype=np.float64)
+    xs = np.clip(np.round(origin[0] + direction[0] * rs * radius).astype(np.int32),
+                 0, width - 1)
+    ys = np.clip(np.round(origin[1] + direction[1] * rs * radius).astype(np.int32),
+                 0, height - 1)
+    hits = mask[ys, xs] > 0
+    if hits.size == 0 or not bool(hits[0]):
+        return 0.0
+    gap_max = max(1, int(round(float(FINGER_RUN_GAP_TOLERANCE) / max(1e-9, r_step))))
+    last_good = 0
+    gap = 0
+    for i in range(int(hits.size)):
+        if hits[i]:
+            gap = 0
+            last_good = i
+        else:
+            gap += 1
+            if gap > gap_max:
+                break
+    return float(rs[last_good])
 
 
-def _lateral_count(tips) -> int:
-    """伸出指尖里"侧向手指"（通常是拇指）的根数。"""
-    return sum(1 for t in tips
-               if _lateral_deviation_deg(t["local"]) >
-               float(GESTURE_LATERAL_DEVIATION_DEG))
+def _radial_profile(mask: np.ndarray, palm_center, up, radius: float):
+    """算**径向剖面**：每个角度上，掩膜从掌心往外连续延伸多长（× R）。
 
-
-def classify_gesture(rec: dict) -> dict:
-    """把识别结果判成一个手势数字。**全部由图像算出来**，没有任何按文件名/按张号的映射。
-
-    用两个特征：
-      ① 伸出手指的**根数** n
-      ② 每根手指**偏离掌轴多少度**（用来认拇指）
-
-    判定表：
-        n=0                 -> 0  握拳
-        n=1  偏侧向(=拇指)   -> 6  点赞（只伸拇指）
-             否则(=食指)    -> 1
-        n=2  没有侧向手指    -> 2  剪刀（食指+中指）
-             有一根侧向      -> 8  手枪（拇指+食指）
-             两根都侧向      -> 6  拇指+小指  ★ 6 的另一种比法
-        n=3  跨度 < 70°      -> 3  ★ 3 和 33 都落这里（伸出的是相邻手指）
-             跨度 >= 70°     -> ye ★ 食+小+拇（伸出的是隔开的手指，跨度大）
-        n=4                 -> 4
-        n>=5                -> 5
-
-    ★ "3 和 33 归为一类"怎么做到的：主特征是**根数**，而 gesture_03
-      （食指+中指+无名指）和 gesture_33（拇指+食指+中指）都是 3 根，
-      **自然合并、零特判**。这也是主特征不能选"哪几根手指"的原因。
-      同理 **6 也有两种比法**：只伸拇指（点赞）和 拇指+小指，都判为 6。
-
-    ★ 为什么还要特征②：数字 6 是"点赞"= **只伸拇指**，而数字 1 是"只伸食指"，
-      两者**都是 1 根手指** —— 必须知道伸的是拇指还是食指。
+    返回 ``(angles_deg, profile)``，两个等长的一维数组。
+    角度以掌轴为 0，**正方向 = 拇指侧**（右手 + 掌心朝镜头）。
     """
-    n = int(rec.get("finger_count", 0))
-    tips = rec.get("tips", [])
-    lateral = _lateral_count(tips)
-    span = float(rec.get("angle_span_deg", 0.0))
+    up = np.asarray(up, dtype=np.float64).reshape(2)
+    norm = float(np.linalg.norm(up))
+    if norm > 1e-9:
+        up = up / norm
+    right = np.array([-up[1], up[0]], dtype=np.float64)   # 与 _to_local_points 一致
+    origin = np.asarray(palm_center, dtype=np.float64).reshape(2)
 
-    if n <= 0:
-        return {"digit": 0, "name": "握拳", "lateral": 0,
-                "reason": "伸出 0 根手指"}
+    angles = np.arange(float(FINGER_PROFILE_MIN_DEG),
+                       float(FINGER_PROFILE_MAX_DEG) + 1e-9,
+                       float(FINGER_PROFILE_STEP_DEG), dtype=np.float64)
+    r_step = max(1e-3, float(FINGER_PROBE_R_STEP))
+    rs = np.arange(float(FINGER_PROBE_R_MIN),
+                   float(FINGER_PROBE_R_MAX) + 1e-9, r_step, dtype=np.float64)
 
-    if n == 1:
-        dev = _lateral_deviation_deg(tips[0]["local"]) if tips else 0.0
-        if lateral >= 1:
-            return {"digit": 6, "name": "点赞（只伸拇指）", "lateral": lateral,
-                    "reason": "1 根手指但偏离掌轴 %.0f° > %.0f° -> 是拇指不是食指"
-                              % (dev, GESTURE_LATERAL_DEVIATION_DEG)}
-        return {"digit": 1, "name": "一（只伸食指）", "lateral": lateral,
-                "reason": "1 根手指且偏离掌轴仅 %.0f° -> 沿掌轴朝上，是食指" % dev}
+    # ---- 一次性算出所有 (角度, r) 采样点，向量化取掩膜值 ----
+    t = np.radians(angles)[:, None]
+    dirs = np.cos(t) * up[None, :] + np.sin(t) * right[None, :]        # (A, 2)
+    pts = origin[None, None, :] + dirs[:, None, :] * (rs[None, :, None] * radius)
+    height, width = mask.shape[:2]
+    xs = np.clip(np.round(pts[:, :, 0]).astype(np.int32), 0, width - 1)
+    ys = np.clip(np.round(pts[:, :, 1]).astype(np.int32), 0, height - 1)
+    hits = mask[ys, xs] > 0                                            # (A, Rn)
 
-    if n == 2:
-        if lateral == 0:
-            return {"digit": 2, "name": "剪刀（食指+中指）", "lateral": lateral,
-                    "reason": "2 根手指都沿掌轴朝上（跨度 %.0f°）-> 相邻两指" % span}
-        if lateral >= 2:
-            # ★ 拇指+小指也是 6，只是比法不同 —— 和 3/33 归一类是同一个道理。
-            return {"digit": 6, "name": "六（拇指+小指）", "lateral": lateral,
-                    "reason": "2 根手指都是侧向手指（跨度 %.0f°）-> 拇指+小指，"
-                              "是 6 的另一种比法" % span}
-        return {"digit": 8, "name": "手枪（拇指+食指）", "lateral": lateral,
-                "reason": "2 根手指中 1 根偏侧向（跨度 %.0f°）" % span}
+    # ---- 每条射线：从内端往外找"允许小缺口"的连续段 ----
+    #   （逐角度循环 A≈116 次、每次 Rn≈54 步，实测 2~4 ms，可以接受）
+    gap_max = max(1, int(round(float(FINGER_RUN_GAP_TOLERANCE) / r_step)))
+    count_a, count_r = hits.shape
+    profile = np.zeros(count_a, dtype=np.float64)
+    for a in range(count_a):
+        row = hits[a]
+        if not bool(row[0]):
+            continue
+        last, gap = 0, 0
+        for i in range(count_r):
+            if row[i]:
+                gap = 0
+                last = i
+            else:
+                gap += 1
+                if gap > gap_max:
+                    break
+        profile[a] = float(rs[last])
+    return angles, profile
 
-    if n == 3 and span >= float(GESTURE_YE_MIN_SPAN_DEG):
-        # ★ "ye"（耶）= **食指 + 小指 + 拇指**打开，中指和无名指蜷缩。
-        #   也是 3 根手指，但伸出的是**隔开**的手指（不像 3/33 是相邻手指），
-        #   绕着手掌散开 -> 跨度特别大（实测 98°，而 3/33 只有 40~48°）。
-        #   ⚠️ 必须带 n==3 的前提，否则五指张开（跨度 106~119°）和 66（107°）
-        #      会被误判进来。详见配置区的判定表注释。
-        return {"digit": "ye", "name": "耶（食指+小指+拇指）", "lateral": lateral,
-                "reason": "3 根手指但跨度 %.0f° 远超 %.0f° -> 伸出的是隔开的手指"
-                          "（食+小+拇），判 ye" % (span, GESTURE_YE_MIN_SPAN_DEG)}
 
-    digit = min(n, int(GESTURE_MAX_FINGERS))
-    note = "伸出 %d 根手指（跨度 %.0f°）" % (n, span)
-    if n == 3:
-        note += "；3 和 33 都是 3 根，归为同一类"
-    return {"digit": digit, "name": "数字 %d" % digit, "lateral": lateral,
-            "reason": note}
+def _nominal_boundaries(combo):
+    """给定槽位组合，返回它**期望有几条指缝、各自在哪**（名义横向位置，从拇指侧排到小指侧）。
+
+    规则：把组合切成"连续段"；段内相邻两指之间有缝，段与段之间是一条"跨缝"，
+    跨缝的位置取中间那几条名义缝的均值。
+        例：{拇,食}          -> [T-I]                      = [+0.72]
+            {拇,中}          -> [T-I 与 I-M 的均值]         = [+0.46]
+            {食,中}          -> [I-M]                      = [+0.20]
+            {拇,食,小}       -> [T-I, (I-M,M-R,R-P)的均值]  = [+0.72, -0.33]
+    """
+    runs = []
+    for i in combo:
+        if runs and i == runs[-1][-1] + 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    out = []
+    for idx, run in enumerate(runs):
+        if idx > 0:
+            prev = runs[idx - 1]
+            vals = [float(FINGER_WEB_X[k]) for k in range(prev[-1], run[0])]
+            if vals:
+                out.append(sum(vals) / len(vals))
+        for a, _b in zip(run, run[1:]):
+            out.append(float(FINGER_WEB_X[a]))
+    return out
+
+
+def _assign_finger_slots(tip_angles, tip_lengths=None, web_xs=None):
+    """★ 把检出的**指尖角度 + 指尖长度 + 指缝位置**分配到 5 个手指槽位上。
+
+    返回 ``(states, order, anchor, detail)``：
+
+        states  5 个 bool，顺序 = (拇指, 食指, 中指, 无名指, 小指)
+        order   指尖的排列顺序（按角度降序），用来把槽位映射回具体是哪个指尖
+        anchor  "thumb" = 用拇指锚定了角度；"palm_axis" = 没找到拇指，退回掌轴
+        detail  调试信息（δ、各组合的代价）
+
+    ── 为什么必须用拇指锚定（实测推演）──────────────────────────────────
+    光靠"指尖角度 + 自由的整体旋转 δ"，**哪几根手指是数学上不可辨识的**：
+      · 食指/中指的名义角度只差 17.5°，而实测噪声有 ~10° ✗
+      · 允许 δ 自由时，"食指伸直(δ=0)"和"中指伸直(δ≈+9)"是几乎同一个几何构型 ✗
+      · 典型翻车：gesture_02（剪刀，真值 食+中）会被判成 无名+小指
+        （因为实测间距 28.8° 更接近 无名-小指 的 24°，而不是 食-中 的 17.5°）
+    **而拇指能打破这个简并**：实测拇指 +46°~+82°，其他四根都在 +30° 以下，
+    干净间隔 16° 以上 -> "最大角 > 40°" 可靠认出拇指 -> 用它把模板对齐，
+    δ 就不再自由，剩余四根的身份立刻确定 ✓
+      验证：gesture_08（手枪）拇指 +55.1° -> δ=−8.1° -> 食指预测 −10.1°，
+            实测 −9.8° ✓（若猜成中指，预测 −27.6°，差 17.8° ✗）
+
+    ── 没找到拇指时怎么办 ──────────────────────────────────────────────
+    退回掌轴（δ=0）。此时几何上确实有歧义，所以加一条**温和的先验**：
+    人类手势里非拇指的四根**基本都是从食指侧连续伸出的**（I / IM / IMR / IMRP），
+    对"不连续"的组合加一个惩罚项。这是低置信路径，结果会被标记出来。
+    """
+    template = np.asarray(FINGER_TEMPLATE_DEG, dtype=np.float64)
+    order = sorted(range(len(tip_angles)), key=lambda j: -float(tip_angles[j]))
+    ta = [float(tip_angles[j]) for j in order]
+    count = len(ta)
+    # 长度也按同一顺序重排（单位 R）
+    lens = [None] * count
+    if tip_lengths is not None:
+        for pos, j in enumerate(order):
+            try:
+                lens[pos] = float(tip_lengths[j])
+            except (TypeError, ValueError, IndexError):
+                lens[pos] = None
+
+    # ---- 1) 定角度锚 ----
+    anchor = "palm_axis"
+    has_thumb = False
+    if count > 0:
+        lo, hi = float(FINGER_THUMB_RANGE_DEG[0]), float(FINGER_THUMB_RANGE_DEG[1])
+        # ★ 拇指槽的门槛：实测拇指只在 +46~+82，其余四根都在 +30 以下。
+        #   不加这个门槛，gesture_03（真值 食+中+无名）会被判成"拇+食+中"。
+        has_thumb = bool(lo < ta[0] < hi)
+    if has_thumb:
+        anchor = "thumb"
+
+    # ---- 2) 枚举槽位组合（顺序固定：角度降序 <-> 槽位序号升序）----
+    by_size = {}
+    for m in range(32):
+        combo = tuple(i for i in range(5) if (m >> i) & 1)
+        by_size.setdefault(len(combo), []).append(combo)
+
+    if has_thumb:
+        want = count - 1                                    # 第一个指尖已占用拇指槽
+        pool = [c for c in by_size.get(want, []) if 0 not in c]
+        candidates = [(0,) + c for c in pool]
+        if count == 1:
+            candidates = [(0,)]
+        scales = [float(s) for s in FINGER_SEARCH_SCALES]
+    else:
+        # ★ 没有指尖落在拇指的角度区间 -> 拇指槽直接判"蜷起"，**不参与分配**
+        #   （否则 gesture_03 那种会把一个 +20.9° 的指尖错当成拇指）
+        candidates = [c for c in by_size.get(count, []) if 0 not in c]
+        scales = [1.0]
+
+    best = None
+    for combo in candidates:
+        for s in scales:
+            if anchor == "thumb":
+                # δ 由拇指钉住：θ_thumb = δ + s·template[0]
+                delta = ta[0] - s * float(template[0])
+            else:
+                delta = 0.0
+            pred = [delta + s * float(template[i]) for i in combo]
+            sse = float(sum((a - p) ** 2 for a, p in zip(ta, pred)))
+            # ★ 长度项：解剖学长度（拇指最短、中指最长，见 FINGER_TEMPLATE_LEN）
+            #   手上大小已经被 R 归一化，所以可以直接比绝对值。
+            len_sse = 0.0
+            for slot, ln in zip(combo, lens):
+                if ln is not None:
+                    d = float(ln) - float(FINGER_TEMPLATE_LEN[slot])
+                    len_sse += d * d
+            # ★ 指缝项：观测到的缝，与"这个组合期望的缝"逐个比横向位置
+            web_sse = 0.0
+            exp_webs = _nominal_boundaries(combo)
+            obs_webs = sorted([float(v) for v in (web_xs or [])], reverse=True)
+            if len(obs_webs) != len(exp_webs):
+                web_sse += float(FINGER_WEB_COUNT_PENALTY)
+            for o, e in zip(obs_webs, exp_webs):
+                web_sse += (o - e) ** 2
+            penalty = 0.0
+            if anchor != "thumb":
+                # 先验：非拇指部分应当是"从食指(1)开始连续"的一段
+                non_thumb = [i for i in combo if i != 0]
+                if non_thumb and non_thumb != list(range(1, 1 + len(non_thumb))):
+                    penalty = float(FINGER_CONTIGUOUS_PENALTY)
+            total = (float(FINGER_W_ANGLE) * sse
+                     + float(FINGER_W_LEN) * len_sse
+                     + float(FINGER_W_WEB) * web_sse
+                     + float(FINGER_W_SCALE) * (s - 1.0) ** 2 + penalty)
+            if best is None or total < best[0] - 1e-9:
+                best = (total, combo, sse, penalty, delta, s, len_sse, web_sse)
+
+    if best is None:
+        return [False] * 5, order, anchor, {"delta_deg": 0.0, "sse": None}
+
+    _total, combo, sse, penalty, delta, scale, len_sse, web_sse = best
+    states = [False] * 5
+    for i in combo:
+        states[i] = True
+    detail = {"delta_deg": delta, "sse": sse, "len_sse": len_sse, "web_sse": web_sse,
+              "penalty": penalty, "anchor": anchor, "slots": list(combo),
+              "scale": scale, "total": total}
+    return states, order, anchor, detail
+
+
+def _match_finger_template(angles: np.ndarray, profile: np.ndarray):
+    """★ 用"名义角度模板 + 允许整体旋转/缩放 + 穷举子集"匹配径向剖面。
+
+    返回 ``(states, ext_at_template, detail)``：
+
+        states          5 个 bool，顺序 = (拇指, 食指, 中指, 无名指, 小指)
+        ext_at_template 5 个 float，在**匹配到的角度**上量到的延伸长度（× R）
+        detail          dict，含匹配到的旋转/缩放/得分，调试用
+
+    **为什么这样比固定扇区稳**：掌轴估计偏 15~30° 时，固定扇区整片错位；
+    这里旋转量 δ 是**搜出来的**，把误差整个吸收掉。张开程度的变化由缩放 s 吸收。
+    子集穷举（2^5=32）则天然处理"漏检/多检"。
+    """
+    angles = np.asarray(angles, dtype=np.float64)
+    profile = np.asarray(profile, dtype=np.float64)
+    template = np.asarray(FINGER_TEMPLATE_DEG, dtype=np.float64)
+
+    shifts = np.arange(-float(FINGER_SEARCH_SHIFT_DEG),
+                       float(FINGER_SEARCH_SHIFT_DEG) + 1e-9,
+                       float(FINGER_SEARCH_SHIFT_STEP), dtype=np.float64)
+    scales = np.asarray(FINGER_SEARCH_SCALES, dtype=np.float64)
+
+    # 所有 (scale, shift) 组合 -> 预测角度矩阵 (N, 5)
+    ss, dd = np.meshgrid(scales, shifts, indexing="ij")
+    pred = (dd.ravel()[:, None] + ss.ravel()[:, None] * template[None, :])
+
+    # 在剖面上插值（越界取 0 = 那里没有掩膜）
+    vals = np.empty_like(pred)
+    for i in range(5):
+        vals[:, i] = np.interp(pred[:, i], angles, profile, left=0.0, right=0.0)
+
+    # 代价：每根手指到"伸开中心"/"蜷起中心"的距离
+    cost_ext = np.abs(vals - float(FINGER_EXT_CENTER))
+    cost_curled = np.abs(vals - float(FINGER_CURLED_CENTER))
+
+    # 32 个子集的得分 = -( Σ_{i∈S} cost_ext_i + Σ_{i∉S} cost_curled_i )
+    #   ★ 展开： = -Σ_all cost_curled - Σ_{i∈S}(cost_ext_i - cost_curled_i)
+    #   ⚠️ 所以 delta 那一项前面是**减号**！写成加号会让"包含手指"反而加分，
+    #      结果永远选"5 根全伸开"（我第一次就栽在这，28 张全判 TIMRP）。
+    bits = np.array([[(m >> i) & 1 for i in range(5)] for m in range(32)],
+                    dtype=np.float64)                                   # (32, 5)
+    base = -cost_curled.sum(axis=1)                                     # (N,)
+    delta = cost_ext - cost_curled                                      # (N, 5)
+    scores = base[:, None] - delta @ bits.T                             # (N, 32)
+
+    flat = int(np.argmax(scores))
+    n_idx, m = divmod(flat, 32)
+    states = [bool((m >> i) & 1) for i in range(5)]
+    matched_scale = float(scales[n_idx // len(shifts)])
+    matched_shift = float(shifts[n_idx % len(shifts)])
+    detail = {
+        "subset": m,
+        "shift_deg": matched_shift,
+        "scale": matched_scale,
+        "score": float(scores[n_idx, m]),
+        "angles_used": [float(matched_shift + matched_scale * a) for a in template],
+    }
+    return states, [float(v) for v in vals[n_idx]], detail
+
+
+def _finger_states(mask: np.ndarray, palm_center, up, radius: float, tips, web_gaps=None):
+    """★ 判断每根手指是**伸开**还是**蜷起**（主输出）。
+
+    返回 ``(states, extensions, angles_used, detail)``：
+        states      5 个 bool，顺序同 ``FINGER_NAMES`` = (拇指, 食指, 中指, 无名指, 小指)
+        extensions  5 个 float，各自角度上的延伸长度（× R）—— 连续量，
+                    调试用；将来若要控弯曲度也不用重做
+        angles_used 5 个 float，各自的角度（度），画射线用
+        detail      匹配细节（δ、锚、代价），调试用
+
+    **两条信息来源合并**：
+      ① **指尖角度 + 拇指锚定**（``_assign_finger_slots``）-> 决定"哪几根是伸开的"（身份）
+         指尖检测是可靠的（原来的手势分类就靠它拿到 28/28），角度也准；
+         真正的难点是**身份**，用拇指当锚解决（详见该函数的说明）。
+      ② **径向剖面**（``_radial_profile``）-> 给出每根手指的**连续延伸长度**，
+         并给拇指一个兜底判据（指尖漏检时靠它补）。
+
+    ⚠️ 坐标约定：``right = (-up.y, up.x)``，θ 正方向 = 拇指侧
+        （即**右手 + 掌心朝镜头**；手背朝镜头会左右颠倒，见配置区警告）
+    """
+    tip_angles = []
+    tip_lengths = []
+    for t in (tips or []):
+        x = float(t["local"][0])
+        y = float(t["local"][1])
+        tip_angles.append(float(np.degrees(np.arctan2(x, -y))))
+        tip_lengths.append(float(np.hypot(x, y)))     # 指尖到掌心的距离，已经是 R 的倍数
+
+    # 指缝的横向位置（单位 R），按从拇指侧到小指侧排序
+    web_xs = sorted([float(g["local"][0]) for g in (web_gaps or [])], reverse=True)
+
+    # ★★ 手性（掌心 / 手背朝镜头）用**两个假设比代价**来定，不写死门槛 ★★
+    #   解剖学上，右手掌心朝镜头时拇指在 right 侧；手背朝镜头时左右相反。
+    #   与其去写"缝的 x 小于 −0.3 就镜像"这种魔法数字，不如把两种手性**各跑一遍分配**，
+    #   取总代价更低的那个 —— 用同一套代价函数做模型选择，不需要任何新阈值 ✓
+    #   （实测 gesture_33 三张就是手背朝镜头，正面假设下怎么配都别扭，镜像假设自然胜出）
+    states, _order, anchor, detail = _assign_finger_slots(tip_angles, tip_lengths, web_xs)
+    best_total = float(detail.get("total", float("inf")))
+    mirrored = False
+    if FINGER_TEST_MIRROR:
+        st_m, _o_m, _a_m, det_m = _assign_finger_slots(
+            [-a for a in tip_angles], tip_lengths, [-v for v in web_xs])
+        if float(det_m.get("total", float("inf"))) < best_total - 1e-6:
+            states, anchor, detail, mirrored = st_m, _a_m, det_m, True
+            best_total = float(det_m.get("total", float("inf")))
+    detail["mirrored"] = mirrored
+
+    angles, profile = _radial_profile(mask, palm_center, up, radius)
+    delta = float(detail.get("delta_deg", 0.0))
+    used = [delta + float(FINGER_TEMPLATE_DEG[i]) for i in range(5)]
+    extensions = [float(np.interp(a, angles, profile)) for a in used]
+
+    # 拇指兜底：本次没用拇指锚（说明没检出拇指指尖），但剖面上拇指方向明显很长
+    if anchor != "thumb" and not states[0]:
+        if extensions[0] >= float(FINGER_EXTENDED_MIN_R):
+            states[0] = True
+            detail["thumb_from_profile"] = True
+    detail["anchor"] = anchor
+    detail["tip_angles_deg"] = [round(a, 1) for a in tip_angles]
+    return states, extensions, used, detail
+
+
+def finger_states_text(states) -> str:
+    """把 5 位状态拼成人类可读的一行，例如 ``拇指+食指+小指`` 或 ``（全部蜷起）``。"""
+    names = [FINGER_LABELS_CN[i] for i, s in enumerate(states) if s]
+    return "+".join(names) if names else "（全部蜷起）"
 
 
 def step_hand_recognize(frame: np.ndarray, state) -> np.ndarray:
@@ -1915,6 +2489,31 @@ def draw_info_panel(image: np.ndarray, lines, anchor: str = "top-left") -> None:
     draw_text_lines(image, lines, (text_x, y0 + HUD_TEXT_PAD_Y))
 
 
+# --- ★ 手指状态方块（主输出）的显示参数 -------------------------------------
+#  5 个正方形横排，顺序 = (拇指, 食指, 中指, 无名指, 小指)
+#  **实心 = 这根手指伸开；空心 = 蜷起**
+FINGER_BOX_SIZE = 54              # 方块边长（像素，画在帧上、缩放前）
+FINGER_BOX_GAP = 12               # 方块间距
+FINGER_BOX_THICKNESS = 4          # 空心方块的线宽
+COLOR_FINGER_ON = (0, 220, 0)     # 实心（伸开）：亮绿
+COLOR_FINGER_OFF = (120, 120, 120)  # 空心（蜷起）：灰
+FINGER_BOX_TAGS = ("T", "I", "M", "R", "P")   # 方块下方标记（拇指/食指/中指/无名指/小指）
+COLOR_UNSETTLED = (0, 215, 255)   # ★ 手在动（过渡帧）时的提示色：橙黄
+
+
+def _draw_dashed_rect(img, p1, p2, color, dash=14, thickness=3) -> None:
+    """画一个虚线矩形（用短线段拼）。用来表示"这一帧不算数"。"""
+    x1, y1 = int(p1[0]), int(p1[1])
+    x2, y2 = int(p2[0]), int(p2[1])
+    d = max(2, int(dash))
+    for x in range(x1, x2, d * 2):
+        cv2.line(img, (x, y1), (min(x + d, x2), y1), color, thickness)
+        cv2.line(img, (x, y2), (min(x + d, x2), y2), color, thickness)
+    for y in range(y1, y2, d * 2):
+        cv2.line(img, (x1, y), (x1, min(y + d, y2)), color, thickness)
+        cv2.line(img, (x2, y), (x2, min(y + d, y2)), color, thickness)
+
+
 def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
     """把识别结果画到给定底图上。"""
     height, width = base.shape[:2]
@@ -1989,20 +2588,60 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
     #   ★ 中文必须走 draw_text_lines（PIL 渲染）—— cv2.putText 画中文是乱码。
     #   ★ 面板宽度自适应并按画面比例设上限，避免和别处的文字叠在一起。
     # =======================================================================
-    gesture = result.get("gesture") or {}
-    digit = gesture.get("digit")
+    # ---- ★★ 主输出：5 个正方形（实心 = 伸开，空心 = 蜷起）★★ ----
+    #   顺序 = FINGER_NAMES = (拇指, 食指, 中指, 无名指, 小指)
+    #   ⚠️ 这里原来是显示 "GESTURE 3" 之类的**数字手势标签**，那一套已按用户要求
+    #      整套删除（classify_gesture 也删了）—— 机械手要控制的是**具体哪几根手指**。
+    states = list(result.get("finger_states") or [])
+    extensions = list(result.get("finger_extensions") or [])
+    while len(states) < 5:
+        states.append(False)
+    while len(extensions) < 5:
+        extensions.append(0.0)
+
+    box = int(FINGER_BOX_SIZE)
+    gap = int(FINGER_BOX_GAP)
+    bx0 = int(HUD_MARGIN)
+    by0 = int(HUD_MARGIN)
+    # ★ 这一帧手稳不稳（由 stability_gate 写进结果里）
+    #   settled=False 时，下面画的 states 其实是"上次稳定时的判定"（保持值），
+    #   所以方块整体套一个黄虚线框 + 文字里说明，避免误以为它是本帧判的。
+    settled = bool(result.get("settled", True))
+    # ⚠️⚠️ **显示顺序：拇指在最右** ⚠️⚠️
+    #   右手掌心朝镜头时，拇指就在**画面右侧** —— 方块要跟画面一致，
+    #   所以从左到右 = 小指, 无名指, 中指, 食指, 拇指。
+    #   （内部下标 i 仍是 FINGER_NAMES 的顺序：0=拇指 … 4=小指，只在**画**的时候反过来。）
+    for pos in range(5):
+        i = 4 - pos                       # pos=0 -> i=4 小指 …… pos=4 -> i=0 拇指
+        x = bx0 + pos * (box + gap)
+        if states[i]:
+            cv2.rectangle(base, (x, by0), (x + box, by0 + box), COLOR_FINGER_ON, -1)
+        else:
+            cv2.rectangle(base, (x, by0), (x + box, by0 + box), COLOR_FINGER_OFF,
+                          int(FINGER_BOX_THICKNESS))
+        # ⚠️ 方块下面用 cv2.putText 画 **ASCII 缩写**（T/I/M/R/P）：
+        #    中文必须借 PIL，而 5 个方块各做一次 PIL 往返要好几个毫秒 × 5，太慢。
+        #    完整中文名放在下面信息面板里**一次性**写。
+        cv2.putText(base, FINGER_BOX_TAGS[i], (x + int(box * 0.32), by0 + box + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, COLOR_LABEL, 2, cv2.LINE_AA)
+    squares_bottom = by0 + box + 36
+    if not settled:
+        # 黄虚线框 = 手还在动，下面显示的是"保持值"
+        total_w = 5 * box + 4 * gap
+        _draw_dashed_rect(base, (bx0 - 8, by0 - 8), (bx0 + total_w + 8, by0 + box + 34),
+                          COLOR_UNSETTLED, dash=14, thickness=3)
+
     palm_rel = result.get("palm_rel", (0.0, 0.0))
 
     hud_lines = []
-    if digit is not None:
-        hud_lines.append(("GESTURE  %s" % digit, 40, (0, 230, 255)))          # 大号主结果
-        hud_lines.append((str(gesture.get("name", "")), 24, (120, 255, 120)))  # 中文名
-        hud_lines.append((str(gesture.get("reason", "")), 17, (185, 185, 185)))  # 判定依据
-    else:
-        hud_lines.append(("GESTURE  ?", 40, (0, 140, 255)))
-        hud_lines.append((str(gesture.get("name", "未知")), 24, (120, 200, 255)))
-        hud_lines.append((str(gesture.get("reason", "")), 17, (185, 185, 185)))
-
+    if not settled:
+        hud_lines.append(("过渡中（手在动）— 下面是上一次稳定的判定", 18, COLOR_UNSETTLED))
+    hud_lines.append(("手指: %s" % result.get("finger_text", "?"), 24, (0, 230, 255)))
+    # 连续量也显示出来：调门槛时一眼看出余量够不够（单位是 R 的倍数）
+    hud_lines.append(("延伸 " + "  ".join("%.1f" % e for e in extensions),
+                      16, (185, 185, 185)))
+    hud_lines.append(("（门槛 %.1fR，实心=伸开）" % float(FINGER_EXTENDED_MIN_R),
+                      15, (150, 150, 150)))
     hud_lines.append((" ", 8, (0, 0, 0)))                                      # 空行分隔
     hud_lines.append(("fingers %d    gaps %d" % (result["finger_count"], len(result["gaps"])),
                       18, COLOR_LABEL))
@@ -2017,7 +2656,8 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
     else:
         hud_lines.append(("wrist not found -> up = image up", 18, (180, 180, 180)))
 
-    draw_info_panel(base, hud_lines, anchor="top-left")
+    # ★ 文字面板改到**方块下面**（原来 anchor="top-left" 会和方块叠在一起）
+    draw_text_lines(base, hud_lines, (int(HUD_MARGIN), int(squares_bottom)), panel=True)
     return base
 
 
@@ -2053,98 +2693,111 @@ def step_roi_boundary(frame: np.ndarray, state) -> np.ndarray:
     enabled = roi_enabled_now(state)
     state.flags["roi_enabled"] = enabled          # 回写，让 r 键有个确定的初始值
 
-    if not enabled:
-        state.flags["roi_touched"] = []
-        return frame
-
     height, width = frame.shape[:2]
     x0, y0, x1, y1 = roi_rect_pixels((height, width))
 
-    # 触边检查：只在"当前显示的确实是掩膜"时才做。
+    # 触边检查：只在 **ROI 真的生效** 且 "当前显示的确实是掩膜" 时才做。
     # 显示模式 1 是原图，任何像素都非零，做触边检查毫无意义（会把三条边全点亮）。
     has_mask = bool(state.flags.get("view_mode_has_mask", True))
-    touched = find_touched_edges(frame, (height, width), enabled) if has_mask else []
+    touched = find_touched_edges(frame, (height, width), enabled) \
+        if (enabled and has_mask) else []
     state.flags["roi_touched"] = touched
 
-    if not ROI_DRAW_BOUNDARY:
-        return frame
-
-    # 画边界。触边时用红色，正常用橙黄。
-    #
-    # ⚠️ 注意线宽是**以坐标为中心向两侧扩展**的：在 (x0,y0) 画厚度 3 的矩形，
-    #    线会溢出到 x0-1 / y0-1，也就是 ROI 之外。测试时正是这一点让
-    #    "ROI 外必须全黑"被破坏。所以这里把矩形**往里缩** thickness+1 像素画。
-    color = COLOR_BOUNDARY_BAD if touched else COLOR_BOUNDARY
     thickness = 3
     inset = thickness + 1
-    cv2.rectangle(frame,
-                  (x0 + inset, y0 + inset),
-                  (x1 - 1 - inset, y1 - 1 - inset),
-                  color, thickness)
+    # ★ ROI 关掉时**不画框** —— 否则会画一个"看着像限制、其实没生效"的框，反而误导。
+    if enabled and ROI_DRAW_BOUNDARY:
+        # 画边界。触边时用红色，正常用橙黄。
+        #
+        # ⚠️ 注意线宽是**以坐标为中心向两侧扩展**的：在 (x0,y0) 画厚度 3 的矩形，
+        #    线会溢出到 x0-1 / y0-1，也就是 ROI 之外。测试时正是这一点让
+        #    "ROI 外必须全黑"被破坏。所以这里把矩形**往里缩** thickness+1 像素画。
+        color = COLOR_BOUNDARY_BAD if touched else COLOR_BOUNDARY
+        cv2.rectangle(frame,
+                      (x0 + inset, y0 + inset),
+                      (x1 - 1 - inset, y1 - 1 - inset),
+                      color, thickness)
 
-    # 文字统一挪到 ROI 的**左下角**。
-    # ⚠️ 原来画在 ROI 左上角，实测会和识别 HUD 面板（也在左上角）叠在一起。
-    #    挪到左下角就彻底错开了；那里正好是手臂进入 ROI 的位置，底色深，更好认。
-    # ⚠️ 这里必须用 draw_text_lines 而不是 cv2.putText —— 因为 view_mode 是中文
+    # ★★ 左下角的信息面板：**不管 ROI 开不开都要画**。
+    #    ⚠️ 原来 ROI 关掉时这个函数直接 return，结果整个诊断面板（前景占比、
+    #       场景自校准量、掌心 C/R）全都不显示 —— 而那正是调算法时最需要看的。
+    #    ⚠️ 这里也**不再用 has_mask 包住**：那些统计量只要算出来了就该显示。
+    #       默认显示模式 6（原图）的 has_mask 是 False，会被整块藏掉；
+    #       而模式 1 根本没有掩膜、segment_stats 是空的，自然就跳过了。
+    #    位置：ROI 生效时贴 ROI 左下角（那里正好是手臂入画处、底色深好认）；
+    #          ROI 关掉时贴画面左下角。
+    # ⚠️ 必须用 draw_text_lines 而不是 cv2.putText —— view_mode 是中文
     #    （"原图"/"掩膜"/"识别(原图)"…），cv2 的 Hershey 字体画中文只会出乱码。
     stats = state.flags.get("segment_stats") or {}
     text_lines = []
     if touched:
         text_lines.append(("TOUCHING ROI: %s" % ",".join(touched), 20, COLOR_BOUNDARY_BAD))
+    if not enabled:
+        text_lines.append(("ROI: off (整幅画面都参与识别)", 18, (0, 200, 255)))
     view_mode = state.flags.get("view_mode")
     if view_mode:
         text_lines.append(("view: %s" % view_mode, 18, COLOR_TEXT))
-    if has_mask:
-        piece = []
-        method = stats.get("method")
-        if method:
-            piece.append("gray" if method == "gray" else "color(Cr/Cb)")
-        if stats.get("cleaned"):
-            piece.append("cleaned")
-        if stats.get("reconstructed"):
-            piece.append("recon")
-        if piece:
-            text_lines.append(("method: %s" % "+".join(piece), 18, COLOR_TEXT))
-        ratio = stats.get("foreground_ratio")
-        if ratio is not None:
-            text_lines.append(("foreground %.1f%%" % (100.0 * ratio), 18, COLOR_TEXT))
-        # ★ 场景自校准：把本帧的色度平移量和"最终生效的框"显示出来。
-        #   换光照/换背景时一眼就能看出它在不在工作：平移量明显不是 0 就是在补。
-        #   （平移量为 0 说明本帧光照和标定基准一致，框按原样用）
-        shift = state.flags.get("scene_shift")
-        box = state.flags.get("scene_box")
-        if shift is not None and box is not None:
-            d_cr, d_cb = shift
-            if abs(d_cr) >= 1.0 or abs(d_cb) >= 1.0:
-                text_lines.append(("scene shift dCr%+.0f dCb%+.0f -> Cr[%d,%d] Cb[%d,%d]"
-                                   % (d_cr, d_cb, box[0], box[1], box[2], box[3]),
-                                   18, (0, 200, 255)))
+    piece = []
+    method = stats.get("method")
+    if method:
+        piece.append("gray" if method == "gray" else "color(Cr/Cb)")
+    if stats.get("cleaned"):
+        piece.append("cleaned")
+    if stats.get("reconstructed"):
+        piece.append("recon")
+    if piece:
+        text_lines.append(("method: %s" % "+".join(piece), 18, COLOR_TEXT))
+    ratio = stats.get("foreground_ratio")
+    if ratio is not None:
+        text_lines.append(("foreground %.1f%%" % (100.0 * ratio), 18, COLOR_TEXT))
+    # ★ 场景自校准：把本帧的色度平移量和"最终生效的框"显示出来。
+    #   换光照/换背景时一眼就能看出它在不在工作：平移量明显不是 0 就是在补。
+    #   （平移量为 0 说明本帧光照和标定基准一致，框按原样用）
+    shift = state.flags.get("scene_shift")
+    box = state.flags.get("scene_box")
+    if shift is not None and box is not None:
+        d_cr, d_cb = shift
+        if abs(d_cr) >= 1.0 or abs(d_cb) >= 1.0:
+            text_lines.append(("scene shift dCr%+.0f dCb%+.0f -> Cr[%d,%d] Cb[%d,%d]"
+                               % (d_cr, d_cb, box[0], box[1], box[2], box[3]),
+                               18, (0, 200, 255)))
+        else:
+            text_lines.append(("scene shift none, Cr[%d,%d] Cb[%d,%d]"
+                               % (box[0], box[1], box[2], box[3]), 18, COLOR_TEXT))
+    # 背景色估计的细节（块级诊断），换取样方式时用来看它稳不稳
+    bg_est = state.flags.get("scene_bg_estimate")
+    if bg_est and bg_est.get("mode") == "ring":
+        text_lines.append(("bg %s: %d 块 Cr%.0f (spread %.0f)"
+                           % (bg_est.get("mode"), bg_est.get("tiles", 0),
+                              bg_est.get("bg_cr") or 0, bg_est.get("spread_cr") or 0),
+                           18, (200, 200, 200)))
+    # 重建那一层额外把掌心和基准颜色显示出来，方便判断容差合不合适
+    if stats.get("reconstructed"):
+        palm = stats.get("palm_center")
+        if palm is not None:
+            palm_r = stats.get("palm_radius", 0.0)
+            raw_r = stats.get("palm_radius_raw", palm_r)
+            # 两个 R 差得多 -> 说明掩膜被割了口子、闭运算副本补救生效了，标出来
+            if raw_r and abs(palm_r - raw_r) / raw_r > 0.10:
+                text_lines.append(("palm C=(%d,%d) R=%.0f (raw %.0f, 已按闭运算补救)"
+                                   % (palm[0], palm[1], palm_r, raw_r), 18, (0, 200, 255)))
             else:
-                text_lines.append(("scene shift none, Cr[%d,%d] Cb[%d,%d]"
-                                   % (box[0], box[1], box[2], box[3]), 18, COLOR_TEXT))
-        # 重建那一层额外把掌心和基准颜色显示出来，方便判断容差合不合适
-        if stats.get("reconstructed"):
-            palm = stats.get("palm_center")
-            if palm is not None:
-                palm_r = stats.get("palm_radius", 0.0)
-                raw_r = stats.get("palm_radius_raw", palm_r)
-                # 两个 R 差得多 -> 说明掩膜被割了口子、闭运算副本补救生效了，标出来
-                if raw_r and abs(palm_r - raw_r) / raw_r > 0.10:
-                    text_lines.append(("palm C=(%d,%d) R=%.0f (raw %.0f, 已按闭运算补救)"
-                                       % (palm[0], palm[1], palm_r, raw_r), 18, (0, 200, 255)))
-                else:
-                    text_lines.append(("palm C=(%d,%d) R=%.0f" % (palm[0], palm[1], palm_r),
-                                       18, COLOR_TEXT))
-            color_base = stats.get("color_base")
-            if color_base is not None:
-                text_lines.append(("base Cr=%.0f Cb=%.0f Y=%.0f" % color_base, 18, COLOR_TEXT))
+                text_lines.append(("palm C=(%d,%d) R=%.0f" % (palm[0], palm[1], palm_r),
+                                   18, COLOR_TEXT))
+        color_base = stats.get("color_base")
+        if color_base is not None:
+            text_lines.append(("base Cr=%.0f Cb=%.0f Y=%.0f" % color_base, 18, COLOR_TEXT))
 
     if text_lines:
         line_h = 26
         block_h = line_h * len(text_lines) + 8
-        text_top = max(y0 + inset + 8, y1 - inset - 14 - block_h)
+        if enabled:
+            anchor_x, anchor_bottom = x0 + inset + 8, y1 - inset - 14
+        else:
+            anchor_x, anchor_bottom = inset + 8, height - inset - 14
+        text_top = max(inset + 8, anchor_bottom - block_h)
         # panel=True：小字号中文笔画密，靠黑描边会糊成一团，改用底衬面板
-        draw_text_lines(frame, text_lines, (x0 + inset + 8, text_top), panel=True)
+        draw_text_lines(frame, text_lines, (anchor_x, text_top), panel=True)
 
     # ★兜底保证：**掩膜模式下**，ROI 之外一律擦回黑色。
     #   这样"ROI 外全黑"就是结构性成立的，以后再加标注也不会破坏它。
@@ -2152,6 +2805,112 @@ def step_roi_boundary(frame: np.ndarray, state) -> np.ndarray:
     #   （单测时踩到过这个坑：原图模式下 ROI 外被擦黑，6.4M 像素不对。）
     if has_mask:
         cv2.bitwise_and(frame, build_roi_mask_bgr((height, width), enabled), dst=frame)
+    return frame
+
+
+# ===========================================================================
+#  ★★ 稳定性门控：过渡帧不出结论 ★★
+# ===========================================================================
+# 用户实测的观察：**手在摆造型的那些过渡帧**会判错，而**手摆好不动的帧基本能认对** ✓
+# 所以：不稳定的帧**不更新输出**，保持上一次稳定时的判定；连续若干帧稳定了才认。
+#
+# ★ 为什么这样比"复杂拒判机制"更该先做：
+#   过渡帧的错**主要来自手在动**（运动模糊、掩膜在变），不是"看不清" ✗
+#   而"手在不在动"用**帧间差异**就直接量得出来 —— 不需要识别层加任何新判据 ✓
+#   （用户自己也提过同一思路："用检测像素整体变化来做延迟来近似照片"）
+#
+# 做法（全部很便宜，约 1 ms）：
+#   ① ROI 内**隔 8 像素采样**再缩到 64x64 灰度
+#   ② 与上一帧比，算平均绝对差 = 运动量
+#   ③ 运动量 <= STABLE_DIFF_MAX 算"稳"；连续 STABLE_MIN_FRAMES 帧稳 -> 认为手摆好了
+#   ④ 手摆好了才把这一帧的判定记下来
+#   ⑤ 没摆好时：把判定**替换成上次记下的**，打 held=True 标记
+#
+# ⚠️ 这只是**门控**，不改变识别本身 —— 稳定帧的判定和以前完全一样 ✓
+STABILITY_GATE = True
+STABLE_DIFF_MAX = 2.0        # 平均绝对差（0~255）小于这个值算"稳"。越大越宽松
+STABLE_MIN_FRAMES = 3        # 连续几帧稳才算"手摆好了"
+STABLE_SAMPLE_STEP = 8       # 采样步长（越大越快、越不敏感）
+
+_STABILITY = {"prev": None, "count": 0, "last": None}
+
+
+def reset_stability() -> None:
+    """清空稳定性门控的记忆（换图 / 换输入源时该调用）。"""
+    _STABILITY["prev"] = None
+    _STABILITY["count"] = 0
+    _STABILITY["last"] = None
+
+
+def step_stability_gate(frame: np.ndarray, state) -> Optional[np.ndarray]:
+    """★ 过渡帧不出结论：不稳定时保持上一次稳定时的判定。
+
+    必须排在 ``hand_recognize`` **之后**（要读它的结果），
+    并排在绘制类插件**之前**（要先把结果换掉，绘制才画的是保持值）。
+
+    ⚠️ 用 ``state.raw_frame`` 算运动量，**不用 ``frame``** ——
+       跑到这一步时 ``frame`` 已经被前面的插件变成掩膜了，拿它算帧间差没意义 ✗
+    """
+    raw = getattr(state, "raw_frame", None)
+    if raw is None or getattr(raw, "ndim", 0) != 3:
+        return frame
+
+    # ---- ① ROI 内隔点采样 + 缩到 64x64 灰度 ----
+    height, width = raw.shape[:2]
+    x0, y0, x1, y1 = roi_rect_pixels((height, width))
+    step = int(max(1, STABLE_SAMPLE_STEP))
+    patch = raw[y0:y1:step, x0:x1:step]
+    if patch.size == 0:
+        patch = raw[::step, ::step]
+    try:
+        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    except cv2.error:
+        return frame
+    small = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
+
+    # ---- ② 与上一帧比 ----
+    prev = _STABILITY["prev"]
+    if prev is None:
+        diff = 0.0
+    else:
+        diff = float(np.mean(np.abs(small.astype(np.int16) - prev.astype(np.int16))))
+    _STABILITY["prev"] = small
+
+    # ---- ③ 连续稳帧计数 ----
+    if diff <= float(STABLE_DIFF_MAX):
+        _STABILITY["count"] = int(_STABILITY["count"]) + 1
+    else:
+        _STABILITY["count"] = 0
+    settled = bool(_STABILITY["count"] >= int(STABLE_MIN_FRAMES))
+
+    # ---- ④ 稳了就把这一帧的判定记下来 ----
+    rec = state.flags.get("recognize")
+    if settled and rec is not None:
+        _STABILITY["last"] = {
+            "states": list(rec.get("finger_states") or []),
+            "extensions": list(rec.get("finger_extensions") or []),
+            "text": rec.get("finger_text"),
+        }
+
+    state.flags["motion_diff"] = round(diff, 2)
+    state.flags["stable_count"] = int(_STABILITY["count"])
+    state.flags["settled"] = settled
+    if rec is not None:
+        # 顺带把"这帧稳不稳"塞进结果里 —— 绘制插件拿不到 state，只能从这里读
+        rec = dict(rec)
+        rec["settled"] = settled
+        rec["motion_diff"] = round(diff, 2)
+        state.flags["recognize"] = rec
+
+    # ---- ⑤ 没摆好：把判定换成"上次记下的"，打 held 标记 ----
+    last = _STABILITY["last"]
+    if rec is not None and not settled and last is not None:
+        rec = dict(rec)
+        rec["finger_states"] = list(last["states"])
+        rec["finger_extensions"] = list(last["extensions"])
+        rec["finger_text"] = last["text"]
+        rec["held"] = True
+        state.flags["recognize"] = rec
     return frame
 
 
@@ -2177,5 +2936,8 @@ def register(api) -> None:
     # 两种画法：画在掩膜上（模式 5）/ 画在原图上（模式 6）
     api.add(DRAW_MASK_PLUGIN_NAME, step_recognize_on_mask, enabled=DRAW_ENABLED_DEFAULT)
     api.add(DRAW_ORIG_PLUGIN_NAME, step_recognize_on_original, enabled=DRAW_ENABLED_DEFAULT)
+    # ★ 稳定性门控：必须排在 hand_recognize【之后】（要读它的结果）、
+    #   排在绘制类插件【之前】（要先把结果换成"保持值"，绘制才画得对）。
+    api.add(STABILITY_PLUGIN_NAME, step_stability_gate, enabled=STABILITY_GATE)
     # 画边界 + 触边检查（排在最后，画在结果之上）
     api.add(ROI_PLUGIN_NAME, step_roi_boundary, enabled=True)
