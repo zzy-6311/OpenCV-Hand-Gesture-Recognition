@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """外部插件模块：ROI 限制 + 灰度上下双阈值区间二值化。
 
 main.py 会自动 import 本文件并调用 ``register(api)``，把这里注册的处理函数
@@ -21,6 +21,10 @@ import os
 
 import cv2
 import numpy as np
+import finger_geometry as FG
+
+# Keep the first-round algorithm available for controlled comparisons.
+FINGER_IDENTITY_MODE = "geometry"    # "geometry" or "legacy"
 
 # ===========================================================================
 #
@@ -80,8 +84,15 @@ ROI_RELATIVE = (0.25, 0.10, 0.50, 0.80)
 #      -> 最大内切圆落到背景块上 -> R 暴涨 -> 所有按 R 归一化的门槛全部松掉
 #      -> 指尖达不到 1.45R -> 数出 0 根手指 -> 判成握拳。
 #    ★ 在**视频**上关掉 ROI 看着还行（手小又居中、背景块没那么大），但照片流一关就崩。
-#      想临时对比可以按 r 键实时切换，不要改这个常量。
-ROI_ENABLED = True
+#      想临时对比可以按 r 键实时切换。
+#
+# ★★★ 但现在默认是 **False** ★★★
+#   因为当前启用的是**第四批素材：FPGA 摄像头实拍**（data/new_camera，40 张）：
+#      · 1280x720，**手在画面里占比很大**（离镜头近）-> 开着 ROI 会把手切掉 ✗
+#      · 背景是灰板，不是白板/床单 -> 关掉 ROI 不会引入大片皮肤色区域 ✓
+#   ⚠️ **切回前三批时（python main.py image old）记得改回 True**，
+#      或者运行时按 r 键实时打开 ✓
+ROI_ENABLED = False
 
 # 是否把 ROI 边界画在画面上。True = 你看到的框就是真正生效的框。
 ROI_DRAW_BOUNDARY = True
@@ -439,6 +450,57 @@ RECON_PALM_CLOSE_RATIO = 0.13   # 核边长 = 该比例 × 掩膜等效半径 sq
 # ---------------------------------------------------------------------------
 RECOG_WRIST_BAND_RATIO = 0.06      # 手腕取手部底端这段比例的带状区域质心
 RECOG_WRIST_MIN_PIXELS = 12        # 带状区域像素太少就不估手腕
+
+# --- ★★ 方向无关的小臂方向估计（见 _estimate_arm_direction）★★ --------------
+# ⚠️ 背景：原来的手腕估计只按**水平行**量宽度、只在掌心**下方**找束腰，
+#    等于写死了"小臂从画面下方垂直入画" ✗
+#    第四批素材（FPGA 摄像头实拍）是**小臂从右侧水平伸入**的，
+#    于是掌轴错 ~90°、所有角度判据全部错位 ✗
+#
+# ★ 认小臂靠的是"**粗细**"，不是"方向"：
+#     · 小臂全宽 ~1.0~1.8R（细长，而且能一直延伸到画面边缘）
+#     · 手指全宽 ~0.3~0.5R（更细，但到 2.7~3.0R 就没了）
+#     · 手掌全宽 ~2R 以上
+#   所以从掌心向 360° 走，找「走得远、一路都不太粗」的那个方向 = 小臂 ✓
+RECOG_ARM_WIDTH_MAX_R = 1.85       # 沿射线走时，全宽超过这个值（×R）就不算小臂
+# ★★ 下界同样重要 ★★
+#   ⚠️ 踩过的坑：只设上界时，**手指**也会被当成小臂 ✗
+#      因为手指同样"细长"，而且当小臂被画面切短时，手指反而走得更远 ✗
+#      实测 40 张里有 12 张因此判反了方向（+90° 而不是 −90°）✗
+#   小臂全宽约 1.0~1.8R，手指只有 0.3~0.5R —— 这个差别很干净 ✓
+RECOG_ARM_WIDTH_MIN_R = 0.62       # 沿射线走时，全宽小于这个值（×R）也不算小臂
+# ★ 需要多长的一段"中等宽度"才认定是小臂（×R）
+#   沿"掌心 -> 手腕 -> 小臂"走，宽度是：粗(掌) -> 细(手腕) -> 中(小臂) ✓
+#   所以不能要求"一路都不细"（手腕就细 ✗），而要**累积**一段中等宽度：
+#       手指方向：宽度一直 0.3~0.5R -> 累积不起来 -> 排除 ✓
+#       小臂方向：过手腕后 1.0~1.8R -> 累积起来 -> 胜出 ✓
+RECOG_ARM_MIN_LEN_R = 0.55
+# ---------------- ★★ 指峰 + 指缝（轮廓法）★★ ----------------
+# 见 _detect_finger_peaks 的说明。这几个常量都尽量"无量纲、少拟合"：
+PEAK_CUT_PROJ = -0.35        # 沿掌轴投影小于这个值（×R）的轮廓点算"前臂切口"，丢掉
+PEAK_SMOOTH_WIN = 0.015      # 轮廓距离曲线的平滑窗口（占轮廓长度的比例）
+PEAK_MIN_SEPARATION = 0.035  # 找极值时的最小间隔（占轮廓长度的比例）
+PEAK_MIN_PROMINENCE = 0.05   # 峰要比两侧谷高出这么多（×R）才算一根手指
+# ★ 「先找指缝再切段」用的门槛（见 _segment_fingers_by_webs）★
+PEAK_WEB_MIN_DEPTH = 0.08    # 一条缝要比两侧的峰低这么多（×R）才算真指缝
+# 射线要走到「该方向画面允许距离」的多少倍，才算被画面切断的小臂
+#   实测：小臂约 1.0（走到边缘）；手指只到 2.7~3.0R，约 0.5~0.7
+#   取 0.82 是给"颜色阈值可能提前断掉"留的余量
+RECOG_ARM_BORDER_FRAC = 0.82
+RECOG_ARM_SEARCH_R_MIN = 0.85      # 从掌外这个距离开始走（掌内必然太粗）
+# ⚠️ 找【手腕束腰】只在掌后很近的一段里找 —— 手腕就在掌后面一点点 ✓
+#    原来放到 3.2R 去找"最细处"，结果找到的是很远处的臂尖 ✗
+#    实测（第四批素材）：正确的手腕在 1.0~1.5R；放太远会跑到 2.65~3.15R，
+#    掌轴跟着偏 12~24°，然后所有角度判据都错位 ✗
+RECOG_WRIST_NEAR_R_MIN = 0.75      # 找束腰的最近距离（×R）
+RECOG_WRIST_NEAR_R_MAX = 1.70      # 找束腰的最远距离（×R）
+RECOG_ARM_SEARCH_R_MAX = 4.20      # 最远走到这里（画面边缘就停）
+RECOG_ARM_MIN_REACH_R = 1.90       # 至少要走到这么远才算"一条小臂"
+RECOG_ARM_WRIST_R_MAX = 3.20       # 找手腕束腰时最远找到这里
+RECOG_ARM_ANGLE_STEP = 6           # 方向搜索步长（度）
+RECOG_WRIST_TRUST_R = 1.85         # ★ 老方法给出的手腕离掌心超过这个倍数（×R）就认为它误判了
+                                   #   实测：老三批手腕距离约 1.0~1.4R；新素材（小臂水平）老方法给 2.4~3.2R
+                                   #   两者隔得开，所以这个门槛很安全 ✓
 RECOG_TRUNCATE_FACTOR = 1.5        # 在掌心下方这么多 R 处截断前臂
 RECOG_TRUNCATE_LINE_HALF = 1.6     # ★只影响"截断线画多长"（× R）。
                                    #   截断本身是半平面（见 _truncate_forearm），
@@ -590,7 +652,11 @@ FINGER_TEMPLATE_LEN = (2.18, 2.85, 3.00, 2.84, 2.54)
 # 打分权重：角度项单位是 平方度，长度项是 R²，量纲差很多，靠权重拉平 ——
 #   长度误差 0.1R -> 0.01 × 2500 = 25，约等于角度误差 5°。
 FINGER_W_ANGLE = 1.0
-FINGER_W_LEN = 2500.0
+FINGER_W_LEN = 0.0
+# ★ 没有拇指锚定时，δ（整体旋转）也搜索，但限制在这个范围内（度）★
+#   实测第四批 29 张的 δ 范围是 -6~+22；相邻手指只隔 17.5°，所以 ±25 够用且不会顶替 ✓
+FINGER_NONTHUMB_SHIFT_DEG = 25.0
+FINGER_NONTHUMB_SHIFT_STEP = 2.5
 # ★ 缩放偏离 1.0 的惩罚。**这一项是必须的** ——
 #   不加的话，缩放搜索会为了迁就一根无名指/小指的名义角度而把整个模板压扁：
 #   实测 gesture_08（手枪，真值 拇+食）在 s=0.90 时，{拇,无名} 的角度代价只有 96，
@@ -608,7 +674,7 @@ FINGER_W_SCALE = 20000.0
 #      若那根手指是食指 -> 缝应落在 T-I 的 +0.72 ✓
 #      若是指中指       -> 缝应落在 T-I 与 I-M 之间（≈+0.46）✗
 FINGER_WEB_X = (0.72, 0.20, -0.34, -0.84)
-FINGER_W_WEB = 8000.0            # 权重同长度项（0.1R 误差 ≈ 25 分 ≈ 5°）
+FINGER_W_WEB = 3000.0            # 权重同长度项（0.1R 误差 ≈ 25 分 ≈ 5°）
 FINGER_WEB_COUNT_PENALTY = 1.0   # 缝的**条数**对不上时的惩罚（单位 R²，会被上面权重放大）
 FINGER_CONTIGUOUS_PENALTY = 900.0  # 没找到拇指时的先验惩罚（平方度）：非"食指起连续"的组合
                                    #   900 = 30²，相当于允许 30° 的角度失配
@@ -1447,10 +1513,119 @@ def _protrusion_length(thickness: np.ndarray, tip_point, palm_center,
     return float(fractions[int(hit[0])]) * total / float(radius)
 
 
-def _estimate_wrist(mask: np.ndarray, palm_center, radius: float):
-    """手腕 W = 手掌下方**横截面最窄**的那一行。
+def _estimate_arm_direction(mask: np.ndarray, palm_center, radius: float):
+    """★ **方向无关**地找【小臂的指向】（单位向量，从掌心指向小臂）。
 
-    ⚠️ 早期那版（已删除的 solution.py）用的是"手部底端带状区域的质心"。但那个做法
+    ⚠️⚠️ 为什么必须有这个函数：
+      原来的 ``_estimate_wrist()`` 只按**水平行**量宽度、并且**只在掌心下方**找束腰
+      —— 等于写死了"**小臂从画面下方垂直入画**" ✗
+      第四批素材（FPGA 摄像头实拍）是**小臂从右侧水平伸入**的，
+      于是它找了个毫无意义的行 -> 掌轴错 ~90° -> **所有角度判据全部错位** ✗
+      （实测：shot_25 是"点赞"，掩膜是个完美的点赞剪影，却判成了"食指"）
+
+    ★ 怎么做到方向无关 —— 用"**粗细**"来认小臂，而不是用"方向"：
+        · 小臂是**细长**的，全宽只有 ~1.0~1.8R
+        · 手指更细（~0.3~0.5R），但**没那么长**（指尖到 2.7~3.0R 就没了）
+        · 手掌更粗（~2R 以上）
+      所以：从掌心向 360° 各个方向走，找那个「**走得远、而且一路都不太粗**」的方向 ✓
+      小臂能一直走到画面边缘，比手指走得远，于是胜出 ✓
+
+    拿不到（比如画面里没有小臂）时返回 None，调用方退回老做法 ✓
+    """
+    height, width = mask.shape[:2]
+    center = np.asarray(palm_center, dtype=np.float64).reshape(2)
+    R = float(radius)
+    if R <= 1e-6:
+        return None
+    dt = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+
+    w_max = float(RECOG_ARM_WIDTH_MAX_R) * R          # 超过这个全宽就不算小臂
+    w_min = float(RECOG_ARM_WIDTH_MIN_R) * R          # 小于这个全宽也不算（那是手指）
+    r_start = float(RECOG_ARM_SEARCH_R_MIN) * R        # 从掌外一点开始（掌内必然太粗）
+    r_end = float(RECOG_ARM_SEARCH_R_MAX) * R
+    step = max(2.0, 0.06 * R)
+
+    best_dir, best_reach = None, 0.0
+    min_run = float(RECOG_ARM_MIN_LEN_R) * R           # 需要多长的一段"中等宽度"
+    for ang_deg in range(0, 360, int(RECOG_ARM_ANGLE_STEP)):
+        t = float(np.radians(ang_deg))
+        d = np.array([np.cos(t), np.sin(t)], dtype=np.float64)
+        # 这个方向"画面允许走多远"（射线到边框的距离）
+        to_border = _ray_to_border(center, d, width, height)
+        if to_border < 0.8 * R:
+            continue                                    # 方向太贴着边框，没意义
+        # ★★ 判据（两条都要满足）★★
+        #  ① 累积一段够长的「中等宽度」（小臂 1.0~1.8R；手指只有 0.3~0.5R ✗）
+        #     沿"掌心->手腕->小臂"走，宽度是 粗(掌) -> 细(手腕) -> 中(小臂)，
+        #     所以不能要求"一路都不细"（手腕就细 ✗），要**累积**。
+        #  ② ★ 必须走到「该方向画面允许距离的 82% 以上」★
+        #     ⚠️ 这一条是关键：小臂一定是**被画面切断**的（走到边缘），
+        #        而手指只伸到 2.7~3.0R 就停了 —— 差距很大，特别干净 ✓
+        #     实测：只用判据① 时，张开的手指（比如手枪的拇指+食指）也满足宽度带 ✗
+        #           于是把手指当小臂 -> 转了 +96° 而不是 −90° -> 上下颠倒 ✗
+        run = 0.0
+        best_run = 0.0
+        reach = 0.0
+        r = r_start
+        while r <= r_end:
+            p = center + d * r
+            x, y = int(round(p[0])), int(round(p[1]))
+            if x < 0 or y < 0 or x >= width or y >= height:
+                reach = r
+                break                                   # 出画面
+            if mask[y, x] == 0:
+                break                                   # 断了：手和小臂是连续的
+            w_now = 2.0 * float(dt[y, x])               # 该处全宽（像素）
+            if w_now > w_max:
+                run = 0.0                               # 还在手掌里
+            elif w_now >= w_min:
+                run += step                             # 中等宽度：像小臂
+                if run > best_run:
+                    best_run = run
+            else:
+                run = 0.0                               # 细：手腕或手指
+            reach = r
+            r += step
+        if reach < float(RECOG_ARM_BORDER_FRAC) * to_border:
+            continue                                    # ★ 没走到画面的足够远处
+        if best_run < min_run:
+            continue
+        if reach > best_reach:
+            best_reach, best_dir = reach, d
+    if best_dir is None:
+        return None
+    return best_dir, best_reach
+
+
+def _ray_to_border(center, direction, width: int, height: int) -> float:
+    """从 ``center`` 沿 ``direction`` 出发，到画面边框的距离（像素）。"""
+    ts = []
+    dx, dy = float(direction[0]), float(direction[1])
+    if dx > 1e-9:
+        ts.append((width - 1 - float(center[0])) / dx)
+    elif dx < -1e-9:
+        ts.append((0.0 - float(center[0])) / dx)
+    if dy > 1e-9:
+        ts.append((height - 1 - float(center[1])) / dy)
+    elif dy < -1e-9:
+        ts.append((0.0 - float(center[1])) / dy)
+    ts = [t for t in ts if t > 0.0]
+    return float(min(ts)) if ts else 0.0
+
+
+def _estimate_wrist(mask: np.ndarray, palm_center, radius: float):
+    """手腕 W = 手掌**下方**横截面最窄的那一行。
+
+    ★★ 这里**故意写死"小臂从画面下方垂直入画"** ★★
+      因为整条流水线（截前臂、掌轴、所有角度判据）都是围绕这个前提标定的，
+      而它在"手指朝上"的图上经过验证（老三批 28 张就是靠它）✓
+
+      手转到别的方向怎么办？**不在这里做** —— 由前处理
+      ``detect_hand_rotation()`` 先把画面**转成"手指朝上"**，再进这条流水线 ✓
+      （试过让这里"方向无关"，实测反而更差：手大、小臂被画面切掉时
+        "找走得远又细的方向"会误选到手指 ✗）
+
+    ⚠️ 早期那版（已删除的 solution.py）用的是"手部底端带状区域的质心"，但那个做法
     默认掩膜在手腕处就结束了 —— 而我们的掩膜里含**整条小臂**，所以底端质心
     取到的是小臂尖，实测跑到 (1522,1265)，离真正的手腕差了 400 多像素。
 
@@ -1458,6 +1633,56 @@ def _estimate_wrist(mask: np.ndarray, palm_center, radius: float):
     再进小臂又变宽。取那个"离掌心最近的、明显比最宽处窄的"局部极小即可。
 
     ``mask`` 必须是**含小臂**的（截断之前），否则找不到束腰。
+    """
+    return _estimate_wrist_legacy(mask, palm_center, radius)
+
+
+def _estimate_wrist_by_arm(mask: np.ndarray, palm_center, radius: float):
+    """方向无关地估手腕：先找小臂指向（``_estimate_arm_direction``），再沿它找最细处。"""
+    center = np.asarray(palm_center, dtype=np.float64).reshape(2)
+    R = float(radius)
+    got = _estimate_arm_direction(mask, center, R)
+    if got is None:
+        return None
+    arm_dir, reach = got
+
+    dt = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    step = max(2.0, 0.05 * R)
+    best_r, best_w = None, None
+    # ★★ 找手腕束腰【只在掌后很近的一段里找】★★
+    #   ⚠️ 踩过的坑：原来用 RECOG_ARM_SEARCH_R_MIN(0.85R) ~ RECOG_ARM_WRIST_R_MAX(3.20R)，
+    #      结果找到的是**很远的臂尖**，腕距离跑到 2.70~3.15R ✗
+    #      实测证据（同一张图 shot_07，掩膜像素/R/检出指尖数两边完全一样）：
+    #          原样（手指朝左）      -> 腕距离 2.70R -> 判定 MR  ✗
+    #          顺时针转 90（手指朝上）-> 腕距离 1.27R -> 判定 IR  ✓
+    #      分歧就是从这一行开始的 —— 它是唯一的"旋转依赖"来源 ✓
+    #      手腕束腰就在手掌后面一点点（实测 1.0~1.5R），根本不该去 3R 外找 ✓
+    r = float(RECOG_WRIST_NEAR_R_MIN) * R
+    while r <= min(reach, float(RECOG_WRIST_NEAR_R_MAX) * R):
+        p = center + arm_dir * r
+        x, y = int(round(p[0])), int(round(p[1]))
+        if 0 <= x < mask.shape[1] and 0 <= y < mask.shape[0] and mask[y, x]:
+            w = float(dt[y, x])
+            if best_w is None or w < best_w:
+                best_w, best_r = w, r
+        r += step
+    if best_r is None:
+        return None
+    wrist = center + arm_dir * best_r
+    if float(np.linalg.norm(wrist - center)) < 0.4 * R:
+        return None
+    return wrist.astype(np.float64)
+
+
+def _estimate_wrist_legacy(mask: np.ndarray, palm_center, radius: float):
+    """手腕 W = 手掌下方**横截面最窄**的那一行（老做法，**只适合小臂垂直入画**）。
+
+    ⚠️ 保留它只作为兜底：当画面里找不到"细长的小臂"（比如手伸到画面外、
+    或者掩膜没含小臂）时用它。**不要再把它当主路径** —— 它写死了小臂方向 ✗
+
+    原始注释（仍然有效）：早期那版用的是"手部底端带状区域的质心"，
+    但那个做法默认掩膜在手腕处就结束了 —— 而我们的掩膜里含**整条小臂**，
+    所以底端质心取到的是小臂尖。改成找**宽度剖面的局部极小**。
     """
     height, width = mask.shape[:2]
     row_widths = np.count_nonzero(mask, axis=1)
@@ -1904,11 +2129,12 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
     # ★ 主输出：5 根手指各自的「伸开 / 蜷起」（径向剖面 + 模板匹配）
     #   顺序 = FINGER_NAMES = (拇指, 食指, 中指, 无名指, 小指)
     #   原来的 classify_gesture（数字标签）整套已删除，不再用。
-    states, extensions, angles_used, match_detail = _finger_states(
-        hand, palm_center, up, radius, tips, gaps)
+    states, extensions, angles_used, match_detail, expect_len = _finger_states(
+        hand, palm_center, up, radius, tips, gaps, contour=contour)
     result["finger_states"] = states                 # 5 个 bool（主判据：模板匹配）
     result["finger_extensions"] = extensions         # 5 个 float（× R），连续量
     result["finger_ray_angles"] = angles_used        # 5 个 float（度），画射线用
+    result["finger_expect_len"] = expect_len         # 5 个 float（× R），模板预期长度
     result["finger_match"] = match_detail            # 匹配到的旋转/缩放/得分，调试用
     result["finger_names"] = list(FINGER_NAMES)
     result["finger_text"] = finger_states_text(states)
@@ -1925,11 +2151,10 @@ def _extend_along_ray(mask: np.ndarray, origin, direction, radius: float,
     """
     height, width = mask.shape[:2]
     rs = np.arange(r_min, r_max + 1e-9, r_step, dtype=np.float64)
-    xs = np.clip(np.round(origin[0] + direction[0] * rs * radius).astype(np.int32),
-                 0, width - 1)
-    ys = np.clip(np.round(origin[1] + direction[1] * rs * radius).astype(np.int32),
-                 0, height - 1)
-    hits = mask[ys, xs] > 0
+    xs = np.round(origin[0] + direction[0] * rs * radius).astype(np.int32)
+    ys = np.round(origin[1] + direction[1] * rs * radius).astype(np.int32)
+    inside = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+    hits = inside & (mask[np.clip(ys, 0, height - 1), np.clip(xs, 0, width - 1)] > 0)
     if hits.size == 0 or not bool(hits[0]):
         return 0.0
     gap_max = max(1, int(round(float(FINGER_RUN_GAP_TOLERANCE) / max(1e-9, r_step))))
@@ -1971,9 +2196,11 @@ def _radial_profile(mask: np.ndarray, palm_center, up, radius: float):
     dirs = np.cos(t) * up[None, :] + np.sin(t) * right[None, :]        # (A, 2)
     pts = origin[None, None, :] + dirs[:, None, :] * (rs[None, :, None] * radius)
     height, width = mask.shape[:2]
-    xs = np.clip(np.round(pts[:, :, 0]).astype(np.int32), 0, width - 1)
-    ys = np.clip(np.round(pts[:, :, 1]).astype(np.int32), 0, height - 1)
-    hits = mask[ys, xs] > 0                                            # (A, Rn)
+    xs = np.round(pts[:, :, 0]).astype(np.int32)
+    ys = np.round(pts[:, :, 1]).astype(np.int32)
+    inside = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+    # Out-of-frame coordinates are empty, not repeated foreground border pixels.
+    hits = inside & (mask[np.clip(ys, 0, height - 1), np.clip(xs, 0, width - 1)] > 0)
 
     # ---- 每条射线：从内端往外找"允许小缺口"的连续段 ----
     #   （逐角度循环 A≈116 次、每次 Rn≈54 步，实测 2~4 ms，可以接受）
@@ -2025,124 +2252,379 @@ def _nominal_boundaries(combo):
     return out
 
 
+def _segment_fingers_by_webs(hand_mask: np.ndarray, palm_center, up, radius: float):
+    """★★★ 「先找指缝，再切段」—— 比"找指峰"稳得多的切入点 ★★★
+
+    ── 为什么换这个思路（上一版踩的坑）────────────────────────────────
+    上一版 `_detect_finger_peaks` 是**先找峰**：沿轮廓距离曲线找局部极大 ✗
+    实测问题：**蜷起指节那种小凸起和噪声分不开** ✗
+      平滑窗口大一点就把它抹掉、小一点就冒出一堆假峰 ✗
+      扫遍参数最好也只有 21/40 能出正好 5 个峰 ✗
+
+    ★★ 用户的洞察是对的，但正确的切入点是「谷」而不是「峰」★★
+      · **指缝（谷）比指峰显著得多、也少得多** ✓ 4 条缝 vs 5 个峰 ✓
+      · **4 条缝天然把轮廓切成 5 段** ✓ -> **段数固定为 5，永不落空** ✓
+      · 顺序分配是**免费**的：段沿轮廓依次就是 T-I-M-R-P ✓
+
+    ── 做法 ─────────────────────────────────────────────────────────
+      ① 最大外轮廓，砍掉前臂切口那一段
+      ② 沿轮廓算到掌心的距离 d（×R），平滑
+      ③ 找所有局部极小（候选指缝）
+      ④ **只取最深的 4 个**
+      ⑤ 4 条缝把轮廓切成 5 段；每段的极值点 = 该手指的指峰
+      ⑥ 按轮廓顺序返回 5 根手指（统一成"拇指在前"）
+
+    返回 ``(fingers, webs)``：
+      fingers  长度 5 的列表（按轮廓顺序），每项
+               ``{"peak_point", "peak_dist", "protrusion", "angle_deg",
+                  "seg_lo", "seg_hi", "peak_order"}``
+      webs     长度 4 的列表，每项 ``{"point", "dist", "angle_deg"}``
+    判不出来时返回 ``([], [])``
+    """
+    contours, _ = cv2.findContours(hand_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return [], []
+    cnt = max(contours, key=cv2.contourArea)
+    pts = cnt.reshape(-1, 2).astype(np.float64)
+    n = pts.shape[0]
+    R = float(radius)
+    if n < 48 or R <= 1e-6:
+        return [], []
+    center = np.asarray(palm_center, dtype=np.float64).reshape(2)
+    delta = pts - center
+    dist = np.linalg.norm(delta, axis=1) / R
+
+    # ---- ① 砍掉前臂切口，把环形轮廓变成一条开链 ----
+    u = np.asarray(up, dtype=np.float64).reshape(2)
+    u = u / (float(np.linalg.norm(u)) + 1e-9)
+    proj = delta @ u / R
+    keep = proj > float(PEAK_CUT_PROJ)
+    breaks = np.nonzero(~keep)[0]
+    if breaks.size == 0:
+        idx_line = np.arange(n)
+    else:
+        start = (int(breaks[0]) + 1) % n
+        idx_line = (start + np.arange(n - int(breaks.size))) % n
+    d_line = dist[idx_line]
+    if d_line.size < 48:
+        return [], []
+
+    # ---- ② 平滑 ----
+    win = max(3, int(round(float(PEAK_SMOOTH_WIN) * d_line.size)) | 1)
+    d_s = _smooth_1d(d_line, win)
+    m = int(d_s.size)
+
+    # ---- ③ 找所有局部极小（候选指缝）+ 局部极大（用来算缝的深度）----
+    span = max(2, int(round(float(PEAK_MIN_SEPARATION) * m)))
+    cands = []
+    peaks_all = []
+    for i in range(1, m - 1):
+        lo, hi = max(0, i - span), min(m, i + span + 1)
+        seg = d_s[lo:hi]
+        if d_s[i] <= seg.min() + 1e-9:
+            cands.append(i)
+        if d_s[i] >= seg.max() - 1e-9:
+            peaks_all.append(i)
+    cands = _thin_plateau(cands, d_s, want_max=False)
+    peaks_all = _thin_plateau(peaks_all, d_s, want_max=True)
+    if not peaks_all:
+        peaks_all = [int(np.argmax(d_s))]
+    if len(cands) < 4:
+        return [], []
+
+    # ---- ④ 只取最深的 4 条缝 ----
+    scored = []
+    for i in cands:
+        left = [j for j in peaks_all if j < i]
+        right = [j for j in peaks_all if j > i]
+        hl = d_s[left[-1]] if left else d_s[0]
+        hr = d_s[right[0]] if right else d_s[-1]
+        scored.append((float(min(hl, hr) - d_s[i]), i))     # 深度
+    scored.sort(key=lambda t: -t[0])
+    webs_line = []
+    min_gap = max(2, int(0.03 * m))
+    for depth, i in scored:
+        if depth < float(PEAK_WEB_MIN_DEPTH):
+            continue
+        if all(abs(i - j) >= min_gap for j in webs_line):
+            webs_line.append(i)
+        if len(webs_line) == 4:
+            break
+    if len(webs_line) != 4:
+        return [], []
+    webs_line.sort()
+
+    # ---- ⑤ 4 条缝切成 5 段 ----
+    bounds = [-1] + webs_line + [m]
+    fingers, webs = [], []
+    for i in webs_line:
+        gi = int(idx_line[i])
+        webs.append({"point": (float(pts[gi, 0]), float(pts[gi, 1])),
+                     "dist": float(d_line[i]),
+                     "angle_deg": float(np.degrees(np.arctan2(
+                         float(delta[gi, 0]), -float(delta[gi, 1]))))})
+    for k in range(5):
+        lo, hi = bounds[k] + 1, bounds[k + 1]
+        if hi - lo < 2:
+            return [], []
+        seg = d_line[lo:hi]
+        p_local = lo + int(np.argmax(seg))
+        gi = int(idx_line[p_local])
+        base = []
+        if k > 0:
+            base.append(d_line[webs_line[k - 1]])
+        if k < 4:
+            base.append(d_line[webs_line[k]])
+        b = max(base) if base else 0.0
+        fingers.append({
+            "peak_point": (float(pts[gi, 0]), float(pts[gi, 1])),
+            "peak_dist": float(d_line[p_local]),
+            "protrusion": float(d_line[p_local] - b),
+            "angle_deg": float(np.degrees(np.arctan2(
+                float(delta[gi, 0]), -float(delta[gi, 1])))),
+            "seg_lo": int(lo), "seg_hi": int(hi), "peak_order": int(p_local),
+        })
+
+    # ---- ⑥ 统一成"拇指在前"的顺序 ----
+    #   拇指的特征：角度最大（实测拇指 +46~+82，其余四根都在 +30 以下）
+    if fingers[0]["angle_deg"] < fingers[-1]["angle_deg"]:
+        fingers.reverse()
+        webs.reverse()
+    return fingers, webs
+
+
+def _detect_finger_peaks(hand_mask: np.ndarray, palm_center, up, radius: float,
+                         cut_point=None):
+    """★★ 「指峰 + 指缝」：沿轮廓找每根手指的凸起和它们之间的凹谷 ★★
+
+    ── 为什么要换这套（用户提出的方案，实测有效）────────────────────────
+    现在那套（``_assign_finger_slots``）只检出**伸开的手指**的指尖 ✗
+    蜷起的手指**根本不产生候选** ✗ 于是"5 个指尖怎么分配到 5 个位置"
+    变成了一个**纯几何模板匹配** ✗ —— 而小指被透视缩短后就和无菌指分不开了 ✗
+
+    ★ 但在标准照片里，**掩膜中 5 根手指全都看得见、而且不重叠** ✓
+      那么沿轮廓走一圈，**每根手指都会形成一个凸起**：
+        · 伸开的手指 -> 尖峰（指尖）
+        · 蜷起的手指 -> 圆钝的凸起（指节）
+      相邻两根之间必然有一个凹谷（指缝）✓
+
+    ★★ 关键优势：每根手指都有自己的峰 -> 分配可以靠【轮廓顺序】★★
+      而"手指从拇指到小指沿轮廓依次排列"是**解剖学固定、永不违反**的事实 ✓
+      —— 这正是现在最大的错误来源（无名指↔小指混淆）的解药 ✓
+
+    ── 做法 ──────────────────────────────────────────────────────────
+      ① 取最大外轮廓，算每个点到掌心的距离 d（按 R 归一化）
+      ② **砍掉前臂截断那条边**（那条直线不是手指形状，会造出两个假角）
+      ③ 环形平滑 d
+      ④ 找局部极大（峰）+ 局部极小（谷）
+      ⑤ 过滤：峰必须比两侧谷明显凸出（否则是噪声）
+      ⑥ 按**轮廓顺序**输出
+
+    返回 ``(peaks, valleys)``，都是列表，元素是
+    ``{"point": (x,y), "dist": d/R, "angle_deg": 相对掌轴的角, "index": 轮廓序号}``
+    """
+    contours, _ = cv2.findContours(hand_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return [], []
+    cnt = max(contours, key=cv2.contourArea)
+    pts = cnt.reshape(-1, 2).astype(np.float64)
+    n = pts.shape[0]
+    if n < 32:
+        return [], []
+    center = np.asarray(palm_center, dtype=np.float64).reshape(2)
+    R = float(radius)
+    if R <= 1e-6:
+        return [], []
+
+    delta = pts - center
+    dist = np.linalg.norm(delta, axis=1) / R
+
+    # ② 砍掉前臂截断边：用"沿掌轴 up 方向的投影"判断
+    #    截断发生在掌心【背后】（-up 方向），所以投影值小的那些点属于切口
+    u = np.asarray(up, dtype=np.float64).reshape(2)
+    u = u / (float(np.linalg.norm(u)) + 1e-9)
+    proj = delta @ u / R                       # 沿掌轴归一化坐标（+ = 指向手指）
+    keep = proj > float(PEAK_CUT_PROJ)         # 只留"手指那半边"的轮廓
+    if int(np.count_nonzero(keep)) < 24:
+        keep = np.ones(n, dtype=bool)
+
+    # 用"保留区的两端"把环形轮廓切成一条开链
+    idx_keep = np.nonzero(keep)[0]
+    # 找最长的连续段（环形的）
+    breaks = np.nonzero(~keep)[0]
+    if breaks.size == 0:
+        order = np.arange(n)
+    else:
+        # 从第一个被砍掉的点之后开始，绕过一圈，到最后一个被砍掉的点结束
+        start = (int(breaks[0]) + 1) % n
+        length = n - int(breaks.size)
+        order = (start + np.arange(length)) % n
+    d_line = dist[order]
+    if d_line.size < 24:
+        return [], []
+
+    # ③ 平滑（一维，边界用边缘复制）
+    win = max(3, int(round(float(PEAK_SMOOTH_WIN) * d_line.size)) | 1)
+    d_s = _smooth_1d(d_line, win)
+
+    # ④ 找局部极大 / 极小（在开链上找，端点不算）
+    span = max(2, int(round(float(PEAK_MIN_SEPARATION) * d_line.size)))
+    peaks_i, valleys_i = [], []
+    for i in range(1, d_line.size - 1):
+        lo = max(0, i - span)
+        hi = min(d_line.size, i + span + 1)
+        seg = d_s[lo:hi]
+        if d_s[i] >= seg.max() - 1e-9:
+            peaks_i.append(i)
+        if d_s[i] <= seg.min() + 1e-9:
+            valleys_i.append(i)
+    # 同一个平台只留一个（取最极端的）
+    peaks_i = _thin_plateau(peaks_i, d_s, want_max=True)
+    valleys_i = _thin_plateau(valleys_i, d_s, want_max=False)
+
+    # ⑤ 过滤：峰必须比两侧最近的谷明显高
+    def _pack(i, is_peak):
+        gi = int(order[i])
+        p = pts[gi]
+        ang = float(np.degrees(np.arctan2(float(delta[gi, 0]), -float(delta[gi, 1]))))
+        return {"point": (float(p[0]), float(p[1])), "dist": float(d_line[i]),
+                "angle_deg": ang, "index": gi, "order": int(i), "peak": bool(is_peak)}
+
+    peaks, valleys = [], []
+    for i in peaks_i:
+        left = [j for j in valleys_i if j < i]
+        right = [j for j in valleys_i if j > i]
+        base = []
+        if left:
+            base.append(d_s[left[-1]])
+        if right:
+            base.append(d_s[right[0]])
+        if not base:
+            continue
+        if d_line[i] - max(base) < float(PEAK_MIN_PROMINENCE):
+            continue                                # 凸得不够 -> 不是手指
+        peaks.append(_pack(i, True))
+    for i in valleys_i:
+        valleys.append(_pack(i, False))
+    return peaks, valleys
+
+
+def _smooth_1d(a: np.ndarray, win: int) -> np.ndarray:
+    """一维滑动平均（边缘复制）。``win`` 应当是奇数。"""
+    win = max(1, int(win) | 1)
+    if win <= 1 or a.size < win:
+        return a.astype(np.float64)
+    pad = win // 2
+    ext = np.concatenate([np.full(pad, a[0]), a.astype(np.float64), np.full(pad, a[-1])])
+    ker = np.ones(win, dtype=np.float64) / float(win)
+    return np.convolve(ext, ker, mode="valid")
+
+
+def _thin_plateau(idx_list, values, want_max: bool):
+    """把"平台"式的极值点压成一个（相邻序号只留最极端那个）。"""
+    if not idx_list:
+        return []
+    out = [idx_list[0]]
+    for i in idx_list[1:]:
+        if i - out[-1] <= 1:                        # 紧挨着 -> 同一平台
+            if want_max:
+                if values[i] > values[out[-1]]:
+                    out[-1] = i
+            else:
+                if values[i] < values[out[-1]]:
+                    out[-1] = i
+        else:
+            out.append(i)
+    return out
+
+
 def _assign_finger_slots(tip_angles, tip_lengths=None, web_xs=None):
-    """★ 把检出的**指尖角度 + 指尖长度 + 指缝位置**分配到 5 个手指槽位上。
+    """Match observed tips to slots, preserving anatomical order.
 
-    返回 ``(states, order, anchor, detail)``：
+    Every (slot subset, angular spread, rotation) must be scored INSIDE
+    all three loops. Return each subset's best fit for diagnosis. The cost
+    margin is a score difference, not a calibrated probability.
 
-        states  5 个 bool，顺序 = (拇指, 食指, 中指, 无名指, 小指)
-        order   指尖的排列顺序（按角度降序），用来把槽位映射回具体是哪个指尖
-        anchor  "thumb" = 用拇指锚定了角度；"palm_axis" = 没找到拇指，退回掌轴
-        detail  调试信息（δ、各组合的代价）
-
-    ── 为什么必须用拇指锚定（实测推演）──────────────────────────────────
-    光靠"指尖角度 + 自由的整体旋转 δ"，**哪几根手指是数学上不可辨识的**：
-      · 食指/中指的名义角度只差 17.5°，而实测噪声有 ~10° ✗
-      · 允许 δ 自由时，"食指伸直(δ=0)"和"中指伸直(δ≈+9)"是几乎同一个几何构型 ✗
-      · 典型翻车：gesture_02（剪刀，真值 食+中）会被判成 无名+小指
-        （因为实测间距 28.8° 更接近 无名-小指 的 24°，而不是 食-中 的 17.5°）
-    **而拇指能打破这个简并**：实测拇指 +46°~+82°，其他四根都在 +30° 以下，
-    干净间隔 16° 以上 -> "最大角 > 40°" 可靠认出拇指 -> 用它把模板对齐，
-    δ 就不再自由，剩余四根的身份立刻确定 ✓
-      验证：gesture_08（手枪）拇指 +55.1° -> δ=−8.1° -> 食指预测 −10.1°，
-            实测 −9.8° ✓（若猜成中指，预测 −27.6°，差 17.8° ✗）
-
-    ── 没找到拇指时怎么办 ──────────────────────────────────────────────
-    退回掌轴（δ=0）。此时几何上确实有歧义，所以加一条**温和的先验**：
-    人类手势里非拇指的四根**基本都是从食指侧连续伸出的**（I / IM / IMR / IMRP），
-    对"不连续"的组合加一个惩罚项。这是低置信路径，结果会被标记出来。
+    Existing weights and priors are retained for a controlled bug fix.
+    In particular, free rotation can still make adjacent identities ambiguous.
     """
     template = np.asarray(FINGER_TEMPLATE_DEG, dtype=np.float64)
     order = sorted(range(len(tip_angles)), key=lambda j: -float(tip_angles[j]))
     ta = [float(tip_angles[j]) for j in order]
     count = len(ta)
-    # 长度也按同一顺序重排（单位 R）
     lens = [None] * count
     if tip_lengths is not None:
         for pos, j in enumerate(order):
             try:
                 lens[pos] = float(tip_lengths[j])
             except (TypeError, ValueError, IndexError):
-                lens[pos] = None
-
-    # ---- 1) 定角度锚 ----
-    anchor = "palm_axis"
-    has_thumb = False
-    if count > 0:
-        lo, hi = float(FINGER_THUMB_RANGE_DEG[0]), float(FINGER_THUMB_RANGE_DEG[1])
-        # ★ 拇指槽的门槛：实测拇指只在 +46~+82，其余四根都在 +30 以下。
-        #   不加这个门槛，gesture_03（真值 食+中+无名）会被判成"拇+食+中"。
-        has_thumb = bool(lo < ta[0] < hi)
-    if has_thumb:
-        anchor = "thumb"
-
-    # ---- 2) 枚举槽位组合（顺序固定：角度降序 <-> 槽位序号升序）----
-    by_size = {}
-    for m in range(32):
-        combo = tuple(i for i in range(5) if (m >> i) & 1)
-        by_size.setdefault(len(combo), []).append(combo)
-
-    if has_thumb:
-        want = count - 1                                    # 第一个指尖已占用拇指槽
-        pool = [c for c in by_size.get(want, []) if 0 not in c]
-        candidates = [(0,) + c for c in pool]
-        if count == 1:
-            candidates = [(0,)]
-        scales = [float(s) for s in FINGER_SEARCH_SCALES]
-    else:
-        # ★ 没有指尖落在拇指的角度区间 -> 拇指槽直接判"蜷起"，**不参与分配**
-        #   （否则 gesture_03 那种会把一个 +20.9° 的指尖错当成拇指）
-        candidates = [c for c in by_size.get(count, []) if 0 not in c]
-        scales = [1.0]
-
+                pass
+    lo, hi = map(float, FINGER_THUMB_RANGE_DEG)
+    has_thumb = bool(count and lo < ta[0] < hi)
+    anchor = "thumb" if has_thumb else "palm_axis"
+    candidates = []
+    for mask in range(32):
+        combo = tuple(i for i in range(5) if (mask >> i) & 1)
+        if len(combo) != count:
+            continue
+        if has_thumb and 0 not in combo:
+            continue
+        if not has_thumb and count < 5 and 0 in combo:
+            continue
+        candidates.append(combo)
+    shifts = [None] if has_thumb else list(np.arange(
+        -float(FINGER_NONTHUMB_SHIFT_DEG), float(FINGER_NONTHUMB_SHIFT_DEG) + 1e-9,
+        float(FINGER_NONTHUMB_SHIFT_STEP)))
+    # No observed tip carries rotation information.
+    if count == 0:
+        shifts = [0.0]
+    obs_webs = sorted([float(v) for v in (web_xs or [])], reverse=True)
+    ranked = []
     best = None
     for combo in candidates:
-        for s in scales:
-            if anchor == "thumb":
-                # δ 由拇指钉住：θ_thumb = δ + s·template[0]
-                delta = ta[0] - s * float(template[0])
-            else:
-                delta = 0.0
-            pred = [delta + s * float(template[i]) for i in combo]
-            sse = float(sum((a - p) ** 2 for a, p in zip(ta, pred)))
-            # ★ 长度项：解剖学长度（拇指最短、中指最长，见 FINGER_TEMPLATE_LEN）
-            #   手上大小已经被 R 归一化，所以可以直接比绝对值。
-            len_sse = 0.0
-            for slot, ln in zip(combo, lens):
-                if ln is not None:
-                    d = float(ln) - float(FINGER_TEMPLATE_LEN[slot])
-                    len_sse += d * d
-            # ★ 指缝项：观测到的缝，与"这个组合期望的缝"逐个比横向位置
-            web_sse = 0.0
-            exp_webs = _nominal_boundaries(combo)
-            obs_webs = sorted([float(v) for v in (web_xs or [])], reverse=True)
-            if len(obs_webs) != len(exp_webs):
-                web_sse += float(FINGER_WEB_COUNT_PENALTY)
-            for o, e in zip(obs_webs, exp_webs):
-                web_sse += (o - e) ** 2
-            penalty = 0.0
-            if anchor != "thumb":
-                # 先验：非拇指部分应当是"从食指(1)开始连续"的一段
-                non_thumb = [i for i in combo if i != 0]
-                if non_thumb and non_thumb != list(range(1, 1 + len(non_thumb))):
-                    penalty = float(FINGER_CONTIGUOUS_PENALTY)
-            total = (float(FINGER_W_ANGLE) * sse
-                     + float(FINGER_W_LEN) * len_sse
-                     + float(FINGER_W_WEB) * web_sse
-                     + float(FINGER_W_SCALE) * (s - 1.0) ** 2 + penalty)
-            if best is None or total < best[0] - 1e-9:
-                best = (total, combo, sse, penalty, delta, s, len_sse, web_sse)
-
+        exp_webs = _nominal_boundaries(combo)
+        web_sse = float(FINGER_WEB_COUNT_PENALTY) if len(obs_webs) != len(exp_webs) else 0.0
+        web_sse += sum((o - e) ** 2 for o, e in zip(obs_webs, exp_webs))
+        non_thumb = [i for i in combo if i != 0]
+        penalty = (float(FINGER_CONTIGUOUS_PENALTY)
+                   if not has_thumb and non_thumb and
+                   non_thumb != list(range(1, 1 + len(non_thumb))) else 0.0)
+        combo_best = None
+        for scale in map(float, FINGER_SEARCH_SCALES):
+            len_sse = sum((ln - scale * float(FINGER_TEMPLATE_LEN[slot])) ** 2
+                          for slot, ln in zip(combo, lens) if ln is not None)
+            for shift in shifts:
+                delta = ta[0] - scale * float(template[0]) if shift is None else float(shift)
+                predicted = [delta + scale * float(template[i]) for i in combo]
+                sse = float(sum((a - p) ** 2 for a, p in zip(ta, predicted)))
+                costs = {
+                    "angle": float(FINGER_W_ANGLE) * sse,
+                    "length": float(FINGER_W_LEN) * len_sse,
+                    "web": float(FINGER_W_WEB) * web_sse,
+                    "scale": float(FINGER_W_SCALE) * (scale - 1.0) ** 2,
+                    "contiguity": penalty,
+                }
+                total = sum(costs.values())
+                detail = {"delta_deg": delta, "sse": sse, "len_sse": len_sse,
+                          "web_sse": web_sse, "penalty": penalty, "anchor": anchor,
+                          "slots": list(combo), "scale": scale, "total": total,
+                          "costs": costs, "predicted_angles_deg": predicted,
+                          "observed_web_x": obs_webs, "expected_web_x": exp_webs}
+                if combo_best is None or total < combo_best["total"] - 1e-9:
+                    combo_best = detail
+                if best is None or total < best["total"] - 1e-9:
+                    best = detail
+        if combo_best is not None:
+            ranked.append(combo_best)
     if best is None:
-        return [False] * 5, order, anchor, {"delta_deg": 0.0, "sse": None}
-
-    _total, combo, sse, penalty, delta, scale, len_sse, web_sse = best
-    states = [False] * 5
-    for i in combo:
-        states[i] = True
-    detail = {"delta_deg": delta, "sse": sse, "len_sse": len_sse, "web_sse": web_sse,
-              "penalty": penalty, "anchor": anchor, "slots": list(combo),
-              "scale": scale, "total": total}
+        return [False] * 5, order, anchor, {
+            "delta_deg": 0.0, "sse": None, "valid_assignment": False, "candidates": []}
+    ranked.sort(key=lambda item: item["total"])
+    detail = dict(best)
+    detail["valid_assignment"] = True
+    detail["candidates"] = ranked
+    detail["score_margin"] = ranked[1]["total"] - ranked[0]["total"] if len(ranked) > 1 else None
+    states = [i in best["slots"] for i in range(5)]
     return states, order, anchor, detail
 
 
@@ -2206,26 +2688,40 @@ def _match_finger_template(angles: np.ndarray, profile: np.ndarray):
     return states, [float(v) for v in vals[n_idx]], detail
 
 
-def _finger_states(mask: np.ndarray, palm_center, up, radius: float, tips, web_gaps=None):
-    """★ 判断每根手指是**伸开**还是**蜷起**（主输出）。
+def _finger_states(mask: np.ndarray, palm_center, up, radius: float, tips, web_gaps=None,
+                   contour=None):
+    """Return five states and diagnostic measurements.
 
-    返回 ``(states, extensions, angles_used, detail)``：
-        states      5 个 bool，顺序同 ``FINGER_NAMES`` = (拇指, 食指, 中指, 无名指, 小指)
-        extensions  5 个 float，各自角度上的延伸长度（× R）—— 连续量，
-                    调试用；将来若要控弯曲度也不用重做
-        angles_used 5 个 float，各自的角度（度），画射线用
-        detail      匹配细节（δ、锚、代价），调试用
+    Geometry mode projects local finger axes onto a transverse palm reference
+    line to assign identity. Local width and aspect determine extension, so a
+    detected candidate can be assigned to a curled finger. This reference-line
+    intersection is a positioning feature, not an anatomical joint estimate.
 
-    **两条信息来源合并**：
-      ① **指尖角度 + 拇指锚定**（``_assign_finger_slots``）-> 决定"哪几根是伸开的"（身份）
-         指尖检测是可靠的（原来的手势分类就靠它拿到 28/28），角度也准；
-         真正的难点是**身份**，用拇指当锚解决（详见该函数的说明）。
-      ② **径向剖面**（``_radial_profile``）-> 给出每根手指的**连续延伸长度**，
-         并给拇指一个兜底判据（指尖漏检时靠它补）。
-
-    ⚠️ 坐标约定：``right = (-up.y, up.x)``，θ 正方向 = 拇指侧
-        （即**右手 + 掌心朝镜头**；手背朝镜头会左右颠倒，见配置区警告）
+    If geometric measurements are unavailable, retain the legacy angle method
+    and record its fallback reason. Neither method reads image labels.
+    The extension diagnostics mean local branch length in geometry mode and
+    radial reach in legacy mode. Rendering distinguishes these two meanings.
     """
+    geometry_failure = None
+    if FINGER_IDENTITY_MODE == "geometry":
+        if contour is None:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            contour = max(contours, key=cv2.contourArea) if contours else None
+        measured, geometry_failure = FG.recognize_fingers(
+            mask, contour, palm_center, up, radius, tips or [])
+        if measured is not None:
+            extensions = [0.0] * 5
+            angles_used = [0.0] * 5
+            for feature in measured["features"]:
+                slot = feature["slot"]
+                extensions[slot] = feature["length_r"]
+                x, y = feature["tip_local"]
+                angles_used[slot] = float(np.degrees(np.arctan2(x, -y)))
+            measured["anchor"] = "local_finger_axis"
+            return measured["states"], extensions, angles_used, measured, [0.0] * 5
+    elif FINGER_IDENTITY_MODE != "legacy":
+        raise ValueError("Unknown finger identity mode: %s" % FINGER_IDENTITY_MODE)
+
     tip_angles = []
     tip_lengths = []
     for t in (tips or []):
@@ -2255,8 +2751,14 @@ def _finger_states(mask: np.ndarray, palm_center, up, radius: float, tips, web_g
 
     angles, profile = _radial_profile(mask, palm_center, up, radius)
     delta = float(detail.get("delta_deg", 0.0))
-    used = [delta + float(FINGER_TEMPLATE_DEG[i]) for i in range(5)]
+    scale_fit = float(detail.get("scale", 1.0))
+    used = [delta + scale_fit * float(FINGER_TEMPLATE_DEG[i]) for i in range(5)]
+    if mirrored:
+        used = [-a for a in used]
     extensions = [float(np.interp(a, angles, profile)) for a in used]
+    # ★ 每根手指"按模板应该伸到多远"（× R）—— 画调试标记用：
+    #   和上面的 extensions（沿射线**实测**到哪）一比，就能看出哪根对不上
+    expected = [float(FINGER_TEMPLATE_LEN[i]) * scale_fit for i in range(5)]
 
     # 拇指兜底：本次没用拇指锚（说明没检出拇指指尖），但剖面上拇指方向明显很长
     if anchor != "thumb" and not states[0]:
@@ -2265,7 +2767,11 @@ def _finger_states(mask: np.ndarray, palm_center, up, radius: float, tips, web_g
             detail["thumb_from_profile"] = True
     detail["anchor"] = anchor
     detail["tip_angles_deg"] = [round(a, 1) for a in tip_angles]
-    return states, extensions, used, detail
+    detail["expect_len"] = [round(v, 2) for v in expected]
+    detail["method"] = "angle_template_legacy"
+    if geometry_failure is not None:
+        detail["geometry_fallback_reason"] = geometry_failure
+    return states, extensions, used, detail, expected
 
 
 def finger_states_text(states) -> str:
@@ -2500,6 +3006,15 @@ COLOR_FINGER_OFF = (120, 120, 120)  # 空心（蜷起）：灰
 FINGER_BOX_TAGS = ("T", "I", "M", "R", "P")   # 方块下方标记（拇指/食指/中指/无名指/小指）
 COLOR_UNSETTLED = (0, 215, 255)   # ★ 手在动（过渡帧）时的提示色：橙黄
 
+# --- ★★ 每根手指的「位置标志」（检查问题用）★★ ------------------------------
+# 打开后在画面上给 5 根手指各画一条射线 + 两个标记：
+#   · 空心黄圈 = 按模板**预期**指尖应该在哪
+#   · 实心点   = 沿射线**实测**延伸到哪里（伸开=绿，蜷起=灰）
+# 两者对不上 -> 就是那根手指判错的地方 ✓
+# 想关掉（画面太乱时）改成 False 即可。
+FINGER_DEBUG_DRAW = True
+FINGER_DEBUG_RAY_LEN_R = 3.6      # 射线画多长（× R）
+
 
 def _draw_dashed_rect(img, p1, p2, color, dash=14, thickness=3) -> None:
     """画一个虚线矩形（用短线段拼）。用来表示"这一帧不算数"。"""
@@ -2569,8 +3084,79 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
         point = (int(round(gap["point"][0])), int(round(gap["point"][1])))
         cv2.circle(base, point, 10, COLOR_GAP, 2)
 
+    # =======================================================================
+    # ★★ 每根手指的「位置标志」（检查问题用）★★
+    #   对 5 根手指各画一条射线，并标三样东西：
+    #     · 射线本身      —— 算法认为这根手指在**哪个方向**（用分配好的角度）
+    #     · 空心圈(黄)    —— 按模板**预期**指尖应该在哪（×R，含拟合出的缩放）
+    #     · 实心点(绿/灰) —— 沿射线**实测**延伸到哪里（伸开=绿，蜷起=灰）
+    #   预期圈和实测点对不上 -> 就是那根手指判错的地方 ✓
+    #   ⚠️ 只在 FINGER_DEBUG_DRAW 打开时画，免得平时画面太乱
+    geometry_match = result.get("finger_match") or {}
+    using_geometry = geometry_match.get("method") == "root_geometry_q10"
+    if FINGER_DEBUG_DRAW and using_geometry:
+        # Measured tip -> projected root, labeled by anatomical identity.
+        # Do not display unfitted template rays as if they were observations.
+        for feature in geometry_match.get("features", []):
+            slot = feature["slot"]
+            tip_px = tuple(int(round(v)) for v in feature["point"])
+            root = feature.get("root_point") or feature["base_point"]
+            root_px = tuple(int(round(v)) for v in root)
+            col = COLOR_FINGER_ON if feature["extended"] else COLOR_FINGER_OFF
+            cv2.line(base, root_px, tip_px, col, 3, cv2.LINE_AA)
+            cv2.circle(base, root_px, 7, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(base, tip_px, 7, col, -1, cv2.LINE_AA)
+            text = "%s %s" % (FINGER_BOX_TAGS[slot], "ON" if feature["extended"] else "OFF")
+            _put_text_outlined(base, text, (tip_px[0] + 12, tip_px[1] - 12), .7, col, 2)
+    elif FINGER_DEBUG_DRAW:
+        up_v = np.asarray(up, dtype=np.float64).reshape(2)
+        right_v = np.array([-up_v[1], up_v[0]])
+        ray_c = float(radius)
+        ray_len = float(FINGER_DEBUG_RAY_LEN_R) * ray_c
+        angles = result.get("finger_ray_angles") or []
+        exts = result.get("finger_extensions") or []
+        exps = result.get("finger_expect_len") or []
+        sts = result.get("finger_states") or []
+        for i in range(min(5, len(angles))):
+            a = float(angles[i])
+            # 角度约定：θ 从掌轴(up)量起，正方向 = right（拇指侧）
+            d = np.array([np.sin(np.radians(a)), -np.cos(np.radians(a))], dtype=np.float64)
+            # 转到图像坐标：把局部 (x沿right, y沿up) 换成像素方向
+            dirv = right_v * d[0] + up_v * (-d[1])
+            n = float(np.linalg.norm(dirv))
+            if n < 1e-9:
+                continue
+            dirv = dirv / n
+            col = COLOR_FINGER_ON if (i < len(sts) and sts[i]) else COLOR_FINGER_OFF
+            p_ray = (int(round(palm_center[0] + dirv[0] * ray_len)),
+                     int(round(palm_center[1] + dirv[1] * ray_len)))
+            cv2.line(base, center_px, p_ray, col, 1, cv2.LINE_AA)
+            if i < len(exps):
+                e = float(exps[i])
+                pe = (int(round(palm_center[0] + dirv[0] * e * ray_c)),
+                      int(round(palm_center[1] + dirv[1] * e * ray_c)))
+                cv2.circle(base, pe, 13, (0, 255, 255), 2, cv2.LINE_AA)   # 预期位置
+            if i < len(exts):
+                m = float(exts[i])
+                pm = (int(round(palm_center[0] + dirv[0] * m * ray_c)),
+                      int(round(palm_center[1] + dirv[1] * m * ray_c)))
+                cv2.circle(base, pm, 7, col, -1, cv2.LINE_AA)              # 实测位置
+            if i < len(exps) and i < len(exts):
+                pe = (int(round(palm_center[0] + dirv[0] * float(exps[i]) * ray_c)),
+                      int(round(palm_center[1] + dirv[1] * float(exps[i]) * ray_c)))
+                pm = (int(round(palm_center[0] + dirv[0] * float(exts[i]) * ray_c)),
+                      int(round(palm_center[1] + dirv[1] * float(exts[i]) * ray_c)))
+                cv2.line(base, pe, pm, (0, 255, 255), 1, cv2.LINE_AA)
+            # 标签：字母 + 实测/预期
+            lab_at = (int(round(palm_center[0] + dirv[0] * (ray_len + 26))),
+                      int(round(palm_center[1] + dirv[1] * (ray_len + 26))))
+            txt = "%s" % FINGER_BOX_TAGS[i]
+            if i < len(exts) and i < len(exps):
+                txt += " %.1f/%.1f" % (float(exts[i]), float(exps[i]))
+            _put_text_outlined(base, txt, lab_at, 0.7, col, 2)
+
     # 每根手指：指根 -> 指尖 一条线 + 两端点 + 编号和长度
-    for finger in result["fingers"]:
+    for finger in ([] if using_geometry else result["fingers"]):
         tip_px = (int(round(finger["tip"][0])), int(round(finger["tip"][1])))
         base_px = (int(round(finger["base"][0])), int(round(finger["base"][1])))
         cv2.line(base, base_px, tip_px, COLOR_TIP, 3)
@@ -2635,13 +3221,15 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
 
     hud_lines = []
     if not settled:
-        hud_lines.append(("过渡中（手在动）— 下面是上一次稳定的判定", 18, COLOR_UNSETTLED))
+        message = ("过渡中：保持上一次稳定的判定" if result.get("held")
+                   else "等待稳定：当前为临时识别结果")
+        hud_lines.append((message, 18, COLOR_UNSETTLED))
     hud_lines.append(("手指: %s" % result.get("finger_text", "?"), 24, (0, 230, 255)))
     # 连续量也显示出来：调门槛时一眼看出余量够不够（单位是 R 的倍数）
-    hud_lines.append(("延伸 " + "  ".join("%.1f" % e for e in extensions),
+    hud_lines.append((("局部长度 " if using_geometry else "延伸 ") + "  ".join("%.1f" % e for e in extensions),
                       16, (185, 185, 185)))
-    hud_lines.append(("（门槛 %.1fR，实心=伸开）" % float(FINGER_EXTENDED_MIN_R),
-                      15, (150, 150, 150)))
+    hud_lines.append((("局部指轴定位身份，宽度与细长程度判断伸缩" if using_geometry
+                       else "状态由模板匹配决定；延伸长度为辅助量"), 15, (150, 150, 150)))
     hud_lines.append((" ", 8, (0, 0, 0)))                                      # 空行分隔
     hud_lines.append(("fingers %d    gaps %d" % (result["finger_count"], len(result["gaps"])),
                       18, COLOR_LABEL))
@@ -2809,7 +3397,180 @@ def step_roi_boundary(frame: np.ndarray, state) -> np.ndarray:
 
 
 # ===========================================================================
-#  ★★ 稳定性门控：过渡帧不出结论 ★★
+#  ★★ 前处理：把手的方向转成「手指朝上」★★
+# ===========================================================================
+# 为什么需要：
+#   整条流水线（手腕 = "下方最窄行"、截前臂、掌轴、所有角度判据）**都写死了
+#   "小臂从画面下方入画、手指朝上"** ✓ 这是它 86% 的来源。
+#   手一旦整体转 90°（比如"手掌朝镜头但手指朝左"），这条流水线就全错 ✗
+#
+# ★ 解法不是把每个判据都改成旋转无关（试过，反而更差 ✗），
+#   而是**在投入计算前先判断手朝哪边，把画面转正**，再走原来那条流水线 ✓
+#
+# 怎么做（不看颜色以外的东西，成本约 3~5 ms）：
+#   ① 把画面缩到 320 宽，用当前颜色阈值粗分割一次
+#   ② 取最大的连通域（手 + 小臂），算它的**主成分方向**（PCA）
+#      小臂是细长结构，会把主轴拉向自己 -> 主轴 ≈ 小臂/手指的连线方向 ✓
+#   ③ 方向的正负：掌心（距离变换最大值点）在**手指那一侧**，
+#      而掩膜质心偏向**小臂那一侧**（小臂有质量）-> 从掌心指向质心就是小臂方向 ✓
+#   ④ 要转的角度 = 让小臂指向"画面下方"所需的旋转量 ✓
+#
+# ⚠️ 判不准时的兜底：找不到足够大的连通域就**不转**（角度 0）✓
+AUTO_ROTATE = True               # 总开关
+AUTO_ROTATE_DOWNSCALE = 320      # 判方向时把画面缩到这么宽（省时间）
+# ★ 判方向时颜色阈值放宽多少（Cr/Cb 上下各放宽这么多）★
+#   小臂常在阴影里、颜色和手掌差一截 ✗ 不放宽的话"手和小臂之间会断掉" -> 判不出方向
+#   放宽只影响判方向这一步，不影响识别 ✓
+AUTO_ROTATE_COLOR_SLACK = 0
+# ★ 判"小臂从哪条边进来"时的门槛（看掩膜贴在哪条边上）★
+#   贴边像素太少 -> 那条边不可信；贴边像素太多 -> 整条边都是掩膜（手贴边/分割糊了）也不可信
+AUTO_ROTATE_EDGE_MIN_PIXELS = 3
+AUTO_ROTATE_EDGE_MAX_FRAC = 0.35
+# 判不出来时的兜底：写死一个角度。
+#   ⚠️ 实测这批素材小臂都从**右边**进来 -> 要转 −90°。
+#      如果判断器不可靠，就把 AUTO_ROTATE 关掉、用这个固定角度 ✓
+AUTO_ROTATE_FIXED_DEG = -90.0
+AUTO_ROTATE_USE_FIXED = False    # True = 不判断，永远用上面那个固定角度
+AUTO_ROTATE_MIN_AREA = 0.004     # 最大连通域小于画面这个比例就不判（太小不可信）
+AUTO_ROTATE_MAX_DEG = 120.0      # 要转的角度超过这个值就认为判错了，不转
+AUTO_ROTATE_SMOOTH = 0.0         # 视频模式下角度的平滑系数（0=不平滑，越大越粘）
+
+_ROTATE_STATE = {"angle": 0.0, "locked": False}
+
+
+def reset_auto_rotate() -> None:
+    """清掉自动转正的记忆（换图/换源时调用）。"""
+    _ROTATE_STATE["angle"] = 0.0
+    _ROTATE_STATE["locked"] = False
+
+
+def detect_hand_rotation(frame: np.ndarray) -> float:
+    """★ 判断"要把画面转多少度，手才会变成手指朝上"。返回角度（度，正=逆时针）。
+
+    判不出来时返回 0.0（= 不转，按原样走）✓
+    """
+    h, w = frame.shape[:2]
+    if h < 32 or w < 32:
+        return 0.0
+    scale = float(AUTO_ROTATE_DOWNSCALE) / max(1, w)
+    small = cv2.resize(frame, (max(32, int(w * scale)), max(32, int(h * scale))),
+                       interpolation=cv2.INTER_AREA)
+    ycc = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
+    # ★ 判方向时**故意放宽颜色阈值** ★
+    #   ⚠️ 为什么要放宽：小臂常常在阴影里、颜色和手掌差一截 ✗
+    #      用正常阈值时"手和小臂之间会断掉" -> 射线走不出去 -> 判不出方向 ✗
+    #      实测：40 张里有 10 张因此判不出（它们的掩膜都很大，不是没分割出来）✓
+    #   ⚠️ 放宽只影响**判方向这一步**，不影响后面的识别 ✓
+    slack = float(AUTO_ROTATE_COLOR_SLACK)
+    mask = cv2.inRange(ycc,
+                       (int(Y_LOW), int(CR_LOW - slack), int(CB_LOW - slack)),
+                       (int(Y_HIGH), int(CR_HIGH + slack), int(CB_HIGH + slack)))
+    if int(np.count_nonzero(mask)) < 64:
+        return 0.0
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    if count <= 1:
+        return 0.0
+    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    area = int(stats[biggest, cv2.CC_STAT_AREA])
+    if area < float(AUTO_ROTATE_MIN_AREA) * mask.size:
+        return 0.0
+    blob = np.uint8(labels == biggest) * 255
+    ys, xs = np.nonzero(blob)
+    pts = np.stack([xs, ys], axis=1).astype(np.float64)
+
+    # 掌心 = 距离变换最大值点（它一定在手掌里，也就是**手指那一侧**）
+    dt = cv2.distanceTransform(blob, cv2.DIST_L2, 5)
+    idx = int(np.argmax(dt))
+    cy, cx = divmod(idx, blob.shape[1])
+    palm = np.array([float(cx), float(cy)])
+
+    # ★★★ 判据：小臂一定被【照片的某一条边】截断 ★★★
+    #   所以只看"掩膜贴在哪条边上"，就知道小臂从哪边进来 ✓
+    #   ⚠️ 之前那 6 版都在"猜小臂方向"（PCA / 质心 / 走得远 / 宽度带 / 角宽度），
+    #      全是在面对结果调阈值 ✗ 这一版只看**掩膜和哪条边相连** —— 物理事实 ✓
+    bh, bw = blob.shape[:2]
+    edge_lines = {
+        "left":   blob[:, 0],
+        "right":  blob[:, bw - 1],
+        "top":    blob[0, :],
+        "bottom": blob[bh - 1, :],
+    }
+    best_edge, best_cnt, best_pos = None, 0, 0.0
+    for name, line in edge_lines.items():
+        idx = np.nonzero(line)[0]
+        if idx.size > best_cnt:
+            best_cnt = int(idx.size)
+            best_edge = name
+            best_pos = float(idx.mean())                # 接触带的中点（沿边坐标）
+    if best_edge is None or best_cnt < int(AUTO_ROTATE_EDGE_MIN_PIXELS):
+        return 0.0
+    # 接触带太长 -> 整条边都是掩膜（手贴边或分割糊了），不可信
+    if best_cnt > float(AUTO_ROTATE_EDGE_MAX_FRAC) * max(bh, bw):
+        return 0.0
+
+    dt = cv2.distanceTransform(blob, cv2.DIST_L2, 5)
+    ys, xs = np.nonzero(blob)
+    # 用【掩膜质心】而不是掌心：质心更稳，而且一定偏在小臂那一侧 ✓
+    centroid = np.array([float(xs.mean()), float(ys.mean())])
+
+    # 小臂方向 = 从质心指向"那条边的接触带中点"
+    if best_edge == "left":
+        target = np.array([0.0, best_pos])
+    elif best_edge == "right":
+        target = np.array([float(bw - 1), best_pos])
+    elif best_edge == "top":
+        target = np.array([best_pos, 0.0])
+    else:
+        target = np.array([best_pos, float(bh - 1)])
+    arm = target - centroid
+    n = float(np.linalg.norm(arm))
+    if n < 1e-6:
+        return 0.0
+    arm = arm / n
+
+    # 要转多少度，才能让"小臂进来的那条边"落到画面下方
+    #   目标：小臂方向 = (0, +1)（图像坐标 y 向下）
+    #   getRotationMatrix2D 正角度 = 逆时针 ✓
+    #   实测：小臂从右边进来（掩膜贴右边）-> 要转 −90° ✓
+    cur = float(np.degrees(np.arctan2(arm[0], arm[1])))
+    while cur > 180.0:
+        cur -= 360.0
+    while cur < -180.0:
+        cur += 360.0
+    return float(-cur)
+
+
+def auto_rotate_frame(frame: np.ndarray):
+    """★ 前处理入口：判断方向 -> 转正。返回 ``(转正后的画面, 转过的角度)``。
+
+    ⚠️ 转正之后，后面的流水线才能假设"小臂从下方入画" ✓
+    """
+    if not AUTO_ROTATE:
+        return frame, 0.0
+    if AUTO_ROTATE_USE_FIXED:
+        angle = float(AUTO_ROTATE_FIXED_DEG)
+    else:
+        angle = detect_hand_rotation(frame)
+    if AUTO_ROTATE_SMOOTH > 0.0 and _ROTATE_STATE["locked"]:
+        a = float(AUTO_ROTATE_SMOOTH)
+        angle = (1.0 - a) * angle + a * float(_ROTATE_STATE["angle"])
+    _ROTATE_STATE["angle"] = angle
+    _ROTATE_STATE["locked"] = True
+    if abs(angle) < 1.0:
+        return frame, angle
+    h, w = frame.shape[:2]
+    center = (w * 0.5, h * 0.5)
+    m = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos_a, sin_a = abs(m[0, 0]), abs(m[0, 1])
+    nw = int(h * sin_a + w * cos_a)
+    nh = int(h * cos_a + w * sin_a)
+    m[0, 2] += nw * 0.5 - center[0]
+    m[1, 2] += nh * 0.5 - center[1]
+    out = cv2.warpAffine(frame, m, (nw, nh), flags=cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_REPLICATE)
+    return out, angle
+
+
 # ===========================================================================
 # 用户实测的观察：**手在摆造型的那些过渡帧**会判错，而**手摆好不动的帧基本能认对** ✓
 # 所以：不稳定的帧**不更新输出**，保持上一次稳定时的判定；连续若干帧稳定了才认。
@@ -2857,7 +3618,10 @@ def step_stability_gate(frame: np.ndarray, state) -> Optional[np.ndarray]:
 
     # ---- ① ROI 内隔点采样 + 缩到 64x64 灰度 ----
     height, width = raw.shape[:2]
-    x0, y0, x1, y1 = roi_rect_pixels((height, width))
+    if roi_enabled_now(state):
+        x0, y0, x1, y1 = roi_rect_pixels((height, width))
+    else:
+        x0, y0, x1, y1 = 0, 0, width, height
     step = int(max(1, STABLE_SAMPLE_STEP))
     patch = raw[y0:y1:step, x0:x1:step]
     if patch.size == 0:
@@ -2933,11 +3697,11 @@ def register(api) -> None:
     api.add(RECON_PLUGIN_NAME, step_palm_reconstruct, enabled=RECON_ENABLED_DEFAULT)
     # 识别骨架：截前臂 + 指尖 + 指缝（模式 5 / 6 用），只算不画
     api.add(RECOG_PLUGIN_NAME, step_hand_recognize, enabled=RECOG_ENABLED_DEFAULT)
-    # 两种画法：画在掩膜上（模式 5）/ 画在原图上（模式 6）
-    api.add(DRAW_MASK_PLUGIN_NAME, step_recognize_on_mask, enabled=DRAW_ENABLED_DEFAULT)
-    api.add(DRAW_ORIG_PLUGIN_NAME, step_recognize_on_original, enabled=DRAW_ENABLED_DEFAULT)
     # ★ 稳定性门控：必须排在 hand_recognize【之后】（要读它的结果）、
     #   排在绘制类插件【之前】（要先把结果换成"保持值"，绘制才画得对）。
     api.add(STABILITY_PLUGIN_NAME, step_stability_gate, enabled=STABILITY_GATE)
+    # Draw the result AFTER the temporal gate has selected the output states.
+    api.add(DRAW_MASK_PLUGIN_NAME, step_recognize_on_mask, enabled=DRAW_ENABLED_DEFAULT)
+    api.add(DRAW_ORIG_PLUGIN_NAME, step_recognize_on_original, enabled=DRAW_ENABLED_DEFAULT)
     # 画边界 + 触边检查（排在最后，画在结果之上）
     api.add(ROI_PLUGIN_NAME, step_roi_boundary, enabled=True)

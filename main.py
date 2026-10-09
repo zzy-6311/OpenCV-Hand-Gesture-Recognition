@@ -71,7 +71,7 @@ DATA_DIR = "data"
 # "camera" = 摄像头实时采集
 # "video"  = 读磁盘上的**视频文件**（走和摄像头同一条 cv2.VideoCapture 路径，
 #            区别只在"读到结尾怎么办"，见下面的 VIDEO_LOOP）
-SOURCE = "video"
+SOURCE = "image"
 
 # --- 视频文件模式（SOURCE = "video" 时生效）---------------------------------
 # ★ 视频素材清单（都放在 data/ 下，文件名相对 DATA_DIR）：
@@ -82,6 +82,7 @@ SOURCE = "video"
 #   两个 mp4 都是同一张印花床单 + 暗光下拍的，手势内容也类似，主要差别是**手占画面的大小**。
 #   实测手占比大的那个（video_2）掩膜更容易糊，所以**日常测试用 video_1**。
 VIDEO_FILE = "gesture_video_1.mp4"     # 相对 DATA_DIR；也可写绝对路径
+VIDEO_DATA_DIR = "data"               # Independent of the selected photo collection.
 VIDEO_LOOP = True                      # True = 播完从头循环；False = 播完自动退出
 # 视频模式下每帧的等待时间：用 FRAME_DELAY_MS_CAMERA(=1)，让处理速度决定节奏。
 # 实测 1920x1440 下整条链约 115~135 ms/帧（约 8 fps）—— 见文件末尾的性能说明。
@@ -131,13 +132,56 @@ GESTURE_SAMPLES = (
     ("ye", "耶（食指+小指+拇指）",  ("gesture_ye.jpg",)),
 )
 
-# 图片模式下要处理的图片（相对本文件所在目录）。按 n / p 在列表里循环切换。
-# 直接由上面的手势素材表展平而来 —— 这样只有一处需要维护，
-# 加素材只改 GESTURE_SAMPLES。老的 shou1/shou2（布背景、五指张开）
-# 放在最后，留着当"难例"做对比。
+# ===========================================================================
+#  ★★ 第四批素材：FPGA 摄像头实拍（2026-10-08，40 张）★★
+# ===========================================================================
+# 特点（和前三批很不一样）：
+#   · **1280x720 横幅**，来自 FPGA 驱动的摄像头。
+#     JSON 参数 40 张**完全相同**：RGB888 / BGGR / 曝光 1900 / 增益 125 / 无手动白平衡
+#   · **颜色比手机拍的偏暗**（图像均值 100~117，前三批是 110~210）
+#   · **手在画面里占比很大**（离镜头近）-> 所以 ROI 限制默认关掉（见 plugins.py）
+#   · 斜视角、灰板背景，手从画面右侧伸入
+#
+# ⚠️ **标签还没标** —— 原文件名是时间戳（20261008_222811_768571_rgb_full.png），
+#    不带手势信息。已按**拍摄时间顺序**改名成 shot_01.png ... shot_40.png，
+#    并在同目录留了两张对照表：
+#        _改名对照表.tsv       新名 <-> 原名
+#        _摄像头参数汇总.tsv    每张的曝光/增益/白平衡/图像均值
+#    要算准确率的话，把下面 CAMERA_SAMPLES 每条的中文描述换成真实手势即可。
+CAMERA_SHOT_DIR = "new_camera"        # 相对 DATA_DIR
+# ★ 29 张【标准】照片（掩膜里 5 根手指都看得见、不重叠）★
+#   另有 10 张"不太标准"的（手指有重叠/遮挡）已挪到旧数据目录：
+#       data/nonstd_01.png ... nonstd_10.png
+#       真值在 data/_不标准_真值.tsv，对照表在 data/_不标准_对照表.tsv
+CAMERA_SHOTS = tuple("shot_%02d.png" % i for i in range(1, 30))
+CAMERA_SAMPLES = tuple((i, "标准 %02d" % i, (name,))
+                       for i, name in enumerate(CAMERA_SHOTS, 1))
+
+# 前三批（手机拍的）保留在变量里，命令行给 "old" 时用它
+_OLD_GESTURE_SAMPLES = GESTURE_SAMPLES
+
+# ---- 用哪一批素材？--------------------------------------------------------
+#   "old"    = 前三批（gesture_*.jpg + shou1/2.png，共 30 张，DATA_DIR="data"）
+#   "camera" = 第四批 FPGA 摄像头实拍（40 张，DATA_DIR="data/new_camera"）
+#   ⚠️ 命令行也能直接切：python main.py image old   /   python main.py image camera
+ACTIVE_MATERIAL = "camera"
+
+if ACTIVE_MATERIAL == "camera":
+    DATA_DIR = "data/" + CAMERA_SHOT_DIR
+    GESTURE_SAMPLES = CAMERA_SAMPLES
+    SOURCE = "image"                  # 这批只有照片
+else:
+    DATA_DIR = "data"
+
+# 图片模式下要处理的图片（相对 DATA_DIR）。按 n / p 在列表里循环切换。
+# 直接由上面的素材表展平而来 —— 只有一处需要维护，加素材只改素材表。
+# "old" 那批里额外带上：
+#   · shou1/shou2（布背景、五指张开）—— 留着当"难例"做对比
+#   · nonstd_01~10（FPGA 摄像头拍的，但手指有重叠/遮挡，用户标注为"不太标准"）
+OLD_EXTRA_FILES = ["shou1.png", "shou2.png"] + ["nonstd_%02d.png" % i for i in range(1, 11)]
 IMAGE_FILES = (
     [name for _label, _desc, names in GESTURE_SAMPLES for name in names]
-    + ["shou1.png", "shou2.png"]
+    + (OLD_EXTRA_FILES if ACTIVE_MATERIAL != "camera" else [])
 )
 IMAGE_START_INDEX = 0                  # 启动时先用列表里的第几张（从 0 开始）
 
@@ -337,7 +381,7 @@ class PluginRegistry:
         """返回当前开启的插件名。"""
         return [item[0] for item in self._items if item[2]]
 
-    def run(self, frame: np.ndarray, state: FrameState) -> Optional[np.ndarray]:
+    def run(self, frame: np.ndarray, state: FrameState, *, strict: bool = False) -> Optional[np.ndarray]:
         """按顺序执行所有已启用插件；任一插件返回 None 则整条流水线短路。"""
         current: Optional[np.ndarray] = frame
         for name, func, enabled in self._items:
@@ -346,6 +390,8 @@ class PluginRegistry:
             try:
                 result = func(current, state)
             except Exception as error:  # 单个插件出错不应该让整个程序崩掉
+                if strict:
+                    raise RuntimeError("Plugin %s failed" % name) from error
                 print("[plugin:%s] 处理失败：%s: %s" % (name, type(error).__name__, error))
                 continue
             if result is None:
@@ -484,6 +530,13 @@ def resolve_image_paths(names: list[str], base_dir: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # 采集：优先 2K，拿不到就退而求其次
 # ---------------------------------------------------------------------------
+def resolve_video_path(filename: str) -> str:
+    """Resolve videos relative to this project, independent of photo selection/CWD."""
+    if os.path.isabs(filename):
+        return filename
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), VIDEO_DATA_DIR, filename)
+
+
 def _try_open(index: int, backend: Optional[int], width: int, height: int,
               fps: float) -> Optional[cv2.VideoCapture]:
     """尝试用指定后端打开摄像头并读取一帧；失败返回 None。"""
@@ -916,35 +969,76 @@ def main() -> int:
     #        python main.py video        强制视频流（用 VIDEO_FILE）
     #        python main.py video 2      直接用第 2 个视频素材（gesture_video_2.mp4）
     #        python main.py camera       摄像头
+    #      ★ 素材批次的切换（第 2 个参数给 old / camera）：
+    #        python main.py image camera 第四批：FPGA 摄像头实拍 40 张（默认）
+    #        python main.py image old    前三批：gesture_*.jpg + shou1/2，共 30 张
     #      ⚠️ 需要在函数里改全局，所以这里用 global 声明。
-    if len(sys.argv) > 1:
-        globals()  # 仅为可读性标记：下面用的是 global 语句
-    global SOURCE, VIDEO_FILE
+    global SOURCE, VIDEO_FILE, DATA_DIR, GESTURE_SAMPLES, IMAGE_FILES
     if len(sys.argv) > 1:
         want = str(sys.argv[1]).strip().lower()
         alias = {"image": "image", "img": "image", "photo": "image", "pic": "image",
                  "video": "video", "vid": "video", "camera": "camera", "cam": "camera"}
         if want not in alias:
             print("[main] 无法识别的输入源 %r；可用：image / video / camera" % sys.argv[1])
-            print("       例：python main.py image     python main.py video 2")
+            print("       例：python main.py image camera   python main.py video 2")
             return 1
         SOURCE = alias[want]
-        if SOURCE == "video" and len(sys.argv) > 2:
+        arg2 = str(sys.argv[2]).strip().lower() if len(sys.argv) > 2 else ""
+        if SOURCE == "video" and arg2:
             pick = str(sys.argv[2]).strip()
             if os.path.isabs(pick):
                 VIDEO_FILE = pick
             else:
                 cand = pick if pick.lower().endswith((".mp4", ".avi", ".mov", ".mkv")) \
                     else "gesture_video_%s.mp4" % pick
-                if os.path.exists(os.path.join(DATA_DIR, cand)):
+                if os.path.exists(resolve_video_path(cand)):
                     VIDEO_FILE = cand
                 else:
                     print("[main] 找不到视频素材 %r（试过 %s）" % (pick, cand))
                     return 1
+        elif SOURCE == "image" and arg2:
+            if arg2 in ("camera", "cam", "new"):
+                DATA_DIR = "data/" + CAMERA_SHOT_DIR
+                GESTURE_SAMPLES = CAMERA_SAMPLES
+                IMAGE_FILES = [n for _l, _d, ns in GESTURE_SAMPLES for n in ns]
+            elif arg2 in ("old", "legacy", "phone"):
+                DATA_DIR = "data"
+                GESTURE_SAMPLES = _OLD_GESTURE_SAMPLES
+                IMAGE_FILES = ([n for _l, _d, ns in GESTURE_SAMPLES for n in ns]
+                               + OLD_EXTRA_FILES)
+            else:
+                print("[main] 无法识别的素材批次 %r；可用：camera（默认）/ old" % arg2)
+                return 1
+    # 拿到 plugins 模块的引用（自动转正要用它的 AUTO_ROTATE / auto_rotate_frame）
+    plugins_module = None
+    try:
+        import plugins as plugins_module
+    except Exception:
+        plugins_module = None
+
     _kind = SOURCE.strip().lower()
-    print("[main] 输入源 = %s%s"
-          % (SOURCE, ("   视频 = %s" % VIDEO_FILE) if _kind == "video" else ""))
-    print("[main] 换输入源不用改文件：python main.py image | video [序号] | camera")
+    # 3.5) ★ 素材批次和 ROI 是配对的，自动切一下，免得手动忘了改：
+    #        · 新素材（FPGA 摄像头，1280x720，**手占比很大**）-> ROI 关掉 ✓
+    #        · 老三批（手机拍的，手占比小）-> ROI 必须打开 ✓
+    #          实测老三批关掉 ROI 会从 24/28 掉到 13/28 ✗
+    #      （运行时按 r 仍可手动覆盖）
+    try:
+        import plugins as _plugins
+        _source_data_dir = VIDEO_DATA_DIR if _kind == "video" else DATA_DIR
+        _want_roi = not (str(_source_data_dir).endswith(CAMERA_SHOT_DIR))
+        if bool(_plugins.ROI_ENABLED) != bool(_want_roi):
+            _plugins.ROI_ENABLED = _want_roi
+            print("[main] 按素材批次自动把 ROI_ENABLED 设成 %s"
+                  "（新素材手大 -> 关；老三批手小 -> 开）" % _want_roi)
+    except Exception as _e:
+        print("[main] （ROI 自动切换跳过：%s）" % _e)
+
+    print("[main] 输入源 = %s%s   素材目录 = %s（%d 张）"
+          % (SOURCE, ("   视频 = %s" % VIDEO_FILE) if _kind == "video" else "",
+             VIDEO_DATA_DIR if _kind == "video" else DATA_DIR,
+             len(IMAGE_FILES) if _kind == "image" else 0))
+    print("[main] 换输入源/素材不用改文件："
+          "python main.py image [camera|old] | video [序号] | camera")
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     # ★ 素材统一放在 DATA_DIR 子目录里（见文件开头的配置）。
@@ -976,8 +1070,7 @@ def main() -> int:
         print("[image] 循环处理同一张；n 下一张，p 上一张，R 从磁盘重载")
         frame_delay_ms = FRAME_DELAY_MS_IMAGE
     elif is_video:
-        video_path = VIDEO_FILE if os.path.isabs(VIDEO_FILE) \
-            else os.path.join(data_dir, VIDEO_FILE)
+        video_path = resolve_video_path(VIDEO_FILE)
         if not os.path.exists(video_path):
             print("[error] 视频文件不存在：%s" % video_path)
             print("        改 VIDEO_FILE（它是相对 DATA_DIR=\"%s\" 的），"
@@ -1071,8 +1164,7 @@ def main() -> int:
                     average_dt = sum(recent_dt) / len(recent_dt)
                     state.fps = 1.0 / average_dt if average_dt > 0 else 0.0
 
-                # 5.2.5 ★★ 视频/摄像头帧降采样（照片流早就在载入时降过了）★★
-                #   ⚠️ 为什么需要：图片模式的 fit_within 只在 ImageSource.load() 里调用，
+                # 5.2.5 ★★ 视频/摄像头帧降采样（照片流早就在载入时降过了）★★                #   ⚠️ 为什么需要：图片模式的 fit_within 只在 ImageSource.load() 里调用，
                 #      **视频/摄像头这条路径完全不经过它** —— 以前 1080x1920 的视频
                 #      是整幅 2.07 Mpx 进流水线的 ✗
                 #   实测（1080x1920 竖幅，完整链）：
@@ -1084,6 +1176,16 @@ def main() -> int:
                     long_side = max(raw.shape[0], raw.shape[1])
                     if long_side > VIDEO_MAX_LONG_SIDE:
                         raw = fit_within(raw, VIDEO_MAX_LONG_SIDE, VIDEO_MAX_LONG_SIDE)
+
+                # 5.2.6 ★★ 自动把手的方向转成「手指朝上」★★
+                #   整条流水线（手腕="下方最窄行"、截前臂、掌轴、所有角度判据）
+                #   **都写死了"小臂从画面下方入画、手指朝上"** ✓ 那是它 86% 的来源。
+                #   手一旦整体转 90°（比如"掌心朝镜头但手指朝左"），这条流水线就全错 ✗
+                #   ★ 解法不是把每个判据都改成旋转无关（试过，反而更差 ✗），
+                #     而是**先判断手朝哪边、把画面转正**，再走原来那条流水线 ✓
+                #   判断不出来时*不转*（返回 0），保持原行为 ✓
+                if plugins_module is not None and getattr(plugins_module, "AUTO_ROTATE", False):
+                    raw, _rot_angle = plugins_module.auto_rotate_frame(raw)
 
                 # 5.3 把本帧信息写进共享状态，插件通过 state 读取原图尺寸和裁切区
                 state.raw_frame = raw
