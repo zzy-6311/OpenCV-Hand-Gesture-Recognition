@@ -15,7 +15,7 @@ import numpy as np
 from recognizer import RecognitionResult, recognize
 
 
-DEFAULT_IMAGE = Path(__file__).resolve().parent.parent / "data/new_camera/shot_01.png"
+DEFAULT_IMAGE = Path(__file__).resolve().parent.parent / "data/old/new_camera/shot_01.png"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 WINDOW_NAME = "Finger recognition"
 NEXT_KEYS = {ord("n"), ord("N"), ord(" "), 0x270000, 65363, 16777236}
@@ -141,7 +141,7 @@ def browse_images(photos: list[Path], index: int, result: RecognitionResult,
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="照片浏览与五指识别；仅在切换照片时运行识别")
     parser.add_argument("image", nargs="?", type=Path, default=DEFAULT_IMAGE,
-                        help="图片或文件夹路径；默认浏览 ../data/new_camera/ 的照片")
+                        help="图片或文件夹路径；默认浏览 ../data/old/new_camera/ 的照片")
     parser.add_argument("--roi", action="store_true",
                         help="启用原旧照片的居中 ROI；标准摄像头照片默认不启用")
     display = parser.add_mutually_exclusive_group()

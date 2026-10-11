@@ -18,6 +18,8 @@ main.py 会自动 import 本文件并调用 ``register(api)``，把这里注册�
 from __future__ import annotations
 
 import os
+from collections import deque
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -73,26 +75,10 @@ ROI_TRACK_MIN_RADIUS = 12.0    # 掌心 R 小于此值就认为不可靠，本�
 # 兼容旧配置：这个常量已经**不再驱动** ROI 几何，只留着方便对照。
 ROI_RELATIVE = (0.25, 0.10, 0.50, 0.80)
 
-# 是否启用 ROI 限制。改成 False 就退回「整幅图都参与识别」。
-#
-# ⚠️⚠️ **实测：静态图上绝对不要关！**（2026-10 实测，28 张素材）
-#      ROI 开 -> 28/28        ROI 关 -> **16/28（退化 12 张）**
-#    失败模式非常一致：**掌心半径 R 从 ~140 暴涨到 253~319**，然后全判成 0（握拳）：
-#      gesture_01: R146 -> R274      gesture_02: R129 -> R319
-#      gesture_05: R138 -> R285      gesture_06: R141 -> R270  ...
-#    原因：关掉 ROI 后白板/桌面那片背景也进了掩膜，而"掌心"取的是**距离变换最大值点**
-#      -> 最大内切圆落到背景块上 -> R 暴涨 -> 所有按 R 归一化的门槛全部松掉
-#      -> 指尖达不到 1.45R -> 数出 0 根手指 -> 判成握拳。
-#    ★ 在**视频**上关掉 ROI 看着还行（手小又居中、背景块没那么大），但照片流一关就崩。
-#      想临时对比可以按 r 键实时切换。
-#
-# ★★★ 但现在默认是 **False** ★★★
-#   因为当前启用的是**第四批素材：FPGA 摄像头实拍**（data/new_camera，40 张）：
-#      · 1280x720，**手在画面里占比很大**（离镜头近）-> 开着 ROI 会把手切掉 ✗
-#      · 背景是灰板，不是白板/床单 -> 关掉 ROI 不会引入大片皮肤色区域 ✓
-#   ⚠️ **切回前三批时（python main.py image old）记得改回 True**，
-#      或者运行时按 r 键实时打开 ✓
-ROI_ENABLED = False
+# 未能可靠定位背景板时，统一使用原来的居中 ROI 掩膜作为兼容回退。
+# 成功定位背景板后自动关闭这层限制，避免对裁好的板面再次切掉手指。
+# 所有照片/视频使用同一规则，不按文件名或素材目录切换；r 键可手动覆盖。
+ROI_ENABLED = True
 
 # 是否把 ROI 边界画在画面上。True = 你看到的框就是真正生效的框。
 ROI_DRAW_BOUNDARY = True
@@ -825,12 +811,25 @@ _ROI_CACHE: dict = {}
 def roi_enabled_now(state) -> bool:
     """当前 ROI 是否启用。
 
-    ``state.flags["roi_enabled"]`` 优先 —— 这样 main.py 的 r 键可以**实时**
-    开关真正生效的 ROI（按一下就能对比"限制/不限制"的效果）。
-    没设过就退回模块常量 ROI_ENABLED。
+    r 键的 manual_roi 优先；自动流程有板时关闭二次 ROI，无板时使用
+    统一回退设置。roi_enabled 只为没有预处理元数据的旧调用保留。
     """
-    if state is not None and "roi_enabled" in getattr(state, "flags", {}):
-        return bool(state.flags["roi_enabled"])
+    if state is not None:
+        flags = getattr(state, "flags", {})
+        if "manual_roi" in flags:
+            return bool(flags["manual_roi"])
+        # A detected board already defines the processing region. A second
+        # centered crop would cut off fingers, especially after rotation.
+        board = flags.get("preprocess", {}).get("board", {})
+        if board.get("detected", False) or board.get("reason") == "disabled":
+            return False
+        if "preprocess" in flags:
+            # roi_enabled is also a display/status field written every frame.
+            # Never let the preceding board's result disable the next frame's
+            # fallback; only an explicit fallback setting overrides the default.
+            return bool(flags.get("roi_fallback_enabled", ROI_ENABLED))
+        if "roi_enabled" in flags:
+            return bool(flags["roi_enabled"])
     return bool(ROI_ENABLED)
 
 
@@ -985,7 +984,7 @@ def step_gray_threshold(frame: np.ndarray, state) -> np.ndarray:
 # 处理方法 B：YCbCr 色度（Cr / Cb）双通道区间二值化
 # ===========================================================================
 def _sampled_median(plane: np.ndarray, y0: int, y1: int, x0: int, x1: int,
-                    step: int) -> float:
+                    step: int, valid=None) -> float:
     """在矩形区域里**隔点取样**后取中位数；没有有效像素就返回 NaN。
 
     隔点取样是为了省时间（整幅上百万像素跑 median 要好几毫秒）。
@@ -993,6 +992,8 @@ def _sampled_median(plane: np.ndarray, y0: int, y1: int, x0: int, x1: int,
     if y1 <= y0 or x1 <= x0:
         return float("nan")
     patch = plane[y0:y1:step, x0:x1:step]
+    if valid is not None:
+        patch = patch[valid[y0:y1:step, x0:x1:step]]
     if patch.size == 0:
         return float("nan")
     return float(np.median(patch.astype(np.float32)))
@@ -1066,7 +1067,11 @@ def _estimate_scene_shift(ycrcb: np.ndarray, state) -> tuple:
     height, width = ycrcb.shape[:2]
     step = max(1, int(SCENE_ESTIMATE_STEP))
     enabled = roi_enabled_now(state)
-    roi_rect = roi_rect_pixels((height, width))
+    measured = state.flags.get("preprocess", {}).get("scene_calibration")
+    if measured is not None and not enabled:
+        state.flags["scene_bg_estimate"] = dict(measured["background"])
+        return tuple(float(v) for v in measured["shift"])
+    roi_rect = roi_rect_pixels((height, width)) if enabled else (0, 0, width, height)
     x0, y0, x1, y1 = roi_rect
 
     bg_cr = bg_cb = float("nan")
@@ -1077,11 +1082,12 @@ def _estimate_scene_shift(ycrcb: np.ndarray, state) -> tuple:
     if str(SCENE_SAMPLE_MODE).lower() == "ring":
         cr_plane = ycrcb[:, :, 1]
         cb_plane = ycrcb[:, :, 2]
+        valid = ycrcb[:, :, 0] > 0
         for (ty0, ty1, tx0, tx1) in _scene_tiles(roi_rect, (height, width)):
-            cr_med = _sampled_median(cr_plane, ty0, ty1, tx0, tx1, step)
+            cr_med = _sampled_median(cr_plane, ty0, ty1, tx0, tx1, step, valid)
             if cr_med != cr_med:            # NaN -> 空块
                 continue
-            cb_med = _sampled_median(cb_plane, ty0, ty1, tx0, tx1, step)
+            cb_med = _sampled_median(cb_plane, ty0, ty1, tx0, tx1, step, valid)
             if cb_med != cb_med:
                 continue
             tile_cr.append(cr_med)
@@ -1097,7 +1103,10 @@ def _estimate_scene_shift(ycrcb: np.ndarray, state) -> tuple:
         # 环带块不够（极端帧）或显式选了旧模式 -> 退回整幅 ROI 中位数
         roi = build_roi_mask((height, width), enabled) > 0
         sub_roi = roi[::step, ::step]
+        # A zero canvas has neutral chroma but is not an observed background.
+        sub_roi &= ycrcb[::step, ::step, 0] > 0
         if not np.any(sub_roi):
+            state.flags.pop("scene_bg_estimate", None)
             return 0.0, 0.0
         bg_cr = float(np.median(ycrcb[::step, ::step, 1][sub_roi].astype(np.float32)))
         bg_cb = float(np.median(ycrcb[::step, ::step, 2][sub_roi].astype(np.float32)))
@@ -1124,11 +1133,74 @@ def _estimate_scene_shift(ycrcb: np.ndarray, state) -> tuple:
     return d_cr, d_cb
 
 
+def _skin_color_bounds(ycrcb: np.ndarray, state, *, calibrate=True) -> tuple:
+    """Shared scene calibration and Y/Cr/Cb bounds for rotation and segmentation."""
+    cr_lo, cr_hi = _normalized_pair(CR_LOW, CR_HIGH, "CR_LOW/CR_HIGH")
+    cb_lo, cb_hi = _normalized_pair(CB_LOW, CB_HIGH, "CB_LOW/CB_HIGH")
+    y_lo, y_hi = _normalized_pair(Y_LOW, Y_HIGH, "Y_LOW/Y_HIGH")
+
+    # ---- ★ 场景色度自校准：把整个框按本帧估计的平移量一起挪 ----
+    scene_dcr = scene_dcb = 0.0
+    if SCENE_CALIBRATE and calibrate:
+        scene_dcr, scene_dcb = _estimate_scene_shift(ycrcb, state)
+        cr_lo = int(round(max(0.0, min(255.0, cr_lo + scene_dcr))))
+        cr_hi = int(round(max(0.0, min(255.0, cr_hi + scene_dcr))))
+        cb_lo = int(round(max(0.0, min(255.0, cb_lo + scene_dcb))))
+        cb_hi = int(round(max(0.0, min(255.0, cb_hi + scene_dcb))))
+        # 平移后仍要保证 下限 <= 上限（贴边时可能撞上，这里再纠一次）
+        cr_lo, cr_hi = _normalized_pair(cr_lo, cr_hi, "校准后 Cr")
+        cb_lo, cb_hi = _normalized_pair(cb_lo, cb_hi, "校准后 Cb")
+
+    else:
+        state.flags.pop("scene_bg_estimate", None)
+
+    state.flags["scene_shift"] = (scene_dcr, scene_dcb)
+    state.flags["scene_box"] = (cr_lo, cr_hi, cb_lo, cb_hi)
+    return (y_lo, cr_lo, cb_lo), (y_hi, cr_hi, cb_hi)
+
+
+def _board_valid_for_threshold(shape_hw, state):
+    """Return this frame's measured board area in segmentation coordinates.
+
+    Preparation runs before the mirror plugin. Raw-frame thresholding bypasses
+    that plugin, so only the ordinary mirrored source needs a mirrored mask.
+    No board mask is cached across frames; missing/disabled board evidence
+    immediately restores the ordinary threshold path.
+    """
+    preprocessing = state.flags.get("preprocess", {})
+    if not preprocessing.get("board", {}).get("detected", False):
+        return None
+    valid = preprocessing.get("board_valid_mask")
+    if not isinstance(valid, np.ndarray) or valid.ndim != 2:
+        return None
+    raw = getattr(state, "raw_frame", None)
+    raw_source = USE_RAW_FRAME and raw is not None
+    if valid.shape != tuple(shape_hw):
+        # The optional display-size processing path crops before resizing.
+        # Transform the board mask with that same crop; resizing the complete
+        # mask would move its boundary relative to the hand.
+        crop = getattr(state, "crop", None)
+        if raw_source or raw is None or valid.shape != raw.shape[:2] or crop is None:
+            return None
+        x, y, width, height = map(int, crop)
+        if (min(x, y) < 0 or min(width, height) <= 0 or
+                x + width > valid.shape[1] or y + height > valid.shape[0]):
+            return None
+        valid = cv2.resize(valid[y:y + height, x:x + width],
+                           (int(shape_hw[1]), int(shape_hw[0])),
+                           interpolation=cv2.INTER_NEAREST)
+    if getattr(state, "mirror", False) and not raw_source:
+        valid = cv2.flip(valid, 1)
+    return valid
+
+
 def step_color_threshold(frame: np.ndarray, state) -> np.ndarray:
     """YCbCr 色度阈值：Cr、Cb、Y 三段区间同时满足才算前景。
 
     和灰度版的区别只在判据：这里用的是**颜色**而不是亮度，
-    所以对阴影不敏感（阴影改 Y、基本不改 Cr/Cb）。
+    阴影会降低 Y，因此固定亮度下限仍可能把暗掌和手指连接处切断。
+    已定位白板的内部允许所有非零亮度，保留原有 Cr/Cb 肤色判据；
+    板外和未知场景仍使用原来的亮度区间。
 
     ★ 打开 SCENE_CALIBRATE 时，**Cr / Cb 两个区间会先按本帧估计的场景色度
       平移量整体挪一下**（详见配置区注释），这样换光照/换背景不用手改阈值。
@@ -1139,31 +1211,23 @@ def step_color_threshold(frame: np.ndarray, state) -> np.ndarray:
     cr_channel = ycrcb[:, :, 1]     # 注意：BGR2YCrCb 的第 1 通道是 Cr
     cb_channel = ycrcb[:, :, 2]     # 第 2 通道是 Cb
 
-    cr_lo, cr_hi = _normalized_pair(CR_LOW, CR_HIGH, "CR_LOW/CR_HIGH")
-    cb_lo, cb_hi = _normalized_pair(CB_LOW, CB_HIGH, "CB_LOW/CB_HIGH")
-    y_lo, y_hi = _normalized_pair(Y_LOW, Y_HIGH, "Y_LOW/Y_HIGH")
-
-    # ---- ★ 场景色度自校准：把整个框按本帧估计的平移量一起挪 ----
-    scene_dcr = scene_dcb = 0.0
-    if SCENE_CALIBRATE:
-        scene_dcr, scene_dcb = _estimate_scene_shift(ycrcb, state)
-        cr_lo = int(round(max(0.0, min(255.0, cr_lo + scene_dcr))))
-        cr_hi = int(round(max(0.0, min(255.0, cr_hi + scene_dcr))))
-        cb_lo = int(round(max(0.0, min(255.0, cb_lo + scene_dcb))))
-        cb_hi = int(round(max(0.0, min(255.0, cb_hi + scene_dcb))))
-        # 平移后仍要保证 下限 <= 上限（贴边时可能撞上，这里再纠一次）
-        cr_lo, cr_hi = _normalized_pair(cr_lo, cr_hi, "校准后 Cr")
-        cb_lo, cb_hi = _normalized_pair(cb_lo, cb_hi, "校准后 Cb")
-
+    lower, upper = _skin_color_bounds(ycrcb, state)
+    y_lo, cr_lo, cb_lo = lower
+    y_hi, cr_hi, cb_hi = upper
     # 三个区间取交集。用 bitwise_and 而不是 numpy 的 & 再 astype，
     # 少两次全图临时数组，而且和后面的 ROI 处理风格一致。
     mask = cv2.inRange(cr_channel, cr_lo, cr_hi)
     cv2.bitwise_and(mask, cv2.inRange(cb_channel, cb_lo, cb_hi), dst=mask)
-    cv2.bitwise_and(mask, cv2.inRange(y_channel, y_lo, y_hi), dst=mask)
-
-    # 记下本帧的平移量和最终生效的框，供 HUD 显示 / 事后排查
-    state.flags["scene_shift"] = (scene_dcr, scene_dcb)
-    state.flags["scene_box"] = (cr_lo, cr_hi, cb_lo, cb_hi)
+    luminance = cv2.inRange(y_channel, y_lo, y_hi)
+    board_valid = _board_valid_for_threshold(y_channel.shape, state)
+    if board_valid is not None:
+        # 1 means "observed, nonzero luminance", not a tuned skin threshold.
+        # Restoring dark pixels before cleanup keeps real fingers connected to
+        # the palm; otherwise the component filter discards the detached tip.
+        observed = cv2.inRange(y_channel, 1, y_hi)
+        cv2.bitwise_and(observed, board_valid, dst=observed)
+        cv2.bitwise_or(luminance, observed, dst=luminance)
+    cv2.bitwise_and(mask, luminance, dst=mask)
 
     # ★把 YCrCb 图挂到 state 上，供下游（掌心重建）取颜色用。
     #   必须是**这一张**（和掩膜同源、同一次镜像），不能改用 state.raw_frame ——
@@ -1173,7 +1237,9 @@ def step_color_threshold(frame: np.ndarray, state) -> np.ndarray:
     # ★同样把"这一帧的彩色原图"存下来，供模式 6（把识别结果画在原图上）用。
     #   理由同上：必须和掩膜同源，否则镜像时标注会错位。
     state.flags["segment_source_bgr"] = _threshold_source(frame, state)
-    return _finish_mask(mask, state, "color")
+    result = _finish_mask(mask, state, "color")
+    state.flags["segment_stats"]["board_low_light_recovery"] = board_valid is not None
+    return result
 
 
 # ===========================================================================
@@ -1474,6 +1540,39 @@ def _tip_sharpness(contour, index: int, window: int) -> tuple:
     return float(np.max(ratios)), float(np.median(angles))
 
 
+def _circular_window_extrema(values, half_window):
+    """Exact min/max of the established circular contour-index window.
+
+    The existing peak thresholds are defined against a fixed number of
+    CHAIN_APPROX_NONE points. Keep that support unchanged; only replace the
+    repeated offset scans with monotone queues, using O(N + window) work.
+    """
+    half_window = int(half_window)
+    if half_window < 0:
+        raise ValueError("The contour window must be nonnegative")
+    minima, maxima = np.empty_like(values), np.empty_like(values)
+    if len(values) == 0:
+        return minima, maxima
+    repeated = np.pad(values, (half_window, half_window), mode="wrap")
+    low, high = deque(), deque()
+    right = 0
+    for index in range(len(values)):
+        while right <= index + 2 * half_window:
+            while low and repeated[low[-1]] >= repeated[right]:
+                low.pop()
+            while high and repeated[high[-1]] <= repeated[right]:
+                high.pop()
+            low.append(right)
+            high.append(right)
+            right += 1
+        while low and low[0] < index:
+            low.popleft()
+        while high and high[0] < index:
+            high.popleft()
+        minima[index], maxima[index] = repeated[low[0]], repeated[high[0]]
+    return minima, maxima
+
+
 def _sample_plane(plane: np.ndarray, point: np.ndarray) -> float:
     """取某个浮点坐标处的像素值（就近取整，越界夹回）。"""
     height, width = plane.shape[:2]
@@ -1755,7 +1854,8 @@ def _truncate_forearm(mask: np.ndarray, palm_center, up, radius: float) -> np.nd
     return cv2.bitwise_and(mask, allowed)
 
 
-def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up):
+def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up,
+                       *, closed_candidates=None):
     """在轮廓上找指尖。返回（候选列表, 距离剖面）。
 
     判据（全部按 R 归一化）：
@@ -1773,19 +1873,16 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
     distances = np.linalg.norm(points - np.asarray(palm_center).reshape(1, 2), axis=1)
 
     window = max(2, int(round(RECOG_TIP_PEAK_WINDOW * float(radius))))
-    idx = np.arange(count)
-    floor_max = distances.copy()      # 环形邻域最大值
-    floor_min = distances.copy()      # 环形邻域最小值（算突出度用）
-    for offset in range(1, window + 1):
-        np.maximum(floor_max, distances[(idx + offset) % count], out=floor_max)
-        np.maximum(floor_max, distances[(idx - offset) % count], out=floor_max)
-        np.minimum(floor_min, distances[(idx + offset) % count], out=floor_min)
-        np.minimum(floor_min, distances[(idx - offset) % count], out=floor_min)
+    floor_min, floor_max = _circular_window_extrema(distances, window)
 
     # 先用纯向量化的三条门槛筛掉绝大多数轮廓点（快）
     keep = distances >= RECOG_TIP_MIN_DISTANCE * float(radius)
     keep &= floor_max <= distances + 1e-9
     keep &= (distances - floor_min) >= RECOG_TIP_MIN_PROMINENCE * float(radius)
+    local_points = _to_local_points(points, palm_center, up, radius)
+    # Reject wrist-cut corners before ranking/capping the candidates, so
+    # invalid distant points cannot consume the slots of real fingertips.
+    keep &= local_points[:, 1] <= float(RECOG_TIP_PALM_SIDE_MAX)
     candidate_indices = np.nonzero(keep)[0]
     if candidate_indices.size == 0:
         return [], distances
@@ -1811,10 +1908,13 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
         # ★主力判据：凸出长度。真手指是细长凸出，指节凸起是圆钝鼓包。
         #   这一条同时管住了两头 —— 既排掉拳头的指节凸起，又保住很短的小指。
         protrusion = _protrusion_length(thickness, points[index], palm_center, radius)
-        if protrusion < float(RECOG_TIP_PROTRUSION_MIN):
+        closed = protrusion < float(RECOG_TIP_PROTRUSION_MIN)
+        if closed and closed_candidates is None:
             continue
         candidates.append({
+            "closed_support": closed,
             "point": points[index].copy(),
+            "local": (float(local_points[index, 0]), float(local_points[index, 1])),
             "distance": float(distances[index]),
             "turn_ratio": float(ratio),
             "angle_deg": float(angle),
@@ -1822,31 +1922,27 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
             "protrusion_ratio": float(protrusion),
         })
 
-    # 去重：距离太近的是同一个指尖，留离掌心更远的那个
-    candidates.sort(key=lambda item: -item["distance"])
-    merged = []
-    for item in candidates:
-        if any(float(np.linalg.norm(item["point"] - kept["point"]))
-               < RECOG_TIP_DEDUP * float(radius) for kept in merged):
-            continue
-        merged.append(item)
-        if len(merged) >= int(RECOG_TIP_MAX_COUNT):
-            break
+    # Keep the original strong-tip ranking independent of closed caps. A
+    # knuckle cannot displace a real tip or change the extended-finger count.
+    def merge(items):
+        items = sorted(items, key=lambda item: -item["distance"])
+        merged = []
+        for item in items:
+            if any(float(np.linalg.norm(item["point"] - kept["point"]))
+                   < RECOG_TIP_DEDUP * float(radius) for kept in merged):
+                continue
+            merged.append(item)
+            if len(merged) >= int(RECOG_TIP_MAX_COUNT):
+                break
+        merged.sort(key=lambda item: float(np.arctan2(item["local"][1], item["local"][0])))
+        return merged
 
-    # 过滤：指尖必须落在掌上方（局部系 y <= 阈值）。
-    # 这一步同时把"前臂截断留下的两个直角"清掉 —— 它们在掌心下方。
-    result = []
-    for item in merged:
-        local = _to_local_points(item["point"].reshape(1, 2),
-                                 palm_center, up, radius)[0]
-        if float(local[1]) > float(RECOG_TIP_PALM_SIDE_MAX):
-            continue
-        item["local"] = (float(local[0]), float(local[1]))
-        result.append(item)
+    if closed_candidates is not None:
+        # Shared distance transform and cap measurements; no second image pass.
+        closed_candidates.extend(item for item in merge(candidates)
+                                 if item["closed_support"])
+    return merge([item for item in candidates if not item["closed_support"]]), distances
 
-    # 按相对掌心的极角排序，显示时就是 1,2,3...
-    result.sort(key=lambda item: float(np.arctan2(item["local"][1], item["local"][0])))
-    return result, distances
 
 
 def _detect_gaps(contour, tips, palm_center, radius: float, up):
@@ -1981,8 +2077,8 @@ RECOG_AXIS_FROM_ARM = False        # ★ 掌轴优先用【前臂主轴】估计
 def _arm_principal_axis(mask: np.ndarray, palm_center, up, wrist):
     """用**前臂区域的主轴方向**估计掌轴（比"掌心-手腕"稳，见 RECOG_AXIS_FROM_ARM）。
 
-    前臂区域 = 掩膜里"沿 up 的投影超过手腕"的那些像素。
-    返回朝掌心方向的单位向量；像素不够时返回 None（调用方退回原做法）。
+    up 从手腕指向掌心，因此前臂像素的投影应小于手腕投影。
+    返回朝掌心方向的单位向量；缺少手腕或像素不足时返回 None。
     """
     ys, xs = np.nonzero(mask)
     if xs.size < 64:
@@ -1991,11 +2087,12 @@ def _arm_principal_axis(mask: np.ndarray, palm_center, up, wrist):
     center = np.asarray(palm_center, dtype=np.float64).reshape(2)
     up = np.asarray(up, dtype=np.float64).reshape(2)
     proj = (pts - center[None, :]) @ up
-    if wrist is not None:
-        cut = float((np.asarray(wrist, dtype=np.float64).reshape(2) - center) @ up)
-    else:
-        cut = 60.0                      # 没有手腕估计时用个固定下限兜底
-    sel = pts[proj > cut]
+    if wrist is None:
+        return None
+    cut = float((np.asarray(wrist, dtype=np.float64).reshape(2) - center) @ up)
+    # up points from the wrist toward the palm. The forearm is behind the
+    # wrist, at SMALLER projections; the opposite half-plane selects fingers.
+    sel = pts[proj < cut]
     if sel.shape[0] < 64:
         return None
     centroid = sel.mean(axis=0)
@@ -2057,7 +2154,9 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
     if int(contour.shape[0]) < 8:
         return None
 
-    tips, _profile = _detect_fingertips(contour, hand, palm_center, radius, up)
+    closed_caps = [] if FINGER_IDENTITY_MODE == "geometry" else None
+    tips, _profile = _detect_fingertips(contour, hand, palm_center, radius, up,
+                                      closed_candidates=closed_caps)
     gaps = _detect_gaps(contour, tips, palm_center, radius, up)
     fingers = _build_fingers(tips, gaps, palm_center, radius, up)
 
@@ -2130,7 +2229,8 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
     #   顺序 = FINGER_NAMES = (拇指, 食指, 中指, 无名指, 小指)
     #   原来的 classify_gesture（数字标签）整套已删除，不再用。
     states, extensions, angles_used, match_detail, expect_len = _finger_states(
-        hand, palm_center, up, radius, tips, gaps, contour=contour)
+        hand, palm_center, up, radius, tips, gaps, contour=contour,
+        closed_candidates=closed_caps)
     result["finger_states"] = states                 # 5 个 bool（主判据：模板匹配）
     result["finger_extensions"] = extensions         # 5 个 float（× R），连续量
     result["finger_ray_angles"] = angles_used        # 5 个 float（度），画射线用
@@ -2689,7 +2789,7 @@ def _match_finger_template(angles: np.ndarray, profile: np.ndarray):
 
 
 def _finger_states(mask: np.ndarray, palm_center, up, radius: float, tips, web_gaps=None,
-                   contour=None):
+                   contour=None, closed_candidates=None):
     """Return five states and diagnostic measurements.
 
     Geometry mode projects local finger axes onto a transverse palm reference
@@ -2708,7 +2808,8 @@ def _finger_states(mask: np.ndarray, palm_center, up, radius: float, tips, web_g
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             contour = max(contours, key=cv2.contourArea) if contours else None
         measured, geometry_failure = FG.recognize_fingers(
-            mask, contour, palm_center, up, radius, tips or [])
+            mask, contour, palm_center, up, radius, tips or [],
+            closed_candidates=closed_candidates)
         if measured is not None:
             extensions = [0.0] * 5
             angles_used = [0.0] * 5
@@ -3093,7 +3194,8 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
     #   预期圈和实测点对不上 -> 就是那根手指判错的地方 ✓
     #   ⚠️ 只在 FINGER_DEBUG_DRAW 打开时画，免得平时画面太乱
     geometry_match = result.get("finger_match") or {}
-    using_geometry = geometry_match.get("method") == "root_geometry_q10"
+    using_geometry = geometry_match.get("method") in (
+        "root_geometry_q10", "complete_digit_topology", "complete_digit_topology_curvature")
     if FINGER_DEBUG_DRAW and using_geometry:
         # Measured tip -> projected root, labeled by anatomical identity.
         # Do not display unfitted template rays as if they were observations.
@@ -3228,7 +3330,8 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
     # 连续量也显示出来：调门槛时一眼看出余量够不够（单位是 R 的倍数）
     hud_lines.append((("局部长度 " if using_geometry else "延伸 ") + "  ".join("%.1f" % e for e in extensions),
                       16, (185, 185, 185)))
-    hud_lines.append((("局部指轴定位身份，宽度与细长程度判断伸缩" if using_geometry
+    hud_lines.append((("指尖与弯曲指节共同定位身份" if geometry_match.get("topology_used") else
+                       "局部指轴定位身份，宽度与细长程度判断伸缩" if using_geometry
                        else "状态由模板匹配决定；延伸长度为辅助量"), 15, (150, 150, 150)))
     hud_lines.append((" ", 8, (0, 0, 0)))                                      # 空行分隔
     hud_lines.append(("fingers %d    gaps %d" % (result["finger_count"], len(result["gaps"])),
@@ -3278,6 +3381,8 @@ def step_roi_boundary(frame: np.ndarray, state) -> np.ndarray:
     因为本插件排在二值化之后，画上去的边界不会被二值化吃掉，
     所以「你看到的框」就是「真正生效的框」。用 r 键可以实时开关。
     """
+    if state.flags.get("view_mode") == "背景板定位":
+        return frame
     enabled = roi_enabled_now(state)
     state.flags["roi_enabled"] = enabled          # 回写，让 r 键有个确定的初始值
 
@@ -3318,6 +3423,16 @@ def step_roi_boundary(frame: np.ndarray, state) -> np.ndarray:
     #    （"原图"/"掩膜"/"识别(原图)"…），cv2 的 Hershey 字体画中文只会出乱码。
     stats = state.flags.get("segment_stats") or {}
     text_lines = []
+    board = state.flags.get("preprocess", {}).get("board")
+    if board is not None:
+        if board.get("detected"):
+            bx0, by0, bx1, by1 = board["rect"]
+            text_lines.append(("背景板已定位：裁剪为 %d x %d" % (bx1-bx0, by1-by0),
+                               18, (100, 230, 100)))
+        elif board.get("reason") == "disabled":
+            text_lines.append(("背景板定位已关闭（b 键开启）", 18, COLOR_TEXT))
+        else:
+            text_lines.append(("背景板定位不确定：保留整图（7 键查看）", 18, (0, 200, 255)))
     if touched:
         text_lines.append(("TOUCHING ROI: %s" % ",".join(touched), 20, COLOR_BOUNDARY_BAD))
     if not enabled:
@@ -3399,24 +3514,12 @@ def step_roi_boundary(frame: np.ndarray, state) -> np.ndarray:
 # ===========================================================================
 #  ★★ 前处理：把手的方向转成「手指朝上」★★
 # ===========================================================================
-# 为什么需要：
-#   整条流水线（手腕 = "下方最窄行"、截前臂、掌轴、所有角度判据）**都写死了
-#   "小臂从画面下方入画、手指朝上"** ✓ 这是它 86% 的来源。
-#   手一旦整体转 90°（比如"手掌朝镜头但手指朝左"），这条流水线就全错 ✗
-#
-# ★ 解法不是把每个判据都改成旋转无关（试过，反而更差 ✗），
-#   而是**在投入计算前先判断手朝哪边，把画面转正**，再走原来那条流水线 ✓
-#
-# 怎么做（不看颜色以外的东西，成本约 3~5 ms）：
-#   ① 把画面缩到 320 宽，用当前颜色阈值粗分割一次
-#   ② 取最大的连通域（手 + 小臂），算它的**主成分方向**（PCA）
-#      小臂是细长结构，会把主轴拉向自己 -> 主轴 ≈ 小臂/手指的连线方向 ✓
-#   ③ 方向的正负：掌心（距离变换最大值点）在**手指那一侧**，
-#      而掩膜质心偏向**小臂那一侧**（小臂有质量）-> 从掌心指向质心就是小臂方向 ✓
-#   ④ 要转的角度 = 让小臂指向"画面下方"所需的旋转量 ✓
-#
-# ⚠️ 判不准时的兜底：找不到足够大的连通域就**不转**（角度 0）✓
+# 先依据图像寻找灰白矩形板并真正裁剪，再估计手臂接入方向。
+# 方向使用最大肤色连通域与四边的接触带中点及连通域质心。
+# 后续腕部扫描仍要求手指朝上，因此对裁图做扩展画布的旋转。
+# 检测不到入口时保持原方向；此时不能把角度 0 当作定位成功的置信度。
 AUTO_ROTATE = True               # 总开关
+BOARD_ROI_ENABLED = True         # 图像驱动的板定位；b 键可临时关闭对比
 AUTO_ROTATE_DOWNSCALE = 320      # 判方向时把画面缩到这么宽（省时间）
 # ★ 判方向时颜色阈值放宽多少（Cr/Cb 上下各放宽这么多）★
 #   小臂常在阴影里、颜色和手掌差一截 ✗ 不放宽的话"手和小臂之间会断掉" -> 判不出方向
@@ -3426,13 +3529,10 @@ AUTO_ROTATE_COLOR_SLACK = 0
 #   贴边像素太少 -> 那条边不可信；贴边像素太多 -> 整条边都是掩膜（手贴边/分割糊了）也不可信
 AUTO_ROTATE_EDGE_MIN_PIXELS = 3
 AUTO_ROTATE_EDGE_MAX_FRAC = 0.35
-# 判不出来时的兜底：写死一个角度。
-#   ⚠️ 实测这批素材小臂都从**右边**进来 -> 要转 −90°。
-#      如果判断器不可靠，就把 AUTO_ROTATE 关掉、用这个固定角度 ✓
+# 可选人工固定角度，仅在显式启用时使用，默认始终从图像估计。
 AUTO_ROTATE_FIXED_DEG = -90.0
-AUTO_ROTATE_USE_FIXED = False    # True = 不判断，永远用上面那个固定角度
+AUTO_ROTATE_USE_FIXED = False
 AUTO_ROTATE_MIN_AREA = 0.004     # 最大连通域小于画面这个比例就不判（太小不可信）
-AUTO_ROTATE_MAX_DEG = 120.0      # 要转的角度超过这个值就认为判错了，不转
 AUTO_ROTATE_SMOOTH = 0.0         # 视频模式下角度的平滑系数（0=不平滑，越大越粘）
 
 _ROTATE_STATE = {"angle": 0.0, "locked": False}
@@ -3444,7 +3544,8 @@ def reset_auto_rotate() -> None:
     _ROTATE_STATE["locked"] = False
 
 
-def detect_hand_rotation(frame: np.ndarray) -> float:
+def detect_hand_rotation(frame: np.ndarray, *, color_state=None,
+                         calibrate_background=False) -> float:
     """★ 判断"要把画面转多少度，手才会变成手指朝上"。返回角度（度，正=逆时针）。
 
     判不出来时返回 0.0（= 不转，按原样走）✓
@@ -3452,19 +3553,28 @@ def detect_hand_rotation(frame: np.ndarray) -> float:
     h, w = frame.shape[:2]
     if h < 32 or w < 32:
         return 0.0
-    scale = float(AUTO_ROTATE_DOWNSCALE) / max(1, w)
-    small = cv2.resize(frame, (max(32, int(w * scale)), max(32, int(h * scale))),
-                       interpolation=cv2.INTER_AREA)
+    # The same physical image must use the same sampling scale at 0/90 degrees.
+    scale = min(1.0, float(AUTO_ROTATE_DOWNSCALE) / max(h, w))
+    small = cv2.resize(frame, (max(1, round(w * scale)), max(1, round(h * scale))),
+                       interpolation=cv2.INTER_AREA) if scale < 1.0 else frame
     ycc = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
-    # ★ 判方向时**故意放宽颜色阈值** ★
-    #   ⚠️ 为什么要放宽：小臂常常在阴影里、颜色和手掌差一截 ✗
-    #      用正常阈值时"手和小臂之间会断掉" -> 射线走不出去 -> 判不出方向 ✗
-    #      实测：40 张里有 10 张因此判不出（它们的掩膜都很大，不是没分割出来）✓
-    #   ⚠️ 放宽只影响**判方向这一步**，不影响后面的识别 ✓
+    # Only a detected pale board establishes a neutral background reference.
+    # An unknown scene may contain patterned skin-coloured objects; its full
+    # image median must not shift the rotation threshold toward those objects.
+    # The caller opts in from this frame's board evidence, never a data group.
+    # Rotation inspects the complete supplied crop, before any centered ROI.
+    if color_state is None:
+        color_state = SimpleNamespace(flags={"manual_roi": False})
+    # Estimate colour from original samples: averaging pixels at a resized
+    # hand/board boundary mixes the two materials and changes its chroma.
+    calibration_ycrcb = (cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+                         if calibrate_background and small is not frame else ycc)
+    lower, upper = _skin_color_bounds(calibration_ycrcb, color_state,
+                                      calibrate=calibrate_background)
     slack = float(AUTO_ROTATE_COLOR_SLACK)
-    mask = cv2.inRange(ycc,
-                       (int(Y_LOW), int(CR_LOW - slack), int(CB_LOW - slack)),
-                       (int(Y_HIGH), int(CR_HIGH + slack), int(CB_HIGH + slack)))
+    lower = (lower[0], max(0, round(lower[1] - slack)), max(0, round(lower[2] - slack)))
+    upper = (upper[0], min(255, round(upper[1] + slack)), min(255, round(upper[2] + slack)))
+    mask = cv2.inRange(ycc, lower, upper)
     if int(np.count_nonzero(mask)) < 64:
         return 0.0
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
@@ -3476,13 +3586,6 @@ def detect_hand_rotation(frame: np.ndarray) -> float:
         return 0.0
     blob = np.uint8(labels == biggest) * 255
     ys, xs = np.nonzero(blob)
-    pts = np.stack([xs, ys], axis=1).astype(np.float64)
-
-    # 掌心 = 距离变换最大值点（它一定在手掌里，也就是**手指那一侧**）
-    dt = cv2.distanceTransform(blob, cv2.DIST_L2, 5)
-    idx = int(np.argmax(dt))
-    cy, cx = divmod(idx, blob.shape[1])
-    palm = np.array([float(cx), float(cy)])
 
     # ★★★ 判据：小臂一定被【照片的某一条边】截断 ★★★
     #   所以只看"掩膜贴在哪条边上"，就知道小臂从哪边进来 ✓
@@ -3508,8 +3611,6 @@ def detect_hand_rotation(frame: np.ndarray) -> float:
     if best_cnt > float(AUTO_ROTATE_EDGE_MAX_FRAC) * max(bh, bw):
         return 0.0
 
-    dt = cv2.distanceTransform(blob, cv2.DIST_L2, 5)
-    ys, xs = np.nonzero(blob)
     # 用【掩膜质心】而不是掌心：质心更稳，而且一定偏在小臂那一侧 ✓
     centroid = np.array([float(xs.mean()), float(ys.mean())])
 
@@ -3540,7 +3641,20 @@ def detect_hand_rotation(frame: np.ndarray) -> float:
     return float(-cur)
 
 
-def auto_rotate_frame(frame: np.ndarray):
+def _rotation_matrix_and_size(width: int, height: int, angle: float):
+    """One pixel-center transform for both the colour frame and validity mask."""
+    center = ((width - 1) * 0.5, (height - 1) * 0.5)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos_a, sin_a = abs(matrix[0, 0]), abs(matrix[0, 1])
+    new_width = int(height * sin_a + width * cos_a)
+    new_height = int(height * cos_a + width * sin_a)
+    matrix[0, 2] += (new_width - 1) * 0.5 - center[0]
+    matrix[1, 2] += (new_height - 1) * 0.5 - center[1]
+    return matrix, (new_width, new_height)
+
+
+def auto_rotate_frame(frame: np.ndarray, *, color_state=None,
+                      calibrate_background=False):
     """★ 前处理入口：判断方向 -> 转正。返回 ``(转正后的画面, 转过的角度)``。
 
     ⚠️ 转正之后，后面的流水线才能假设"小臂从下方入画" ✓
@@ -3550,7 +3664,8 @@ def auto_rotate_frame(frame: np.ndarray):
     if AUTO_ROTATE_USE_FIXED:
         angle = float(AUTO_ROTATE_FIXED_DEG)
     else:
-        angle = detect_hand_rotation(frame)
+        angle = detect_hand_rotation(frame, color_state=color_state,
+                                     calibrate_background=calibrate_background)
     if AUTO_ROTATE_SMOOTH > 0.0 and _ROTATE_STATE["locked"]:
         a = float(AUTO_ROTATE_SMOOTH)
         angle = (1.0 - a) * angle + a * float(_ROTATE_STATE["angle"])
@@ -3559,16 +3674,80 @@ def auto_rotate_frame(frame: np.ndarray):
     if abs(angle) < 1.0:
         return frame, angle
     h, w = frame.shape[:2]
-    center = (w * 0.5, h * 0.5)
-    m = cv2.getRotationMatrix2D(center, angle, 1.0)
-    cos_a, sin_a = abs(m[0, 0]), abs(m[0, 1])
-    nw = int(h * sin_a + w * cos_a)
-    nh = int(h * cos_a + w * sin_a)
-    m[0, 2] += nw * 0.5 - center[0]
-    m[1, 2] += nh * 0.5 - center[1]
-    out = cv2.warpAffine(frame, m, (nw, nh), flags=cv2.INTER_LINEAR,
+    m, size = _rotation_matrix_and_size(w, h, angle)
+    out = cv2.warpAffine(frame, m, size, flags=cv2.INTER_LINEAR,
                          borderMode=cv2.BORDER_REPLICATE)
     return out, angle
+
+
+def prepare_hand_frame(frame: np.ndarray, *, board_enabled=None):
+    """Locate the board, crop actual pixels, then normalize hand direction.
+
+    This entry point receives pixels only: no filename, label or data-group
+    switches. Uncertain board detection leaves the image intact.
+    """
+
+    height, width = frame.shape[:2]
+    enabled = BOARD_ROI_ENABLED if board_enabled is None else bool(board_enabled)
+    board = detect_board(frame) if enabled else {
+        "detected": False, "rect": (0, 0, width, height),
+        "confidence": 0.0, "reason": "disabled", "lines": [],
+    }
+    if board["detected"]:
+        x0, y0, x1, y1 = (int(v) for v in board["rect"])
+        if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+            raise ValueError("Board detector returned an invalid crop")
+        working = np.ascontiguousarray(frame[y0:y1, x0:x1])
+    else:
+        working = frame
+    color_state = SimpleNamespace(flags={"manual_roi": False})
+    rotated, angle = auto_rotate_frame(working, color_state=color_state,
+                                        calibrate_background=bool(board["detected"]))
+    board_valid = None
+    if board["detected"] and len(board.get("polygon", [])) >= 3:
+        # A slanted board's bounding rectangle also contains background at
+        # its corners. Keep the measured board surface separate from pixels
+        # introduced by the expanded rotation canvas.
+        board_valid = np.zeros(working.shape[:2], np.uint8)
+        polygon = np.rint(np.asarray(board["polygon"]) - [x0, y0]).astype(np.int32)
+        cv2.fillConvexPoly(board_valid, polygon, 255)
+        if abs(angle) >= 1.0:
+            matrix, size = _rotation_matrix_and_size(working.shape[1], working.shape[0], angle)
+            board_valid = cv2.warpAffine(board_valid, matrix, size,
+                                         flags=cv2.INTER_NEAREST,
+                                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    info = {"board": board, "rotation_deg": float(angle),
+            "input_size": (width, height),
+            "cropped_size": (working.shape[1], working.shape[0]),
+            "board_valid_mask": board_valid}
+    # Keep the board's measured background, before rotation replicates edge
+    # pixels into its expanded canvas. This is measurement from this frame,
+    # not temporal state or a saved calibration from another photograph.
+    if board["detected"] and "scene_shift" in color_state.flags:
+        info["scene_calibration"] = {
+            "shift": color_state.flags["scene_shift"],
+            "background": color_state.flags.get("scene_bg_estimate", {}),
+        }
+    return rotated, info
+
+
+def step_board_preview(frame: np.ndarray, state) -> np.ndarray:
+    """Show the measured board rectangle on the unrotated input (view 7)."""
+    source = state.flags.get("input_frame", state.raw_frame)
+    out = source.copy() if source is not None else frame.copy()
+    board = state.flags.get("preprocess", {}).get("board", {})
+    detected = bool(board.get("detected"))
+    color = (80, 230, 80) if detected else (0, 200, 255)
+    if detected:
+        x0, y0, x1, y1 = board["rect"]
+        cv2.rectangle(out, (x0, y0), (x1-1, y1-1), color, 3)
+    label = "背景板已定位：绿色框内参与识别" if detected else "背景板定位不确定：本帧保留整图"
+    if board.get("reason") == "disabled":
+        label = "背景板定位已关闭：按 b 开启"
+    draw_text_lines(out, [(label, 22, color),
+                         ("6 返回识别 | b 开关自动裁板 | n/p 换图", 18, COLOR_TEXT)],
+                    (12, 12), panel=True)
+    return out
 
 
 # ===========================================================================
@@ -3612,6 +3791,15 @@ def step_stability_gate(frame: np.ndarray, state) -> Optional[np.ndarray]:
     ⚠️ 用 ``state.raw_frame`` 算运动量，**不用 ``frame``** ——
        跑到这一步时 ``frame`` 已经被前面的插件变成掩膜了，拿它算帧间差没意义 ✗
     """
+    # Independent photos must never inherit the preceding photo's finger bits.
+    if state.flags.get("still_image", False):
+        state.flags["settled"] = True
+        rec = state.flags.get("recognize")
+        if rec is not None:
+            rec = dict(rec, settled=True, motion_diff=0.0)
+            rec.pop("held", None)
+            state.flags["recognize"] = rec
+        return frame
     raw = getattr(state, "raw_frame", None)
     if raw is None or getattr(raw, "ndim", 0) != 3:
         return frame
@@ -3703,5 +3891,212 @@ def register(api) -> None:
     # Draw the result AFTER the temporal gate has selected the output states.
     api.add(DRAW_MASK_PLUGIN_NAME, step_recognize_on_mask, enabled=DRAW_ENABLED_DEFAULT)
     api.add(DRAW_ORIG_PLUGIN_NAME, step_recognize_on_original, enabled=DRAW_ENABLED_DEFAULT)
+    api.add("board_preview", step_board_preview, enabled=False)
     # 画边界 + 触边检查（排在最后，画在结果之上）
     api.add(ROI_PLUGIN_NAME, step_roi_boundary, enabled=True)
+
+
+# Background board localization, bundled for the three-file release.
+def _fit_edge(points, extent):
+    """Deterministic consensus line: dependent coordinate = a * axis + b."""
+    points = np.asarray(points, np.float64)
+    if len(points) < 12:
+        return None
+    ids = np.unique(np.linspace(0, len(points) - 1, min(48, len(points))).astype(int))
+    selected = points[ids]
+    first, second = np.triu_indices(len(selected), 1)
+    delta = selected[second] - selected[first]
+    usable = np.abs(delta[:, 0]) >= 0.20 * np.ptp(points[:, 0])
+    delta, first = delta[usable], first[usable]
+    slopes = delta[:, 1] / delta[:, 0]
+    intercepts = selected[first, 1] - slopes * selected[first, 0]
+    usable = np.abs(slopes) <= np.tan(np.deg2rad(20.0))
+    slopes, intercepts = slopes[usable], intercepts[usable]
+    if not len(slopes):
+        return None
+    tolerance = max(1.5, 0.005 * extent)
+    best = None
+    for start in range(0, len(slopes), 128):
+        aa, bb = slopes[start:start + 128], intercepts[start:start + 128]
+        error = np.abs(points[None, :, 1] - aa[:, None] * points[None, :, 0] - bb[:, None])
+        inside = error <= tolerance
+        votes = inside.sum(axis=1)
+        # Residual is a tie breaker; it does not reward image-specific positions.
+        score = votes - np.minimum(error, tolerance).mean(axis=1) / (2 * tolerance)
+        winner = int(np.argmax(score))
+        if best is None or score[winner] > best[0]:
+            best = (float(score[winner]), float(aa[winner]), float(bb[winner]))
+    _, slope, intercept = best
+    for _ in range(3):
+        keep = np.abs(points[:, 1] - slope * points[:, 0] - intercept) <= tolerance
+        if np.count_nonzero(keep) < 10:
+            return None
+        slope, intercept = np.polyfit(points[keep, 0], points[keep, 1], 1)
+    residual = np.abs(points[:, 1] - slope * points[:, 0] - intercept)
+    keep = residual <= tolerance
+    span = np.ptp(points[keep, 0]) / max(1, np.ptp(points[:, 0]))
+    return {"a": float(slope), "b": float(intercept),
+            "support": float(keep.mean()), "span": float(span),
+            "error": float(np.median(residual[keep])), "tolerance": tolerance}
+
+
+def _intersection(vertical, horizontal):
+    # x = av*y+bv, y = ah*x+bh.
+    av, bv = vertical["a"], vertical["b"]
+    ah, bh = horizontal["a"], horizontal["b"]
+    x = (av * bh + bv) / (1 - av * ah)
+    return [x, ah * x + bh]
+
+
+def _candidate(mask, height, width):
+    result = {"rect": (0, 0, width, height), "detected": False,
+              "confidence": 0.0, "reason": "no_pale_region", "lines": [], "polygon": []}
+    edges = []
+    for axis in (0, 1):
+        oriented = mask if axis == 0 else mask.T
+        rows = np.flatnonzero(np.any(oriented, axis=1))
+        low = np.argmax(oriented, axis=1)
+        high = oriented.shape[1] - 1 - np.argmax(oriented[:, ::-1], axis=1)
+        for name, envelope in zip(("left", "right") if axis == 0 else ("top", "bottom"), (low, high)):
+            edge = _fit_edge(np.column_stack((rows, envelope[rows])), oriented.shape[1])
+            if edge is None or edge["support"] < 0.28 or edge["span"] < 0.28:
+                result["reason"] = "insufficient_straight_edges"
+                return result
+            edge["name"] = name
+            edges.append(edge)
+    left, right, top, bottom = edges
+    if sum(edge["support"] >= 0.60 and edge["span"] >= 0.70 for edge in edges) < 2:
+        result["reason"] = "insufficient_unoccluded_edges"
+        return result
+    # Opposing sides should be approximately parallel.  Modest perspective is
+    # allowed; a heavily tilted board should be re-positioned, not guessed.
+    if abs(left["a"] - right["a"]) > 0.15 or abs(top["a"] - bottom["a"]) > 0.15:
+        result["reason"] = "perspective_or_conflicting_edges"
+        return result
+    polygon = np.asarray([_intersection(left, top), _intersection(right, top),
+                          _intersection(right, bottom), _intersection(left, bottom)], np.float32)
+    sh, sw = mask.shape
+    polygon[:, 0] = np.clip(polygon[:, 0], 0, sw - 1)
+    polygon[:, 1] = np.clip(polygon[:, 1], 0, sh - 1)
+    area = abs(float(cv2.contourArea(polygon)))
+    if area < 0.16 * mask.size or not cv2.isContourConvex(polygon):
+        result["reason"] = "invalid_board_geometry"
+        return result
+    polygon_mask = np.zeros(mask.shape, np.uint8)
+    cv2.fillConvexPoly(polygon_mask, np.rint(polygon).astype(np.int32), 1)
+    inside = polygon_mask != 0
+    coverage = float(np.mean(mask[inside]))
+    if coverage < 0.45:
+        result["reason"] = "insufficient_board_surface"
+        return result
+    # Reject image-border-only hypotheses: a uniform room wall is not a located
+    # board.  Image-border lines remain valid when other board edges are visible.
+    visible = 0
+    for edge, extent, along in zip(edges, (sw, sw, sh, sh), (sh, sh, sw, sw)):
+        values = edge["a"] * np.array([0.0, along - 1.0]) + edge["b"]
+        clipped = np.all(values <= 2) or np.all(values >= extent - 3)
+        edge["image_boundary"] = bool(clipped)
+        visible += not clipped
+    if visible < 2:
+        result["reason"] = "board_edges_out_of_view"
+        return result
+    # No added black/white canvas: callers crop the original pixels so an arm
+    # entering the board remains attached to the new image boundary.
+    sx, sy = width / sw, height / sh
+    original = polygon * np.array([sx, sy], np.float32)
+    x0, y0 = np.floor(original.min(axis=0)).astype(int)
+    x1, y1 = np.ceil((polygon.max(axis=0) + 1) * [sx, sy]).astype(int)
+    rect = (max(0, int(x0)), max(0, int(y0)), min(width, int(x1)), min(height, int(y1)))
+    if rect[2] - rect[0] < width * 0.20 or rect[3] - rect[1] < height * 0.20:
+        result["reason"] = "board_too_narrow"
+        return result
+    confidence = float(np.clip(0.6 * min(e["support"] for e in edges) + 0.4 * coverage, 0, 1))
+    lines = []
+    for index, edge in enumerate(edges):
+        ends = {0: (0, 3), 1: (1, 2), 2: (0, 1), 3: (3, 2)}[index]
+        lines.append({"name": edge["name"], "points": original[list(ends)].tolist(),
+                      "support": edge["support"], "image_boundary": edge["image_boundary"]})
+    result.update(rect=rect, detected=True, confidence=confidence,
+                  reason="straight_pale_board", lines=lines, polygon=original.tolist(),
+                  surface_coverage=coverage)
+    return result
+
+
+def _regions(pale, height, width, restore=None):
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(pale, connectivity=8)
+    candidates = []
+    for label in (1 + np.argsort(stats[1:, cv2.CC_STAT_AREA])[::-1])[:4]:
+        if stats[label, cv2.CC_STAT_AREA] < 0.12 * pale.size:
+            break
+        mask = labels == label
+        if restore is not None:
+            # Restore the thin strip removed by edge separation without merging
+            # the already separated region identities back into one component.
+            mask = (cv2.dilate(mask.astype(np.uint8), np.ones((5, 5), np.uint8)) != 0) & (restore != 0)
+        candidate = _candidate(mask, height, width)
+        candidate["region_area"] = float(stats[label, cv2.CC_STAT_AREA] / pale.size)
+        candidates.append(candidate)
+    return candidates
+
+
+def _select(candidates, fallback):
+    valid = sorted((r for r in candidates if r["detected"]),
+                   key=lambda r: r["confidence"], reverse=True)
+    if not valid:
+        return candidates[0] if candidates else fallback
+    if len(valid) > 1 and valid[1]["region_area"] >= 0.80 * valid[0]["region_area"]:
+        return dict(fallback, reason="ambiguous_pale_regions")
+    return valid[0]
+
+
+def detect_board(frame):
+    """Return rect=(x0,y0,x1,y1), detected, confidence, reason, lines.
+
+    Coordinates refer to the original image; upper bounds are exclusive.
+    Confidence is a geometric support score, not a calibrated probability.
+    ``rect`` is the whole image when ``detected`` is false.  ``lines`` and
+    ``polygon`` describe detected straight board boundaries for diagnostics.
+    At least two actual board edges must be visible.  Strong perspective,
+    textured cloth and ambiguous borders are deliberately rejected.
+    """
+    if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError("detect_board expects a BGR image")
+    height, width = frame.shape[:2]
+    fallback = {"rect": (0, 0, width, height), "detected": False,
+                "confidence": 0.0, "reason": "no_pale_region", "lines": [], "polygon": []}
+    if min(height, width) < 32:
+        return dict(fallback, reason="image_too_small")
+    scale = min(1.0, 640.0 / max(height, width))
+    small = cv2.resize(frame, (round(width * scale), round(height * scale)),
+                       interpolation=cv2.INTER_AREA) if scale < 1 else frame
+    smooth = cv2.GaussianBlur(small, (5, 5), 0)
+    gray = cv2.cvtColor(smooth, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(smooth, cv2.COLOR_BGR2HSV)
+    threshold, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Relative brightness handles exposure; saturation is a material constraint
+    # for a white/grey board, independent of the skin and gesture classifier.
+    pale = ((hsv[:, :, 1] <= 45) & (gray >= max(45, threshold))).astype(np.uint8)
+    pale = cv2.morphologyEx(pale, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    result = _select(_regions(pale, height, width), fallback)
+    if result["detected"] or result["reason"] == "ambiguous_pale_regions":
+        return result
+    # A neutral background can connect to the board in a brightness mask.
+    # Split at measured image edges, then validate each resulting region using
+    # exactly the same geometry.  This preserves shadowed board pixels instead
+    # of treating an arbitrary higher brightness threshold as a crop boundary.
+    dx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    dy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    magnitude = np.clip(cv2.magnitude(dx, dy), 0, 255).astype(np.uint8)
+    high, _ = cv2.threshold(magnitude, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    high = max(20.0, high)
+    image_edges = cv2.Canny(gray, 0.4 * high, high, L2gradient=True)
+    barrier = cv2.dilate(image_edges, np.ones((3, 3), np.uint8))
+    separated = pale & (barrier == 0).astype(np.uint8)
+    refined = _select(_regions(separated, height, width, restore=pale), fallback)
+    if refined["detected"]:
+        refined["candidate_source"] = "image_edges"
+        return refined
+    if refined["reason"] == "ambiguous_pale_regions":
+        return refined
+    return result

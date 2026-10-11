@@ -11,8 +11,8 @@
     - ``"image"``（当前默认）：读磁盘上的单张图片，**在循环里反复处理同一张**，
       方便一边看叠加结果一边开关插件、调参数。按 n / p 切换图片，按 R 重载。
     - ``"camera"``：原来的摄像头路径（2K 采集），代码完整保留，随时切回去。
-* 处理：默认把**原图（如 2560x1440）整帧**交给插件，不做裁切，
-  这样指尖/指缝这类细节不会被提前缩小。
+* 处理：默认先自动定位背景板并裁剪，再估计手臂方向和转正。
+  板定位不确定时保留原画布，使用原 ROI 处理；r 键可手动覆盖。
   想回到「先裁成 1280x720 再交给插件」的旧行为，把 `PLUGIN_FULL_RESOLUTION`
   改成 False 即可。
 * 显示：窗口固定 1280x720（WINDOW_NORMAL 会把大图按比例缩放进窗口显示）。
@@ -37,7 +37,7 @@
 
 运行方式：执行 main.py。
 键位：q 退出，空格暂停/继续，d 显示信息叠加，m 镜像开关，f 全屏开关，
-      l 列出插件，r ROI限制 开关；图片模式下另有 n 下一张、p 上一张、R 从磁盘重载。
+      l 列出插件，r ROI限制 开关，b 自动裁板，7 查看定位；图片模式下另有 n 下一张、p 上一张、R 从磁盘重载。
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ from __future__ import annotations
 import collections
 import importlib
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -142,17 +143,14 @@ GESTURE_SAMPLES = (
 #   · **手在画面里占比很大**（离镜头近）-> 所以 ROI 限制默认关掉（见 plugins.py）
 #   · 斜视角、灰板背景，手从画面右侧伸入
 #
-# ⚠️ **标签还没标** —— 原文件名是时间戳（20261008_222811_768571_rgb_full.png），
-#    不带手势信息。已按**拍摄时间顺序**改名成 shot_01.png ... shot_40.png，
-#    并在同目录留了两张对照表：
-#        _改名对照表.tsv       新名 <-> 原名
-#        _摄像头参数汇总.tsv    每张的曝光/增益/白平衡/图像均值
-#    要算准确率的话，把下面 CAMERA_SAMPLES 每条的中文描述换成真实手势即可。
-CAMERA_SHOT_DIR = "new_camera"        # 相对 DATA_DIR
+# 原批次 29 张标准照片按拍摄顺序命名，位于 data/new。
+# 后续开发照片也放在 data/new，主程序动态枚举，不限制为原来的 29 张。
+# 真值表只供独立评测器读取，主程序仅枚举图片，不把编号或答案用于识别。
+CAMERA_SHOT_DIR = "new"               # 相对 data；当前开发素材
 # ★ 29 张【标准】照片（掩膜里 5 根手指都看得见、不重叠）★
 #   另有 10 张"不太标准"的（手指有重叠/遮挡）已挪到旧数据目录：
-#       data/nonstd_01.png ... nonstd_10.png
-#       真值在 data/_不标准_真值.tsv，对照表在 data/_不标准_对照表.tsv
+#       data/不标准/nonstd_01.png ... nonstd_10.png
+#       真值和对照表也保存在 data/不标准/，通过 image nonstd 单独浏览。
 CAMERA_SHOTS = tuple("shot_%02d.png" % i for i in range(1, 30))
 CAMERA_SAMPLES = tuple((i, "标准 %02d" % i, (name,))
                        for i, name in enumerate(CAMERA_SHOTS, 1))
@@ -161,27 +159,31 @@ CAMERA_SAMPLES = tuple((i, "标准 %02d" % i, (name,))
 _OLD_GESTURE_SAMPLES = GESTURE_SAMPLES
 
 # ---- 用哪一批素材？--------------------------------------------------------
-#   "old"    = 前三批（gesture_*.jpg + shou1/2.png，共 30 张，DATA_DIR="data"）
-#   "camera" = 第四批 FPGA 摄像头实拍（40 张，DATA_DIR="data/new_camera"）
+#   "old"    = 前三批（gesture_*.jpg + shou1/2.png，DATA_DIR="data/old"）
+#   "new"    = 当前开发素材（默认，DATA_DIR="data/new"）；camera 为兼容入口。
+#   "test"   = 留出测试集，显式选择；不用于开发调参。
 #   ⚠️ 命令行也能直接切：python main.py image old   /   python main.py image camera
-ACTIVE_MATERIAL = "camera"
+ACTIVE_MATERIAL = "new"
 
 if ACTIVE_MATERIAL == "camera":
     DATA_DIR = "data/" + CAMERA_SHOT_DIR
     GESTURE_SAMPLES = CAMERA_SAMPLES
     SOURCE = "image"                  # 这批只有照片
+elif ACTIVE_MATERIAL in ("new", "test"):
+    DATA_DIR = "data/" + ACTIVE_MATERIAL
+    GESTURE_SAMPLES = ()               # 文件列表稍后枚举；答案不进入识别程序
+    SOURCE = "image"
 else:
-    DATA_DIR = "data"
+    DATA_DIR = "data/old"
 
 # 图片模式下要处理的图片（相对 DATA_DIR）。按 n / p 在列表里循环切换。
 # 直接由上面的素材表展平而来 —— 只有一处需要维护，加素材只改素材表。
 # "old" 那批里额外带上：
 #   · shou1/shou2（布背景、五指张开）—— 留着当"难例"做对比
-#   · nonstd_01~10（FPGA 摄像头拍的，但手指有重叠/遮挡，用户标注为"不太标准"）
-OLD_EXTRA_FILES = ["shou1.png", "shou2.png"] + ["nonstd_%02d.png" % i for i in range(1, 11)]
+OLD_EXTRA_FILES = ["shou1.png", "shou2.png"]
 IMAGE_FILES = (
     [name for _label, _desc, names in GESTURE_SAMPLES for name in names]
-    + (OLD_EXTRA_FILES if ACTIVE_MATERIAL != "camera" else [])
+    + (OLD_EXTRA_FILES if ACTIVE_MATERIAL == "old" else [])
 )
 IMAGE_START_INDEX = 0                  # 启动时先用列表里的第几张（从 0 开始）
 
@@ -295,6 +297,7 @@ VIEW_MODES = (
                               "hand_recognize", "recognize_on_mask")),
     (ord("6"), "识别(原图)", ("color_threshold", "mask_cleanup", "palm_reconstruct",
                               "hand_recognize", "recognize_on_original")),
+    (ord("7"), "背景板定位", ("board_preview",)),
 )
 
 # 默认模式（索引，5 = VIEW_MODES 里的第六项「识别(原图)」）
@@ -302,7 +305,7 @@ VIEW_MODE_DEFAULT = 5
 
 # 每个显示模式下"画面里是不是掩膜"。决定要不要做触边检查 + ROI 外擦黑 ——
 # 模式 1（原图）和模式 6（原图+标注）都不是掩膜，不能把 ROI 外擦黑。
-VIEW_MODE_HAS_MASK = (False, True, True, True, True, False)
+VIEW_MODE_HAS_MASK = (False, True, True, True, True, False, False)
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +428,39 @@ def fit_within(image: np.ndarray, max_width: int, max_height: int) -> np.ndarray
     return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
 
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def image_sort_key(name: str) -> list:
+    """Natural filename order for browsing; filenames carry no recognition input."""
+    return [int(part) if part.isdigit() else part.casefold()
+            for part in re.split(r"(\d+)", name)]
+
+
+def image_filenames(folder: str) -> list[str]:
+    """List immediate photo files only; never load labels or image contents."""
+    if not os.path.isdir(folder):
+        return []
+    return sorted((name for name in os.listdir(folder)
+                   if os.path.isfile(os.path.join(folder, name))
+                   and os.path.splitext(name)[1].lower() in IMAGE_SUFFIXES),
+                  key=image_sort_key)
+
+
+# 默认开发素材按目录内容枚举，不把文件名或正确答案写进算法。
+if ACTIVE_MATERIAL in ("new", "test", "camera"):
+    IMAGE_FILES = image_filenames(os.path.join(os.path.dirname(os.path.abspath(__file__)), DATA_DIR))
+
+
+def read_image(path: str) -> Optional[np.ndarray]:
+    """Decode images using Unicode-safe Windows file I/O."""
+    try:
+        encoded = np.fromfile(path, dtype=np.uint8)
+        return cv2.imdecode(encoded, cv2.IMREAD_COLOR) if encoded.size else None
+    except (OSError, ValueError, cv2.error):
+        return None
+
+
 class ImageSource:
     """把磁盘上的图片伪装成"视频源"，接口与 ``cv2.VideoCapture`` 对齐。
 
@@ -469,7 +505,7 @@ class ImageSource:
             self.message = "没有可用的图片路径"
             return False
 
-        image = cv2.imread(target, cv2.IMREAD_COLOR)
+        image = read_image(target)
         if image is None or image.size == 0:
             self.message = "读不到图片：%s" % target
             return False
@@ -664,7 +700,7 @@ def step_info_overlay(frame: np.ndarray, state: FrameState) -> np.ndarray:
     if not state.show_overlay:
         return frame
     lines = [
-        "capture %dx%d" % state.raw_size,
+        "working %dx%d" % state.raw_size,
         "display %dx%d" % state.display_size,
         "fps %.1f" % state.fps,
         "frame %d" % state.index,
@@ -702,7 +738,7 @@ def step_info_overlay(frame: np.ndarray, state: FrameState) -> np.ndarray:
                     scale, color, thickness, cv2.LINE_AA)
 
     # 底部按键提示（整宽，单独一条，和上面的面板不冲突）
-    hint = "q quit | space pause | 1-6 view | d overlay | m mirror | r ROI | f fullscreen | l plugins"
+    hint = "q quit | space pause | 1-7 view | b board | d overlay | m mirror | r ROI | f fullscreen"
     cv2.putText(frame, hint, (12, height - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (0, 0, 0), 4, cv2.LINE_AA)
     cv2.putText(frame, hint, (12, height - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
@@ -934,8 +970,16 @@ def _handle_key(key: int, state: FrameState, registry: PluginRegistry) -> Option
     elif key == ord("r"):
         # 控制**真正生效**的 ROI 限制（实现在 plugins.py 里），
         # 而不是那个"只画不裁"的示例框。按一下就能对比限制/不限制的效果。
-        state.flags["roi_enabled"] = not state.flags.get("roi_enabled", True)
+        module = sys.modules.get("plugins")
+        active = module.roi_enabled_now(state) if module is not None else bool(
+            state.flags.get("roi_enabled", True))
+        state.flags["roi_enabled"] = not active
+        state.flags["manual_roi"] = state.flags["roi_enabled"]
         print("[main] ROI 限制：%s" % ("开" if state.flags["roi_enabled"] else "关"))
+    elif key == ord("b"):
+        default = getattr(sys.modules.get("plugins"), "BOARD_ROI_ENABLED", True)
+        state.flags["board_roi_enabled"] = not state.flags.get("board_roi_enabled", default)
+        print("[main] 自动背景板裁剪：%s" % ("开" if state.flags["board_roi_enabled"] else "关"))
     elif key == ord("l"):
         print("[main] 插件顺序：%s" % " -> ".join(registry.names()))
         print("[main] 已启用：%s" % ", ".join(registry.enabled_names()))
@@ -964,13 +1008,14 @@ def main() -> int:
     add_display_plugins(registry)
 
     # 2.6) ★★ 命令行覆盖输入源 —— 方便**快速切换，不用改文件、不用重开编辑器** ★★
-    #        python main.py              用本文件里 SOURCE 的设定（默认 video）
-    #        python main.py image        强制照片流（28 张，n/p 翻页）
+    #        python main.py              用本文件里 SOURCE 的设定（默认 image）
+    #        python main.py image        强制照片流（按当前目录枚举，n/p 翻页）
     #        python main.py video        强制视频流（用 VIDEO_FILE）
     #        python main.py video 2      直接用第 2 个视频素材（gesture_video_2.mp4）
     #        python main.py camera       摄像头
-    #      ★ 素材批次的切换（第 2 个参数给 old / camera）：
-    #        python main.py image camera 第四批：FPGA 摄像头实拍 40 张（默认）
+    #      ★ 素材批次：new / camera / old / nonstd / test（test 仅显式查看，不读答案）
+    #        python main.py              data/new 开发素材（默认）
+    #        python main.py image camera 历史 FPGA 标准素材
     #        python main.py image old    前三批：gesture_*.jpg + shou1/2，共 30 张
     #      ⚠️ 需要在函数里改全局，所以这里用 global 声明。
     global SOURCE, VIDEO_FILE, DATA_DIR, GESTURE_SAMPLES, IMAGE_FILES
@@ -997,17 +1042,25 @@ def main() -> int:
                     print("[main] 找不到视频素材 %r（试过 %s）" % (pick, cand))
                     return 1
         elif SOURCE == "image" and arg2:
-            if arg2 in ("camera", "cam", "new"):
+            if arg2 in ("camera", "cam"):
                 DATA_DIR = "data/" + CAMERA_SHOT_DIR
-                GESTURE_SAMPLES = CAMERA_SAMPLES
-                IMAGE_FILES = [n for _l, _d, ns in GESTURE_SAMPLES for n in ns]
+                GESTURE_SAMPLES = ()
+                IMAGE_FILES = image_filenames(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), DATA_DIR))
             elif arg2 in ("old", "legacy", "phone"):
-                DATA_DIR = "data"
+                DATA_DIR = "data/old"
                 GESTURE_SAMPLES = _OLD_GESTURE_SAMPLES
                 IMAGE_FILES = ([n for _l, _d, ns in GESTURE_SAMPLES for n in ns]
                                + OLD_EXTRA_FILES)
+            elif arg2 in ("new", "nonstd", "test"):
+                DATA_DIR = "data/不标准" if arg2 == "nonstd" else "data/" + arg2
+                GESTURE_SAMPLES = ()
+                IMAGE_FILES = image_filenames(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), DATA_DIR))
+                if arg2 == "test":
+                    print("[main] 显式浏览留出测试集；不读取答案，请勿据此调参。")
             else:
-                print("[main] 无法识别的素材批次 %r；可用：camera（默认）/ old" % arg2)
+                print("[main] 无法识别的素材批次 %r；可用：new（默认）/ test / camera / old / nonstd" % arg2)
                 return 1
     # 拿到 plugins 模块的引用（自动转正要用它的 AUTO_ROTATE / auto_rotate_frame）
     plugins_module = None
@@ -1017,28 +1070,15 @@ def main() -> int:
         plugins_module = None
 
     _kind = SOURCE.strip().lower()
-    # 3.5) ★ 素材批次和 ROI 是配对的，自动切一下，免得手动忘了改：
-    #        · 新素材（FPGA 摄像头，1280x720，**手占比很大**）-> ROI 关掉 ✓
-    #        · 老三批（手机拍的，手占比小）-> ROI 必须打开 ✓
-    #          实测老三批关掉 ROI 会从 24/28 掉到 13/28 ✗
-    #      （运行时按 r 仍可手动覆盖）
-    try:
-        import plugins as _plugins
-        _source_data_dir = VIDEO_DATA_DIR if _kind == "video" else DATA_DIR
-        _want_roi = not (str(_source_data_dir).endswith(CAMERA_SHOT_DIR))
-        if bool(_plugins.ROI_ENABLED) != bool(_want_roi):
-            _plugins.ROI_ENABLED = _want_roi
-            print("[main] 按素材批次自动把 ROI_ENABLED 设成 %s"
-                  "（新素材手大 -> 关；老三批手小 -> 开）" % _want_roi)
-    except Exception as _e:
-        print("[main] （ROI 自动切换跳过：%s）" % _e)
+    # Processing is selected from image evidence, never the data-folder name.
+    # Uncertain board detection uses the same legacy ROI fallback for every source.
 
     print("[main] 输入源 = %s%s   素材目录 = %s（%d 张）"
           % (SOURCE, ("   视频 = %s" % VIDEO_FILE) if _kind == "video" else "",
              VIDEO_DATA_DIR if _kind == "video" else DATA_DIR,
              len(IMAGE_FILES) if _kind == "image" else 0))
     print("[main] 换输入源/素材不用改文件："
-          "python main.py image [camera|old] | video [序号] | camera")
+          "python main.py image [new|camera|old|nonstd|test] | video [序号] | camera")
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     # ★ 素材统一放在 DATA_DIR 子目录里（见文件开头的配置）。
@@ -1099,6 +1139,7 @@ def main() -> int:
 
     # 4) 建立这一轮运行共享的状态对象（帧号、FPS、裁切区、各种开关都在里面）
     state = FrameState(plugins=registry.names())
+    state.flags["still_image"] = is_image
     state.flags["roi"] = True              # 内置 ROI 示例框默认开启
     # 图片模式默认不做镜像：磁盘上的照片本身就是真实方向，再翻一次会左右颠倒，
     # 调试坐标时容易看错。摄像头模式保留"照镜子"的习惯。
@@ -1119,7 +1160,7 @@ def main() -> int:
     failures = 0                           # 连续读帧失败计数
     last_displayed: Optional[np.ndarray] = None    # 最近一帧"处理完、还没做显示适配"的画面
     refresh_requested = False              # 暂停时按 n/p/R 也要强制刷新一帧
-    print("[main] 按键：q 退出，空格暂停，1~6 切换显示模式，d 叠加，m 镜像，r ROI限制，f 全屏，l 列出插件"
+    print("[main] 按键：q 退出，空格暂停，1~7 切换显示模式，b 自动裁板，d 叠加，m 镜像，r ROI限制，f 全屏，l 列出插件"
           + ("，n/p 换图，R 重载" if image_source is not None else ""))
 
     try:
@@ -1184,8 +1225,11 @@ def main() -> int:
                 #   ★ 解法不是把每个判据都改成旋转无关（试过，反而更差 ✗），
                 #     而是**先判断手朝哪边、把画面转正**，再走原来那条流水线 ✓
                 #   判断不出来时*不转*（返回 0），保持原行为 ✓
-                if plugins_module is not None and getattr(plugins_module, "AUTO_ROTATE", False):
-                    raw, _rot_angle = plugins_module.auto_rotate_frame(raw)
+                state.flags["input_frame"] = raw
+                if plugins_module is not None:
+                    raw, preprocessing = plugins_module.prepare_hand_frame(
+                        raw, board_enabled=state.flags.get("board_roi_enabled"))
+                    state.flags["preprocess"] = preprocessing
 
                 # 5.3 把本帧信息写进共享状态，插件通过 state 读取原图尺寸和裁切区
                 state.raw_frame = raw
@@ -1238,6 +1282,11 @@ def main() -> int:
                     image_source.step(-1)
                 else:
                     image_source.reload()
+                if plugins_module is not None:
+                    plugins_module.reset_auto_rotate()
+                    plugins_module.reset_stability()
+                    plugins_module.set_roi_anchor(None)
+                    plugins_module.clear_roi_cache()
                 print("[image] %s%s" % (image_source.message,
                                         "  [暂停中，已强制刷新一帧]" if state.paused else ""))
                 refresh_requested = True      # ★ 暂停时也要立刻把新图显示出来
@@ -1246,6 +1295,9 @@ def main() -> int:
             # 5.9 _handle_key：把按键翻译成开关动作；返回 "quit"/"fullscreen" 时需额外处理
             #     空格键会翻转 state.paused，下一轮循环的 5.0 就会真的停下处理。
             action = _handle_key(key, state, registry)
+            if key in (ord("b"), ord("r"), ord("m"), ord("d")) or any(
+                    key == mode[0] for mode in VIEW_MODES):
+                refresh_requested = True
             if action == "quit":
                 return 0
             if action == "fullscreen":
