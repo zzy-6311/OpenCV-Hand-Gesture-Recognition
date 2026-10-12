@@ -19,7 +19,11 @@ import numpy as np
 @dataclass(frozen=True)
 class GeometryConfig:
     root_y_r: float = -0.7
-    scan_rows_r: tuple = (-0.8, -0.7, -0.6)
+    # Measure width across the palm body, behind its center. Distal rows can
+    # include splayed finger branches and shift every normalized finger root.
+    # The four-finger projection line remains root_y_r; it serves a different
+    # purpose from these three transverse width measurements.
+    scan_rows_r: tuple = (0.0, 0.1, 0.2)
     scan_limit_r: float = 3.5
     scan_step_r: float = 0.025
     contour_limit_r: float = 3.0
@@ -104,6 +108,14 @@ def _measure_tip(contour, tip, center, up, radius, config):
     mid = (sides[0] + sides[1]) * 0.5
     widths = np.linalg.norm(sides[0] - sides[1], axis=1) / radius
     width = float(np.median(widths[(steps >= config.width_start_r) & (steps <= config.width_end_r)]))
+    # The fixed local shaft window also distinguishes a rounded slender
+    # finger from a progressively widening needle/shadow. Do not truncate
+    # this window at an early base event: that would hide the widening.
+    shaft_widths = widths[(steps >= config.axis_start_r - 1e-9) &
+                         (steps <= config.axis_end_r + 1e-9)]
+    shaft_width_ratio = (float(shaft_widths.max() / shaft_widths.min())
+                         if len(shaft_widths) >= 2 and np.isfinite(shaft_widths).all()
+                         and shaft_widths.min() > 0 else float("inf"))
     base_candidates = np.flatnonzero((steps >= config.width_end_r) &
                                     (widths > config.base_width_factor * width))
     base_index = int(base_candidates[0]) if len(base_candidates) else len(steps)-1
@@ -157,6 +169,7 @@ def _measure_tip(contour, tip, center, up, radius, config):
             "tip_local": tip_local.tolist(), "axis_local": axis_local.tolist(),
             "axis_origin": axis_origin.tolist(), "axis_origin_local": origin_local.tolist(),
             "root_x_r": root_x, "width_r": width, "length_r": length,
+            "shaft_width_ratio": shaft_width_ratio,
             "axis_fit_samples": int(len(sample_steps)), "axis_fit_residual_r": residual_r,
             "axis_fit_span_r": float(np.ptp(sample_steps)) if len(sample_steps) else 0.0,
             "base_detected": bool(len(base_candidates)),
@@ -293,35 +306,43 @@ def curvature_caps(contour, center, up, radius, config=DEFAULT_CONFIG, minimum_t
     return caps
 
 
-def refine_with_curvature_caps(measured, contour, center, up, radius,
-                               config=DEFAULT_CONFIG):
-    """Recover knuckles on sloped palm edges using signed contour curvature.
-
-    This bounded contour pass runs only when radial caps did not complete the
-    hand. It reuses extension bits and needs no additional distance transform.
-    """
-    if measured is None or measured.get("topology_used"):
-        return measured
-    others = [f for f in measured["features"] if f["slot"] != 0]
-    if not 0 < len(others) < 4:
-        return measured
-    index = next((f for f in others if f["slot"] == 1), None)
+def _curvature_supports(measured, caps, radius, config, *, independent=False):
+    """Collect closed positions without modifying the shared raw cap measurements."""
+    others = [feature for feature in measured["features"] if feature["slot"] != 0]
+    index = next((feature for feature in others if feature["slot"] == 1), None)
+    min_width = min(feature["width_r"] for feature in others)
     supports = []
-    for feature in curvature_caps(contour, center, up, radius, config):
+    for cap in caps:
+        feature = dict(cap)
         x, y = feature["tip_local"]
         if y >= 0 or x > config.thumb_slope * -y:
             continue
-        # A curled finger can be a broad knuckle or a compact short cap.
-        # The latter must still be at least as wide as this frame's thinnest
-        # observed finger. Neither case changes a detected long finger's bit.
         broad = (feature["width_r"] > config.curled_width_r and
                  feature["aspect"] < config.curled_aspect_max)
-        short = (feature["length_r"] < feature["width_r"] and
-                 feature["width_r"] >= min(f["width_r"] for f in others))
-        if not (broad or short):
+        compact = (feature["aspect"] < config.curled_aspect_max and
+                   feature["width_r"] >= min_width)
+        if not (broad or compact):
             continue
-        if (index is not None and x > index["tip_local"][0] and
-                (feature["root_x_r"] is None or feature["root_x_r"] > index["root_x_r"])):
+        if independent:
+            if (feature.get("cap_support_chord_r") is None or
+                    feature.get("cap_support_depth_r") is None):
+                continue
+            # A very short convex arc can sit on a much wider palm/shaft edge.
+            # Require shoulders to span at least half the measured local width.
+            if feature["cap_support_chord_r"] < 0.5 * feature["width_r"]:
+                continue
+            # On the thumb side, a folded digit must project past the distal
+            # tangent to the inscribed palm circle. A lateral palm cap cannot
+            # supply the missing index position merely because its x is large.
+            if x > 0 and y >= -1.0:
+                continue
+            # The independent short-branch test belongs to thumb recovery,
+            # not to closed-finger occupancy.
+            if (x > 0 and feature["length_r"] > feature["width_r"] and
+                    feature["cap_support_depth_r"] > feature["width_r"]):
+                continue
+        elif (index is not None and x > 0 and x > index["tip_local"][0] and
+              (feature["root_x_r"] is None or feature["root_x_r"] > index["root_x_r"])):
             continue
         if shares_extended_branch(feature, others):
             continue
@@ -333,16 +354,45 @@ def refine_with_curvature_caps(measured, contour, center, up, radius,
     chosen = []
     for feature in sorted(supports, key=lambda item: -item["curvature_turn"]):
         if any(np.linalg.norm(np.asarray(feature["point"]) - other["point"]) <
-               0.5 * max(feature["width_r"], other["width_r"]) * radius for other in chosen):
+               0.5 * max(feature["width_r"], other["width_r"]) * radius
+               for other in chosen):
             continue
         chosen.append(feature)
-    measured["curvature_support_candidates"] = chosen
-    if len(others) + len(chosen) != 4:
+    return chosen
+
+
+def _refine_with_curvature_caps_base(measured, contour, center, up, radius,
+                               config=DEFAULT_CONFIG, *, caps=None):
+    """Complete four contour positions, then fall back to roots if ambiguous.
+
+    An already complete position set is preserved. If ordinary caps cannot
+    complete four positions, require independent shoulder support and the
+    distal palm geometry instead of trusting the preliminary index identity.
+    Competing or insufficient positions still leave root assignment intact.
+    Both passes reuse the same contour measurements; no image labels enter.
+    """
+    if measured is None or measured.get("topology_used"):
         return measured
+    others = [feature for feature in measured["features"] if feature["slot"] != 0]
+    if not 0 < len(others) < 4:
+        return measured
+    if caps is None:
+        caps = curvature_caps(contour, center, up, radius, config)
+    chosen = _curvature_supports(measured, caps, radius, config)
+    measured["curvature_support_candidates"] = chosen
+    method = "complete_digit_topology_curvature"
+    if len(others) + len(chosen) != 4:
+        independent = _curvature_supports(measured, caps, radius, config, independent=True)
+        measured["independent_support_candidates"] = independent
+        if len(others) + len(independent) != 4:
+            return measured
+        chosen = independent
+        method = "complete_digit_topology_supported_caps"
+        measured["topology_support_reason"] = "ordinary_positions_incomplete_or_competing"
     for feature in chosen:
         feature.update(extended=False, extension_rejection_reason="curvature_closed_support",
                        tip_index=None, root_q10=None, root_point=None, closed_support=True)
-    return _complete_digit_topology(measured, chosen, "complete_digit_topology_curvature")
+    return _complete_digit_topology(measured, chosen, method)
 
 
 def _complete_digit_topology(measured, supports, method="complete_digit_topology"):
@@ -410,6 +460,29 @@ def refine_with_closed_caps(measured, contour, palm_center, up, radius,
     return _complete_digit_topology(measured, supports)
 
 
+def _is_lateral_thumb_branch(feature, center, up, radius, config):
+    """Recognize an upright thumb from its observed low, lateral attachment.
+
+    Angle alone misses a thumb held close to the index direction. Require a
+    real extended branch with a detected base below the four-finger root line
+    and on the lateral palm. A tip beyond one palm diameter is excluded: long
+    fingers can also produce a low apparent base. All distances use the palm
+    radius, and the measurements already exist; no extra image scan is needed.
+    """
+    if (not feature.get("extended") or not feature.get("has_branch_extent") or
+            not feature.get("base_detected")):
+        return False
+    x, y = feature["tip_local"]
+    if (not np.isfinite([x, y]).all() or not -2.0 < y < 0 or
+            x <= config.five_candidate_thumb_slope * -y):
+        return False
+    right = np.array([-up[1], up[0]])
+    delta = np.asarray(feature["base_point"], dtype=float) - center
+    base_x, base_y = float(delta @ right / radius), float(-delta @ up / radius)
+    return bool(np.isfinite([base_x, base_y]).all() and
+                base_y > config.root_y_r and base_x > abs(base_y))
+
+
 def recognize_fingers(mask, contour, palm_center, up, radius, tips, config=DEFAULT_CONFIG,
                       *, closed_candidates=None):
     """Return (measurement, failure_reason); failure leaves fallback to caller."""
@@ -446,7 +519,8 @@ def recognize_fingers(mask, contour, palm_center, up, radius, tips, config=DEFAU
     if first is not None:
         x, y = first["tip_local"]
         if y < 0 and (x > config.thumb_slope * -y or
-                      (assignable_count == 5 and x > config.five_candidate_thumb_slope * -y)):
+                      (assignable_count == 5 and x > config.five_candidate_thumb_slope * -y) or
+                      _is_lateral_thumb_branch(first, center, up, radius, config)):
             thumb = first
     retained = []
     discarded = []
@@ -499,5 +573,182 @@ def recognize_fingers(mask, contour, palm_center, up, radius, tips, config=DEFAU
     if closed_candidates is not None:
         measured = refine_with_closed_caps(measured, contour, center, up, radius,
                                           closed_candidates, config)
-        measured = refine_with_curvature_caps(measured, contour, center, up, radius, config)
+        non_thumb_count = sum(feature["slot"] != 0 for feature in measured["features"])
+        need_caps = ((0 < non_thumb_count < 4 and not measured.get("topology_used")) or
+                     (non_thumb_count == 4 and not measured["states"][0]))
+        caps = curvature_caps(contour, center, up, radius, config) if need_caps else []
+        measured = refine_with_curvature_caps(measured, contour, center, up, radius, config,
+                                             caps=caps)
+        measured = refine_with_outer_thumb(measured, contour, center, up, radius, config,
+                                          caps=caps)
+        measured = refine_thumb_from_five_positions(measured, config)
     return measured, None
+
+
+def refine_with_outer_thumb(measured, contour, center, up, radius,
+                            config=DEFAULT_CONFIG, *, caps=None):
+    """Recover an independent short outer branch after four fingers are accounted for.
+
+    Requiring all four non-thumb contour positions avoids using absent fingers
+    as evidence for a thumb. The candidate's own convex-arc depth must exceed
+    its shaft width; this rejects shallow palm roughness in the current tests.
+    This contour-only reference remains a hypothesis for a visible branch,
+    not recovery of an occluded anatomical thumb.
+    """
+    if measured is None or measured["states"][0]:
+        return measured
+    observed = measured["features"]
+    if sorted(feature["slot"] for feature in observed) != [1, 2, 3, 4]:
+        return measured
+    index = next(feature for feature in observed if feature["slot"] == 1)
+    candidates = []
+    if caps is None:
+        caps = curvature_caps(contour, center, up, radius, config)
+    for candidate in caps:
+        cap = dict(candidate)
+        x, y = cap["tip_local"]
+        if x <= max(0, index["tip_local"][0]):
+            continue
+        if cap.get("cap_support_depth_r") is None:
+            continue
+        if cap["length_r"] <= cap["width_r"] or cap["cap_support_depth_r"] <= cap["width_r"]:
+            continue
+        if (cap["root_x_r"] is None or index["root_x_r"] is None or
+                cap["root_x_r"] <= index["root_x_r"]):
+            continue
+        if shares_extended_branch(cap, observed):
+            continue
+        if any(np.linalg.norm(np.asarray(cap["point"]) - feature["point"]) <
+               0.5 * (cap["width_r"] + feature["width_r"]) * radius
+               for feature in observed):
+            continue
+        candidates.append(cap)
+    if len(candidates) != 1:
+        return measured
+    cap = candidates[0]
+    cap.update(slot=0, extended=True, extension_rejection_reason=None,
+               tip_index=None, root_q10=None, root_point=None, thumb_recovered=True)
+    measured["states"][0] = True
+    measured["features"].append(cap)
+    measured["thumb_recovered"] = "four_slots_and_outer_branch"
+    return measured
+
+
+def refine_with_curvature_caps(measured, contour, center, up, radius, config=DEFAULT_CONFIG, *, caps=None):
+    if measured is None:
+        return measured
+    if measured.get("topology_used"):
+        return measured
+    observed = [dict(feature) for feature in measured["features"] if feature["slot"] != 0]
+    thumbs = [dict(feature) for feature in measured["features"] if feature["slot"] == 0]
+    if not 0 < len(observed) < 4:
+        return measured
+    raw_caps = caps if caps is not None else curvature_caps(contour, center, up, radius, config)
+    baseline = dict(measured)
+    baseline["features"] = [dict(feature) for feature in measured["features"]]
+    baseline = _refine_with_curvature_caps_base(baseline, contour, center, up, radius, config, caps=raw_caps)
+    independent = _curvature_supports(measured, raw_caps, radius, config, independent=True)
+    if baseline.get("topology_used"):
+        # The old ordinary pass can count a tiny convex arc on the palm edge.
+        # Replace it only if the existing stricter shoulder test independently
+        # supplies a complete set; otherwise preserve the existing decision.
+        ordinary = baseline.get("curvature_support_candidates", [])
+        weak = any(cap.get("cap_support_chord_r", 0) < .5 * cap["width_r"] for cap in ordinary)
+        if (baseline.get("method") == "complete_digit_topology_curvature" and weak and
+                len(observed) + len(independent) == 4):
+            supports = []
+            for cap in independent:
+                cap = dict(cap)
+                cap.update(extended=False, extension_rejection_reason="independent_shoulder_support",
+                           tip_index=None, root_q10=None, root_point=None, closed_support=True)
+                supports.append(cap)
+            measured["independent_support_candidates"] = supports
+            measured["topology_support_reason"] = "ordinary_cap_lacks_independent_shoulders"
+            return _complete_digit_topology(measured, supports,
+                         method="complete_digit_topology_curvature")
+        return baseline
+    if not independent:
+        return baseline
+    lo, hi = measured["palm_bounds_r"]
+    supported = []
+    for feature in independent:
+        root = feature["root_x_r"]
+        # A closed-cap shaft must reach the observed palm cross-section.
+        # Unlike fingertip polar order, this is comparable to extended roots.
+        if root is None or not np.isfinite(root) or not lo <= root <= hi:
+            continue
+        feature = dict(feature)
+        feature.update(extended=False, extension_rejection_reason="independent_closed_root_support",
+                       tip_index=None, root_q10=int(np.floor((root-lo)/(hi-lo)*Q10 + .5)),
+                       root_point=None, closed_support=True)
+        supported.append(feature)
+    measured["joint_closed_candidates"] = supported
+    if len(observed) + len(supported) > 4:
+        measured["joint_rejection"] = "competing_observed_positions"
+        return baseline
+    # Incomplete closed caps constrain identity only when they bracket the
+    # observed fingers. One-sided caps alone cannot anchor both slot ends.
+    angles = lambda fs: [float(np.arctan2(f["tip_local"][0], -f["tip_local"][1])) for f in fs]
+    observed_angles, closed_angles = angles(observed), angles(supported)
+    if (len(supported) < 2 or min(closed_angles) >= min(observed_angles) or
+            max(closed_angles) <= max(observed_angles)):
+        return baseline
+    combined = sorted(observed + supported, key=lambda item: -item["root_q10"])
+    slots, ranked, margin = assign_slots_q10([feature["root_q10"] for feature in combined],
+                                                       config.slot_positions_q10)
+    states = [bool(thumbs), False, False, False, False]
+    for slot, feature in zip(slots, combined):
+        feature["slot"] = slot
+        states[slot] = bool(feature["extended"])
+    measured["initial_root_assignment"] = {key: measured.get(key) for key in
+                                           ("candidates", "score_margin_q20", "total_q20")}
+    measured.update(features=thumbs + combined, states=states, candidates=ranked,
+                    score_margin_q20=margin, total_q20=ranked[0]["cost_q20"],
+                    method="root_geometry_q10", topology_used=False,
+                    identity_refinement="bracketed_closed_root_support")
+    return measured
+
+
+
+def refine_thumb_from_five_positions(measured, config=DEFAULT_CONFIG):
+    """Recover a steep outer thumb only with five independent contour positions.
+
+    The independent caps must come from _curvature_supports(...,
+    independent=True). This helper reuses those measurements; it performs no
+    extra contour scan. Missing/competing evidence leaves measured unchanged.
+    On success, four non-thumb positions are ordered by the existing topology
+    completion. Five observed positions remain a silhouette-based hypothesis,
+    not a guarantee against segmentation artifacts or anatomical overlap.
+    """
+    if measured is None or measured["states"][0] or measured.get("topology_used"):
+        return measured
+    observed = measured["features"]
+    supports = measured.get("independent_support_candidates") or ()
+    if not observed or not supports or len(observed) + len(supports) != 5:
+        return measured
+
+    first = max(observed, key=lambda f: f["tip_local"][0] /
+                max(1e-6, -f["tip_local"][1]))
+    x, y = first["tip_local"]
+    if (y >= 0 or x <= config.five_candidate_thumb_slope * -y or
+            not first["extended"] or not first["has_branch_extent"]):
+        return measured
+    for cap in supports:
+        cap_x, cap_y = cap["tip_local"]
+        # Lateral position and angular order must both place the thumb outside
+        # every closed digit. Cross multiplication reuses the topology order.
+        if (cap_y >= 0 or x <= cap_x or
+                x * -cap_y <= cap_x * -y):
+            return measured
+
+    # All admission checks passed. Copy only the small cap dictionaries so
+    # their raw diagnostic measurements remain intact; the output is updated
+    # in place like the other refinement helpers.
+    closed = [dict(cap) for cap in supports]
+    for cap in closed:
+        cap.update(extended=False, extension_rejection_reason="curvature_closed_support",
+                   tip_index=None, root_q10=None, root_point=None, closed_support=True)
+    first["slot"] = 0
+    result = _complete_digit_topology(measured, closed, "five_observed_positions_thumb")
+    result["thumb_recovered"] = "five_observed_positions"
+    return result

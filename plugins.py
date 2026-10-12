@@ -1426,7 +1426,14 @@ def step_palm_reconstruct(frame: np.ndarray, state) -> np.ndarray:
 
     allowed = cv2.inRange(cr_plane, cr_lo, cr_hi)
     cv2.bitwise_and(allowed, cv2.inRange(cb_plane, cb_lo, cb_hi), dst=allowed)
-    cv2.bitwise_and(allowed, cv2.inRange(y_plane, y_lo, 255), dst=allowed)
+    reconstruction_y = cv2.inRange(y_plane, y_lo, 255)
+    # On a verified board, thresholding already admitted observed dark skin.
+    # Preserve it here while retaining chroma, input-mask and seed-connectivity
+    # constraints. Outside the board, the original luminance gate still holds.
+    board_valid = _board_valid_for_threshold(mask.shape, state)
+    if board_valid is not None:
+        cv2.bitwise_or(reconstruction_y, board_valid, dst=reconstruction_y)
+    cv2.bitwise_and(allowed, reconstruction_y, dst=allowed)
     cv2.bitwise_and(allowed, mask, dst=allowed)
 
     # ---- 5) 重建 = 允许区里【与种子相连】的连通域 ----
@@ -1904,7 +1911,17 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
         # 针状毛刺：夹角和厚度同时极端小 -> 不是指尖（真指尖是圆帽，两者都不会这么极端）
         if angle < RECOG_TIP_MIN_ANGLE_DEG and \
                 thickness_ratio < RECOG_TIP_MIN_THICKNESS:
-            continue
+            # The radial sample can cross a finger gap. Rescue only a long
+            # local shaft with opposing sides that do not markedly taper.
+            shaft = FG._measure_tip(contour, points[index],
+                                    np.asarray(palm_center, dtype=float),
+                                    np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG)
+            if not (shaft["width_r"] >= 2.0 * RECOG_TIP_MIN_THICKNESS and
+                    shaft["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r and
+                    shaft["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max and
+                    shaft["shaft_width_ratio"] <=
+                    FG.DEFAULT_CONFIG.base_width_factor):
+                continue
         # ★主力判据：凸出长度。真手指是细长凸出，指节凸起是圆钝鼓包。
         #   这一条同时管住了两头 —— 既排掉拳头的指节凸起，又保住很短的小指。
         protrusion = _protrusion_length(thickness, points[index], palm_center, radius)
@@ -1937,11 +1954,38 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
         merged.sort(key=lambda item: float(np.arctan2(item["local"][1], item["local"][0])))
         return merged
 
+    strong = merge([item for item in candidates if not item["closed_support"]])
     if closed_candidates is not None:
-        # Shared distance transform and cap measurements; no second image pass.
-        closed_candidates.extend(item for item in merge(candidates)
-                                 if item["closed_support"])
-    return merge([item for item in candidates if not item["closed_support"]]), distances
+        caps = [item for item in merge(candidates) if item["closed_support"]]
+        promoted, remaining = [], []
+        for cap in caps:
+            # The mixed candidate merge can prefer a farther closed cap over
+            # a nearby strong tip. Keep the strong observation and avoid
+            # counting that same local contour cap again after promotion.
+            if any(float(np.linalg.norm(cap["point"] - tip["point"])) <
+                   RECOG_TIP_DEDUP * float(radius) for tip in strong):
+                continue
+            feature = FG._measure_tip(contour, np.asarray(cap["point"], dtype=float),
+                                      np.asarray(palm_center, dtype=float),
+                                      np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG)
+            # Radial reach can underestimate a spread little finger. Require
+            # a real narrow shaft spanning the full existing axis window;
+            # aspect alone would also accept a tiny, needle-like mask burr.
+            if (feature["extended"] and feature["has_branch_extent"] and
+                    feature["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r and
+                    feature["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max):
+                promoted.append(dict(cap, closed_support=False,
+                                     promotion="contour_shaft_extent"))
+            else:
+                remaining.append(cap)
+        if len(strong) + len(promoted) <= 5:
+            strong.extend(promoted)
+            strong.sort(key=lambda item: float(np.arctan2(item["local"][1], item["local"][0])))
+            closed_candidates.extend(remaining)
+        else:
+            # Conflicting evidence cannot introduce more anatomical fingers.
+            closed_candidates.extend(caps)
+    return strong, distances
 
 
 
@@ -3113,6 +3157,7 @@ COLOR_UNSETTLED = (0, 215, 255)   # ★ 手在动（过渡帧）时的提示色�
 #   · 实心点   = 沿射线**实测**延伸到哪里（伸开=绿，蜷起=灰）
 # 两者对不上 -> 就是那根手指判错的地方 ✓
 # 想关掉（画面太乱时）改成 False 即可。
+DISPLAY_DEBUG = False                 # h toggles drawing details only; never read by recognition.
 FINGER_DEBUG_DRAW = True
 FINGER_DEBUG_RAY_LEN_R = 3.6      # 射线画多长（× R）
 
@@ -3130,11 +3175,48 @@ def _draw_dashed_rect(img, p1, p2, color, dash=14, thickness=3) -> None:
         cv2.line(img, (x2, y), (x2, min(y + d, y2)), color, thickness)
 
 
-def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
-    """把识别结果画到给定底图上。"""
+def _draw_recognition_compact(base: np.ndarray, result: Optional[dict],
+                              show_summary: bool = True) -> np.ndarray:
+    """Only observed extended fingertip markers and the final finger result."""
+    if result is None:
+        if show_summary:
+            draw_text_lines(base, [("未检测到手", 26, (70, 100, 255))], (16, 14), panel=True)
+        return base
+    match = result.get("finger_match") or {}
+    if match.get("anchor") == "local_finger_axis":
+        for feature in match.get("features", []):
+            if not feature.get("extended"):
+                continue
+            slot = int(feature.get("slot", -1))
+            if not 0 <= slot < 5:
+                continue
+            point = tuple(int(round(v)) for v in feature["point"])
+            cv2.circle(base, point, 6, COLOR_FINGER_ON, -1, cv2.LINE_AA)
+            cv2.circle(base, point, 8, (255, 255, 255), 1, cv2.LINE_AA)
+            _put_text_outlined(base, FINGER_BOX_TAGS[slot],
+                               (point[0] + 10, point[1] - 9), .65, COLOR_FINGER_ON, 2)
+    else:
+        # Raw candidates do not necessarily have an anatomical assignment.
+        for tip in result.get("tips", []):
+            point = tuple(int(round(v)) for v in tip["point"])
+            cv2.circle(base, point, 6, COLOR_FINGER_ON, -1, cv2.LINE_AA)
+    if show_summary:
+        lines = [("手指：" + result.get("finger_text", "?"), 26, (0, 230, 255))]
+        if not result.get("settled", True):
+            lines.append(("过渡中，保持上次结果" if result.get("held") else "等待稳定", 18, COLOR_UNSETTLED))
+        draw_text_lines(base, lines, (16, 14), panel=True)
+    return base
+
+
+def _draw_recognition(base: np.ndarray, result: Optional[dict],
+                      show_summary: bool = True) -> np.ndarray:
+    """把识别结果画到给定底图上；详细几何由 h 键切换。"""
+    if not DISPLAY_DEBUG:
+        return _draw_recognition_compact(base, result, show_summary)
     height, width = base.shape[:2]
     if result is None:
-        _put_text_outlined(base, "no hand", (20, 40), 0.9, (0, 0, 255), 2)
+        if show_summary:
+            _put_text_outlined(base, "no hand", (20, 40), 0.9, (0, 0, 255), 2)
         return base
 
     palm_center = result["palm_center"]
@@ -3150,7 +3232,12 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
         cv2.drawContours(base, [hull], -1, (255, 255, 0), 1, cv2.LINE_AA)
 
     # 掌心 + 手掌尺度圆
-    cv2.circle(base, center_px, int(round(radius)), COLOR_PALM, 2)
+    ellipse = result.get("_display_palm_ellipse")
+    if ellipse is None:
+        cv2.circle(base, center_px, int(round(radius)), COLOR_PALM, 2)
+    else:
+        axes, angle = ellipse
+        cv2.ellipse(base, center_px, axes, angle, 0, 360, COLOR_PALM, 2)
     cv2.drawMarker(base, center_px, COLOR_PALM, cv2.MARKER_CROSS, 40, 3)
 
     # 掌轴（指向手指方向）和它的垂直方向
@@ -3158,7 +3245,7 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
     tip_up = (int(round(palm_center[0] + up[0] * axis_length)),
               int(round(palm_center[1] + up[1] * axis_length)))
     cv2.arrowedLine(base, center_px, tip_up, COLOR_WRIST, 2, tipLength=0.15)
-    right = np.array([-up[1], up[0]])
+    right = np.asarray(result.get("_display_right", [-up[1], up[0]]))
     tip_right = (int(round(palm_center[0] + right[0] * radius * 0.7)),
                  int(round(palm_center[1] + right[1] * radius * 0.7)))
     cv2.arrowedLine(base, center_px, tip_right, COLOR_WRIST, 2, tipLength=0.15)
@@ -3194,8 +3281,9 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
     #   预期圈和实测点对不上 -> 就是那根手指判错的地方 ✓
     #   ⚠️ 只在 FINGER_DEBUG_DRAW 打开时画，免得平时画面太乱
     geometry_match = result.get("finger_match") or {}
-    using_geometry = geometry_match.get("method") in (
-        "root_geometry_q10", "complete_digit_topology", "complete_digit_topology_curvature")
+    # Every geometry refinement carries this anchor, including supported
+    # closed caps and recovered thumbs. Draw their measured axes consistently.
+    using_geometry = geometry_match.get("anchor") == "local_finger_axis"
     if FINGER_DEBUG_DRAW and using_geometry:
         # Measured tip -> projected root, labeled by anatomical identity.
         # Do not display unfitted template rays as if they were observations.
@@ -3212,7 +3300,7 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
             _put_text_outlined(base, text, (tip_px[0] + 12, tip_px[1] - 12), .7, col, 2)
     elif FINGER_DEBUG_DRAW:
         up_v = np.asarray(up, dtype=np.float64).reshape(2)
-        right_v = np.array([-up_v[1], up_v[0]])
+        right_v = np.asarray(result.get("_display_right", [-up_v[1], up_v[0]]))
         ray_c = float(radius)
         ray_len = float(FINGER_DEBUG_RAY_LEN_R) * ray_c
         angles = result.get("finger_ray_angles") or []
@@ -3228,7 +3316,8 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
             n = float(np.linalg.norm(dirv))
             if n < 1e-9:
                 continue
-            dirv = dirv / n
+            if "_display_right" not in result:
+                dirv = dirv / n
             col = COLOR_FINGER_ON if (i < len(sts) and sts[i]) else COLOR_FINGER_OFF
             p_ray = (int(round(palm_center[0] + dirv[0] * ray_len)),
                      int(round(palm_center[1] + dirv[1] * ray_len)))
@@ -3290,7 +3379,7 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
     box = int(FINGER_BOX_SIZE)
     gap = int(FINGER_BOX_GAP)
     bx0 = int(HUD_MARGIN)
-    by0 = int(HUD_MARGIN)
+    by0 = int(HUD_MARGIN) if show_summary else max(180, int(HUD_MARGIN))
     # ★ 这一帧手稳不稳（由 stability_gate 写进结果里）
     #   settled=False 时，下面画的 states 其实是"上次稳定时的判定"（保持值），
     #   所以方块整体套一个黄虚线框 + 文字里说明，避免误以为它是本帧判的。
@@ -3326,7 +3415,8 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
         message = ("过渡中：保持上一次稳定的判定" if result.get("held")
                    else "等待稳定：当前为临时识别结果")
         hud_lines.append((message, 18, COLOR_UNSETTLED))
-    hud_lines.append(("手指: %s" % result.get("finger_text", "?"), 24, (0, 230, 255)))
+    if show_summary:
+        hud_lines.append(("手指: %s" % result.get("finger_text", "?"), 24, (0, 230, 255)))
     # 连续量也显示出来：调门槛时一眼看出余量够不够（单位是 R 的倍数）
     hud_lines.append((("局部长度 " if using_geometry else "延伸 ") + "  ".join("%.1f" % e for e in extensions),
                       16, (185, 185, 185)))
@@ -3334,7 +3424,7 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
                        "局部指轴定位身份，宽度与细长程度判断伸缩" if using_geometry
                        else "状态由模板匹配决定；延伸长度为辅助量"), 15, (150, 150, 150)))
     hud_lines.append((" ", 8, (0, 0, 0)))                                      # 空行分隔
-    hud_lines.append(("fingers %d    gaps %d" % (result["finger_count"], len(result["gaps"])),
+    hud_lines.append(("fingers %d    gaps %d" % (sum(bool(on) for on in result["finger_states"]), len(result["gaps"])),
                       18, COLOR_LABEL))
     hud_lines.append(("solidity %.2f    span %.0f deg"
                       % (result.get("solidity", 0.0), result.get("angle_span_deg", 0.0)),
@@ -3355,21 +3445,98 @@ def _draw_recognition(base: np.ndarray, result: Optional[dict]) -> np.ndarray:
 def step_recognize_on_mask(frame: np.ndarray, state) -> np.ndarray:
     """模式 5：把识别结果画在当前（掩膜）画面上。"""
     base = frame.copy()
-    return _draw_recognition(base, state.flags.get("recognize"))
+    return _draw_recognition(base, state.flags.get("recognize"),
+                             show_summary=not state.flags.get("still_image", False))
+
+
+def _transform_display_points(points, matrix):
+    """Map drawing coordinates without changing the recognizer's arrays."""
+    points = np.asarray(points, dtype=np.float64)
+    return points @ matrix[:2, :2].T + matrix[:2, 2]
+
+
+def _recognition_to_input_matrix(state, shape_hw):
+    """Invert crop, actual rotation, optional display crop/resize and mirror."""
+    preprocessing = state.flags.get("preprocess", {})
+    source = state.flags.get("input_frame")
+    prepared = getattr(state, "raw_frame", None)
+    if source is None or prepared is None or "input_to_prepared" not in preprocessing:
+        return None
+    input_to_prepared = np.asarray(preprocessing["input_to_prepared"], np.float64)
+    height, width = shape_hw
+    prepared_to_work = np.eye(3)
+    raw_source = USE_RAW_FRAME and prepared is not None
+    if not raw_source:
+        if tuple(shape_hw) != prepared.shape[:2]:
+            x, y, crop_w, crop_h = state.crop
+            sx, sy = width / float(crop_w), height / float(crop_h)
+            # cv2.resize maps pixel centers, not pixel corners.
+            prepared_to_work = np.array([
+                [sx, 0, sx * (0.5 - x) - 0.5],
+                [0, sy, sy * (0.5 - y) - 0.5], [0, 0, 1]], np.float64)
+        if getattr(state, "mirror", False):
+            flip_work = np.array([[-1, 0, width - 1], [0, 1, 0], [0, 0, 1]], np.float64)
+            prepared_to_work = flip_work @ prepared_to_work
+    matrix = np.linalg.inv(prepared_to_work @ input_to_prepared)
+    if getattr(state, "mirror", False):
+        flip_input = np.array([[-1, 0, source.shape[1] - 1], [0, 1, 0], [0, 0, 1]], np.float64)
+        matrix = flip_input @ matrix
+    return matrix
+
+
+def _transform_recognition_for_display(result, matrix):
+    """Copy only drawing geometry; finger decisions and processing masks stay intact."""
+    if result is None:
+        return None
+    out = dict(result)
+    point = lambda value: tuple(_transform_display_points(value, matrix))
+    linear = matrix[:2, :2]
+    scale = float(np.sqrt(abs(np.linalg.det(linear))))
+    out["palm_center"] = _transform_display_points(result["palm_center"], matrix)
+    out["wrist"] = None if result["wrist"] is None else point(result["wrist"])
+    up = np.asarray(result["up"], np.float64)
+    out["up"] = linear @ up / scale
+    out["_display_right"] = linear @ np.array([-up[1], up[0]]) / scale
+    out["palm_radius"] = result["palm_radius"] * scale
+    u, singular, _ = np.linalg.svd(linear)
+    if not np.isclose(singular[0], singular[1]):
+        axes = tuple(max(1, int(round(result["palm_radius"] * s))) for s in singular)
+        angle = float(np.degrees(np.arctan2(u[1, 0], u[0, 0])))
+        out["_display_palm_ellipse"] = (axes, angle)
+    for key in ("hull", "contour"):
+        if result.get(key) is not None:
+            out[key] = np.rint(_transform_display_points(result[key], matrix)).astype(np.int32)
+    for key, fields in (("tips", ("point",)), ("gaps", ("point",)),
+                        ("fingers", ("tip", "base"))):
+        out[key] = [dict(item, **{f: point(item[f]) for f in fields
+                                 if item.get(f) is not None}) for item in result.get(key, [])]
+    match = result.get("finger_match") or {}
+    if "features" in match:
+        fields = ("point", "base_point", "root_point", "axis_origin")
+        out["finger_match"] = dict(match, features=[
+            dict(item, **{f: point(item[f]) for f in fields if item.get(f) is not None})
+            for item in match["features"]])
+    return out
 
 
 def step_recognize_on_original(frame: np.ndarray, state) -> np.ndarray:
-    """模式 6：把识别结果画在**原图**上。
-
-    原图从 state.flags["segment_source_bgr"] 取（颜色阈值那一层存下来的），
-    **不能用 state.raw_frame** —— 镜像开着的时候 raw_frame 没被翻，
-    坐标会和掩膜错位，画出来的标注就偏了。
-    """
+    """模式 6：整幅输入保持原方向，只把识别几何逆映射回来绘制。"""
+    state.flags.pop("display_geometry_to_input", None)
     source = state.flags.get("segment_source_bgr")
     if source is None:
         source = state.raw_frame if getattr(state, "raw_frame", None) is not None else frame
+    matrix = _recognition_to_input_matrix(state, source.shape[:2])
+    if matrix is not None:
+        original = state.flags["input_frame"]
+        base = cv2.flip(original, 1) if getattr(state, "mirror", False) else original.copy()
+        state.flags["display_geometry_to_input"] = matrix
+        result = _transform_recognition_for_display(state.flags.get("recognize"), matrix)
+        return _draw_recognition(base, result,
+                                 show_summary=not state.flags.get("still_image", False))
+    # Keep standalone callers without preprocessing metadata compatible.
     base = source.copy()
-    return _draw_recognition(base, state.flags.get("recognize"))
+    return _draw_recognition(base, state.flags.get("recognize"),
+                             show_summary=not state.flags.get("still_image", False))
 
 
 # ===========================================================================
@@ -3382,6 +3549,23 @@ def step_roi_boundary(frame: np.ndarray, state) -> np.ndarray:
     所以「你看到的框」就是「真正生效的框」。用 r 键可以实时开关。
     """
     if state.flags.get("view_mode") == "背景板定位":
+        return frame
+    matrix = state.flags.get("display_geometry_to_input")
+    if state.flags.get("view_mode") == "识别(原图)" and matrix is not None:
+        # ROI belongs to the processing image. Do not invent a new ROI from
+        # the full display dimensions after mapping the hand back to the input.
+        source = state.flags.get("segment_source_bgr", state.raw_frame)
+        enabled = roi_enabled_now(state)
+        state.flags["roi_enabled"] = enabled
+        state.flags["roi_touched"] = []
+        if enabled and ROI_DRAW_BOUNDARY:
+            x0, y0, x1, y1 = roi_rect_pixels(source.shape[:2])
+            corners = np.array([[x0, y0], [x1 - 1, y0], [x1 - 1, y1 - 1], [x0, y1 - 1]])
+            polygon = np.rint(_transform_display_points(corners, matrix)).astype(np.int32)
+            cv2.polylines(frame, [polygon], True, COLOR_BOUNDARY, 2, cv2.LINE_AA)
+        if DISPLAY_DEBUG:
+            draw_text_lines(frame, [("整帧显示：裁板和转正仅用于内部识别", 18, COLOR_TEXT)],
+                            (12, max(24, frame.shape[0] - 60)), panel=True)
         return frame
     enabled = roi_enabled_now(state)
     state.flags["roi_enabled"] = enabled          # 回写，让 r 键有个确定的初始值
@@ -3491,7 +3675,7 @@ def step_roi_boundary(frame: np.ndarray, state) -> np.ndarray:
         if color_base is not None:
             text_lines.append(("base Cr=%.0f Cb=%.0f Y=%.0f" % color_base, 18, COLOR_TEXT))
 
-    if text_lines:
+    if text_lines and DISPLAY_DEBUG:
         line_h = 26
         block_h = line_h * len(text_lines) + 8
         if enabled:
@@ -3544,102 +3728,193 @@ def reset_auto_rotate() -> None:
     _ROTATE_STATE["locked"] = False
 
 
-def detect_hand_rotation(frame: np.ndarray, *, color_state=None,
-                         calibrate_background=False) -> float:
-    """★ 判断"要把画面转多少度，手才会变成手指朝上"。返回角度（度，正=逆时针）。
+def _rotation_edge_contact(blob):
+    """Return the strongest foreground/image-edge contact and its validity."""
+    height, width = blob.shape
+    lines = (blob[:, 0], blob[:, -1], blob[0], blob[-1])
+    counts = [int(np.count_nonzero(line)) for line in lines]
+    edge = max(range(4), key=lambda index: counts[index])
+    count = counts[edge]
+    valid = (int(AUTO_ROTATE_EDGE_MIN_PIXELS) <= count <=
+             float(AUTO_ROTATE_EDGE_MAX_FRAC) * max(height, width))
+    return edge, count, valid
 
-    判不出来时返回 0.0（= 不转，按原样走）✓
-    """
-    h, w = frame.shape[:2]
-    if h < 32 or w < 32:
+
+def _rotation_edge_arm(blob, edge):
+    """Centroid-to-contact direction; unchanged evidence from the old path."""
+    height, width = blob.shape
+    lines = (blob[:, 0], blob[:, -1], blob[0], blob[-1])
+    contact = np.flatnonzero(lines[edge])
+    ys, xs = np.nonzero(blob)
+    if not len(contact) or not len(xs):
+        return None
+    position = float(contact.mean())
+    target = ((0., position), (float(width - 1), position),
+              (position, 0.), (position, float(height - 1)))[edge]
+    return np.asarray(target) - np.array([float(xs.mean()), float(ys.mean())])
+
+
+def _rotation_arm_angle(direction):
+    if direction is None or not np.isfinite(direction).all():
         return 0.0
-    # The same physical image must use the same sampling scale at 0/90 degrees.
-    scale = min(1.0, float(AUTO_ROTATE_DOWNSCALE) / max(h, w))
-    small = cv2.resize(frame, (max(1, round(w * scale)), max(1, round(h * scale))),
-                       interpolation=cv2.INTER_AREA) if scale < 1.0 else frame
-    ycc = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
-    # Only a detected pale board establishes a neutral background reference.
-    # An unknown scene may contain patterned skin-coloured objects; its full
-    # image median must not shift the rotation threshold toward those objects.
-    # The caller opts in from this frame's board evidence, never a data group.
-    # Rotation inspects the complete supplied crop, before any centered ROI.
+    if float(np.linalg.norm(direction)) < 1e-6:
+        return 0.0
+    return -float(np.degrees(np.arctan2(direction[0], direction[1])))
+
+
+def _rotation_internal_arm(small, blob, *, known_board):
+    """Find a repaired board exit or a broad skin-to-dark-clothing boundary.
+
+    This only runs when the original contact test is inconclusive. Geometry
+    proposes a terminal boundary, but cannot by itself identify it as a cuff.
+    Ambiguous or absent clothing evidence returns None without inventing an
+    arm direction. Operations are confined to the existing small image.
+    """
+    contours, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    rough = np.zeros_like(blob)
+    cv2.drawContours(rough, contours, -1, 255, -1)
+    if not np.any(rough == 0):
+        return None
+    _, rough_radius, _, _ = cv2.minMaxLoc(cv2.distanceTransform(rough, cv2.DIST_L2, 5))
+    if not np.isfinite(rough_radius) or rough_radius < 2.0:
+        return None
+
+    # Remove a connected, thin board-edge stripe before checking the exit.
+    # This mask is used only to estimate orientation, never for recognition.
+    kernel_size = 2 * max(1, round(0.08 * rough_radius)) + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    clean = cv2.morphologyEx(blob, cv2.MORPH_OPEN, kernel)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(clean, 8)
+    if count <= 1:
+        return None
+    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    clean = np.uint8(labels == biggest) * 255
+    edge, _, valid = _rotation_edge_contact(clean)
+    if known_board and valid:
+        return _rotation_edge_arm(clean, edge)
+
+    contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    filled = np.zeros_like(clean)
+    cv2.drawContours(filled, [contour], -1, 255, -1)
+    if not np.any(filled == 0):
+        return None
+    distance = cv2.distanceTransform(filled, cv2.DIST_L2, 5)
+    _, radius, _, location = cv2.minMaxLoc(distance)
+    if not np.isfinite(radius) or radius < 2.0:
+        return None
+    # An elongated constant-width region can have many equal maxima. Its
+    # center must not depend on minMaxLoc's top-left traversal tie-break.
+    max_y, max_x = np.nonzero(distance == radius)
+    center = np.array([float(max_x.mean()), float(max_y.mean())])
+    ys, xs = np.nonzero(filled)
+    points = np.column_stack((xs, ys)).astype(np.float64)
+    centroid = points.mean(axis=0)
+    eigenvalues, eigenvectors = np.linalg.eigh(np.cov(points.T))
+    if (not np.isfinite(eigenvalues).all() or eigenvalues[-1] <= 0.0 or
+            np.isclose(eigenvalues[0], eigenvalues[-1], rtol=1e-6, atol=1e-9)):
+        return None
+    major = eigenvectors[:, -1]
+    polygon = cv2.approxPolyDP(contour, max(1.0, 0.05 * radius), True).reshape(-1, 2)
+    polygon = polygon.astype(np.float64)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape
+    segments = []
+
+    for first, second in zip(polygon, np.roll(polygon, -1, axis=0)):
+        edge_vector = second - first
+        length = float(np.linalg.norm(edge_vector))
+        if length < 1.0:
+            continue
+        midpoint = (first + second) * 0.5
+        normal = np.array([-edge_vector[1], edge_vector[0]]) / length
+        if float(normal @ (midpoint - centroid)) < 0.0:
+            normal = -normal
+        if abs(float(normal @ major)) < 0.5:
+            continue
+        offset = midpoint - center
+        reach = float(np.linalg.norm(offset))
+        if reach < radius or float(normal @ offset) / max(reach, 1e-9) < 0.5:
+            continue
+
+        # Both sides must be observed pixels. Clipping or negative indexing
+        # would manufacture contrast by sampling another side of the frame.
+        samples = first + np.linspace(0.15, 0.85, 9)[:, None] * edge_vector
+        inside = np.rint(samples - 0.2 * radius * normal).astype(np.int32)
+        outside = np.rint(samples + 0.2 * radius * normal).astype(np.int32)
+        if any(np.any(sample < 0) or np.any(sample[:, 0] >= width) or
+               np.any(sample[:, 1] >= height) for sample in (inside, outside)):
+            continue
+        if float(np.mean(filled[inside[:, 1], inside[:, 0]] > 0)) < 0.75:
+            continue
+        inner_values = gray[inside[:, 1], inside[:, 0]].astype(np.float64)
+        outer_values = gray[outside[:, 1], outside[:, 0]].astype(np.float64)
+        inner_level = float(np.median(inner_values))
+        outer_level = float(np.median(outer_values))
+        contrast = float(np.median(inner_values - outer_values))
+        if inner_level <= 0.0 or outer_level >= 0.5 * inner_level or contrast <= 0.0:
+            continue
+        pole = 1 if float(normal @ major) >= 0.0 else -1
+        segments.append((pole, midpoint, length, contrast))
+
+    targets = []
+    for pole in (-1, 1):
+        supported = [segment for segment in segments if segment[0] == pole]
+        support = sum(segment[2] for segment in supported)
+        if support < 0.65 * radius:
+            continue
+        weight = sum(length * contrast for _, _, length, contrast in supported)
+        if weight <= 0.0:
+            continue
+        target = sum(midpoint * length * contrast
+                     for _, midpoint, length, contrast in supported) / weight
+        targets.append(target)
+    # Two opposite broad dark boundaries do not identify which end is the arm.
+    if len(targets) != 1:
+        return None
+    return targets[0] - center
+
+
+def detect_hand_rotation(frame, *, color_state=None, calibrate_background=False):
+    """Estimate rotation from edge contact, or observed internal cuff evidence."""
+    height, width = frame.shape[:2]
+    if height < 32 or width < 32:
+        return 0.0
+    scale = min(1.0, float(AUTO_ROTATE_DOWNSCALE) / max(height, width))
+    small = (cv2.resize(frame, (max(1, round(width * scale)), max(1, round(height * scale))),
+                        interpolation=cv2.INTER_AREA) if scale < 1.0 else frame)
+    ycrcb = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
     if color_state is None:
         color_state = SimpleNamespace(flags={"manual_roi": False})
-    # Estimate colour from original samples: averaging pixels at a resized
-    # hand/board boundary mixes the two materials and changes its chroma.
-    calibration_ycrcb = (cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-                         if calibrate_background and small is not frame else ycc)
-    lower, upper = _skin_color_bounds(calibration_ycrcb, color_state,
-                                      calibrate=calibrate_background)
+    calibration = (cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+                   if calibrate_background and small is not frame else ycrcb)
+    lower, upper = _skin_color_bounds(calibration, color_state, calibrate=calibrate_background)
     slack = float(AUTO_ROTATE_COLOR_SLACK)
     lower = (lower[0], max(0, round(lower[1] - slack)), max(0, round(lower[2] - slack)))
     upper = (upper[0], min(255, round(upper[1] + slack)), min(255, round(upper[2] + slack)))
-    mask = cv2.inRange(ycc, lower, upper)
+    mask = cv2.inRange(ycrcb, lower, upper)
     if int(np.count_nonzero(mask)) < 64:
         return 0.0
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     if count <= 1:
         return 0.0
     biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    area = int(stats[biggest, cv2.CC_STAT_AREA])
-    if area < float(AUTO_ROTATE_MIN_AREA) * mask.size:
+    if int(stats[biggest, cv2.CC_STAT_AREA]) < float(AUTO_ROTATE_MIN_AREA) * mask.size:
         return 0.0
     blob = np.uint8(labels == biggest) * 255
-    ys, xs = np.nonzero(blob)
-
-    # ★★★ 判据：小臂一定被【照片的某一条边】截断 ★★★
-    #   所以只看"掩膜贴在哪条边上"，就知道小臂从哪边进来 ✓
-    #   ⚠️ 之前那 6 版都在"猜小臂方向"（PCA / 质心 / 走得远 / 宽度带 / 角宽度），
-    #      全是在面对结果调阈值 ✗ 这一版只看**掩膜和哪条边相连** —— 物理事实 ✓
-    bh, bw = blob.shape[:2]
-    edge_lines = {
-        "left":   blob[:, 0],
-        "right":  blob[:, bw - 1],
-        "top":    blob[0, :],
-        "bottom": blob[bh - 1, :],
-    }
-    best_edge, best_cnt, best_pos = None, 0, 0.0
-    for name, line in edge_lines.items():
-        idx = np.nonzero(line)[0]
-        if idx.size > best_cnt:
-            best_cnt = int(idx.size)
-            best_edge = name
-            best_pos = float(idx.mean())                # 接触带的中点（沿边坐标）
-    if best_edge is None or best_cnt < int(AUTO_ROTATE_EDGE_MIN_PIXELS):
+    edge, contact_count, valid = _rotation_edge_contact(blob)
+    if valid:
+        return _rotation_arm_angle(_rotation_edge_arm(blob, edge))
+    # A broad invalid contact in an unknown background indicates ambiguous
+    # segmentation, not an isolated hand ending inside a sleeve.
+    if not calibrate_background and contact_count >= int(AUTO_ROTATE_EDGE_MIN_PIXELS):
         return 0.0
-    # 接触带太长 -> 整条边都是掩膜（手贴边或分割糊了），不可信
-    if best_cnt > float(AUTO_ROTATE_EDGE_MAX_FRAC) * max(bh, bw):
-        return 0.0
-
-    # 用【掩膜质心】而不是掌心：质心更稳，而且一定偏在小臂那一侧 ✓
-    centroid = np.array([float(xs.mean()), float(ys.mean())])
-
-    # 小臂方向 = 从质心指向"那条边的接触带中点"
-    if best_edge == "left":
-        target = np.array([0.0, best_pos])
-    elif best_edge == "right":
-        target = np.array([float(bw - 1), best_pos])
-    elif best_edge == "top":
-        target = np.array([best_pos, 0.0])
-    else:
-        target = np.array([best_pos, float(bh - 1)])
-    arm = target - centroid
-    n = float(np.linalg.norm(arm))
-    if n < 1e-6:
-        return 0.0
-    arm = arm / n
-
-    # 要转多少度，才能让"小臂进来的那条边"落到画面下方
-    #   目标：小臂方向 = (0, +1)（图像坐标 y 向下）
-    #   getRotationMatrix2D 正角度 = 逆时针 ✓
-    #   实测：小臂从右边进来（掩膜贴右边）-> 要转 −90° ✓
-    cur = float(np.degrees(np.arctan2(arm[0], arm[1])))
-    while cur > 180.0:
-        cur -= 360.0
-    while cur < -180.0:
-        cur += 360.0
-    return float(-cur)
-
+    direction = _rotation_internal_arm(small, blob, known_board=calibrate_background)
+    return _rotation_arm_angle(direction)
 
 def _rotation_matrix_and_size(width: int, height: int, angle: float):
     """One pixel-center transform for both the colour frame and validity mask."""
@@ -3700,9 +3975,16 @@ def prepare_hand_frame(frame: np.ndarray, *, board_enabled=None):
         working = np.ascontiguousarray(frame[y0:y1, x0:x1])
     else:
         working = frame
+        x0, y0 = 0, 0
     color_state = SimpleNamespace(flags={"manual_roi": False})
     rotated, angle = auto_rotate_frame(working, color_state=color_state,
                                         calibrate_background=bool(board["detected"]))
+    input_to_prepared = np.array([[1., 0., -x0], [0., 1., -y0], [0., 0., 1.]])
+    if abs(angle) >= 1.0:
+        rotation, _ = _rotation_matrix_and_size(working.shape[1], working.shape[0], angle)
+        rotation_h = np.eye(3)
+        rotation_h[:2] = rotation
+        input_to_prepared = rotation_h @ input_to_prepared
     board_valid = None
     if board["detected"] and len(board.get("polygon", [])) >= 3:
         # A slanted board's bounding rectangle also contains background at
@@ -3717,6 +3999,7 @@ def prepare_hand_frame(frame: np.ndarray, *, board_enabled=None):
                                          flags=cv2.INTER_NEAREST,
                                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     info = {"board": board, "rotation_deg": float(angle),
+            "input_to_prepared": input_to_prepared,
             "input_size": (width, height),
             "cropped_size": (working.shape[1], working.shape[0]),
             "board_valid_mask": board_valid}
@@ -3746,7 +4029,7 @@ def step_board_preview(frame: np.ndarray, state) -> np.ndarray:
         label = "背景板定位已关闭：按 b 开启"
     draw_text_lines(out, [(label, 22, color),
                          ("6 返回识别 | b 开关自动裁板 | n/p 换图", 18, COLOR_TEXT)],
-                    (12, 12), panel=True)
+                    (12, 180 if state.flags.get("still_image") else 12), panel=True)
     return out
 
 
