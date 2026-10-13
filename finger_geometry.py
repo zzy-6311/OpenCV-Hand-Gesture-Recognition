@@ -311,12 +311,26 @@ def _curvature_supports(measured, caps, radius, config, *, independent=False):
     others = [feature for feature in measured["features"] if feature["slot"] != 0]
     index = next((feature for feature in others if feature["slot"] == 1), None)
     min_width = min(feature["width_r"] for feature in others)
+    extended = [feature for feature in others if feature["extended"]]
+    bracket = None
+    if not independent and len(extended) >= 2:
+        angles = [np.arctan2(f["tip_local"][0], -f["tip_local"][1]) for f in extended]
+        bracket = min(angles), max(angles)
     supports = []
     for cap in caps:
         feature = dict(cap)
         x, y = feature["tip_local"]
         if y >= 0 or x > config.thumb_slope * -y:
             continue
+        if bracket is not None:
+            angle = np.arctan2(x, -y)
+            if not bracket[0] <= angle <= bracket[1]:
+                # Outside the observed fingers, a tiny convex ripple on the
+                # palm/shaft edge is not an independent folded digit. Require
+                # the same shoulder support used by the independent pass.
+                if (feature.get("cap_support_chord_r", 0) < 0.5 * feature["width_r"] or
+                        (x > 0 and y >= -1.0)):
+                    continue
         broad = (feature["width_r"] > config.curled_width_r and
                  feature["aspect"] < config.curled_aspect_max)
         compact = (feature["aspect"] < config.curled_aspect_max and

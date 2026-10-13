@@ -1300,10 +1300,34 @@ def step_mask_cleanup(frame: np.ndarray, state) -> np.ndarray:
     removed_components = 0
     kept_components = 0
     min_area_used = 0.0
+    unsupported_board_components = 0
+    board_valid = _board_valid_for_threshold((height, width), state)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     if count > 1:
-        areas = stats[1:, cv2.CC_STAT_AREA].astype(np.float64)
-        largest = float(areas.max())
+        eligible = np.ones(count, dtype=bool)
+        eligible[0] = False
+        if board_valid is not None:
+            # Cropping the board's bounding rectangle leaves room pixels at
+            # slanted corners; rotation can replicate them into a large blob.
+            # A component crossing the measured board edge needs an actual
+            # palm-sized core INSIDE the board, using the recognizer's existing
+            # minimum radius. Test before hole filling can invent such a core.
+            # Keep supported components whole: clipping a real forearm at the
+            # slanted board edge changes the wrist and finger coordinate axes.
+            inside = cv2.bitwise_and(mask, board_valid)
+            padded = cv2.copyMakeBorder(inside, 1, 1, 1, 1,
+                                        cv2.BORDER_CONSTANT, value=0)
+            distance = cv2.distanceTransform(padded, cv2.DIST_L2, 5)[1:-1, 1:-1]
+            outside_labels = np.unique(labels[board_valid == 0])
+            core_labels = np.unique(labels[distance >= float(RECON_MIN_RADIUS_PX)])
+            eligible[outside_labels] = False
+            eligible[core_labels] = True
+            eligible[0] = False
+            unsupported_board_components = int(np.count_nonzero(~eligible[1:]))
+        # Rejected outside blobs must not raise the relative size threshold
+        # and suppress a smaller, genuinely supported hand.
+        areas = stats[eligible, cv2.CC_STAT_AREA].astype(np.float64)
+        largest = float(areas.max()) if areas.size else 0.0
         absolute_min = float(CLEANUP_MIN_AREA_RATIO) * float(roi_area_pixels((height, width), enabled))
         relative_min = float(CLEANUP_MIN_AREA_VS_LARGEST) * largest
         min_area_used = max(1.0, absolute_min, relative_min)
@@ -1311,7 +1335,7 @@ def step_mask_cleanup(frame: np.ndarray, state) -> np.ndarray:
         # 用查找表做筛选，比 np.isin 快得多
         lut = np.zeros(count, np.uint8)
         for label in range(1, int(count)):
-            if float(stats[label, cv2.CC_STAT_AREA]) >= min_area_used:
+            if eligible[label] and float(stats[label, cv2.CC_STAT_AREA]) >= min_area_used:
                 lut[label] = 255
                 kept_components += 1
             else:
@@ -1328,6 +1352,8 @@ def step_mask_cleanup(frame: np.ndarray, state) -> np.ndarray:
     # 更新统计（保留阈值那级写下的 method / roi 信息，补上清理的痕迹）
     segment_stats = dict(state.flags.get("segment_stats") or {})
     segment_stats["cleaned"] = True
+    segment_stats["board_component_filter"] = board_valid is not None
+    segment_stats["unsupported_board_components"] = unsupported_board_components
     segment_stats["foreground_ratio"] = float(np.count_nonzero(mask)) / float(mask.size)
     segment_stats["removed_components"] = removed_components
     segment_stats["kept_components"] = kept_components
@@ -1341,7 +1367,61 @@ def step_mask_cleanup(frame: np.ndarray, state) -> np.ndarray:
 # ===========================================================================
 # 掌心重建：宽阈值保召回，再用"和掌心颜色相近"把不是手的筛掉
 # ===========================================================================
-def _estimate_palm_robust(mask: np.ndarray):
+def _reject_board_shadow_branches(mask, ycrcb, board_valid, background_crcb,
+                                  palm_seed, palm_radius):
+    """Remove thinly attached board shadows using this frame's two chroma centers.
+
+    Opening supplies connectivity evidence; it never replaces the hand mask.
+    Palm-supported components and skin-colored thin fingers retain their
+    original outline. Only board-colored detached branches are removed.
+    """
+    diagnostic = dict(applied=False, rejected_branches=0, removed_pixels=0)
+    if (ycrcb is None or board_valid is None or background_crcb is None or
+            palm_radius <= 0 or not np.any(palm_seed)):
+        return mask, diagnostic
+    foreground = np.median(ycrcb[:, :, 1:][palm_seed].astype(np.float32), axis=0)
+    background = np.asarray(background_crcb, np.float32)
+    direction = foreground - background
+    separation = float(direction @ direction)
+    if not np.isfinite(separation) or separation <= 0:
+        return mask, diagnostic
+    # The existing minimum flesh support defines a scale-relative thin neck.
+    size = max(3, int(round(palm_radius * RECOG_TIP_MIN_THICKNESS)) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
+    diagnostic.update(applied=True, kernel=size, components=count - 1)
+    if count <= 2:
+        return mask, diagnostic
+    protected = np.zeros(count, bool)
+    protected[np.unique(labels[palm_seed])] = True
+    protected[0] = False
+    outside_votes = np.bincount(labels[board_valid == 0], minlength=count)
+    possible = (~protected) & (outside_votes == 0)
+    possible[0] = False
+    if not np.any(possible):
+        return mask, diagnostic
+    # Only detached, board-contained components need a color vote. Avoid
+    # converting/scoring every background and palm pixel of the full frame.
+    selected = possible[labels]
+    selected_labels = labels[selected]
+    score = (ycrcb[:, :, 1:][selected].astype(np.float32) - background) @ direction
+    foreground_votes = np.bincount(
+        selected_labels[score >= 0.5 * separation], minlength=count)
+    rejected = possible & (foreground_votes * 2 < stats[:, cv2.CC_STAT_AREA])
+    diagnostic["rejected_branches"] = int(rejected.sum())
+    if not np.any(rejected):
+        return mask, diagnostic
+    remove = cv2.dilate((rejected.astype(np.uint8) * 255)[labels], kernel)
+    remove[protected[labels]] = 0
+    erased = (remove > 0) & (mask > 0)
+    diagnostic["removed_pixels"] = int(erased.sum())
+    result = mask.copy()
+    result[erased] = 0
+    return result, diagnostic
+
+
+def _estimate_palm_robust(mask: np.ndarray, valid_mask=None):
     """估掌心 (C, R)：先对**一份副本**做闭运算，再取最大内切圆。
 
     为什么这么做（完整理由见配置区 RECON_PALM_CLOSE_RATIO 的注释）：
@@ -1369,7 +1449,9 @@ def _estimate_palm_robust(mask: np.ndarray):
     else:
         work = mask
     distance = cv2.distanceTransform(work, cv2.DIST_L2, 5)
-    _, radius, _, location = cv2.minMaxLoc(distance)
+    # Keep the complete silhouette for wrist estimation, but a board-backed
+    # palm cannot be centered on replicated forearm/background outside it.
+    _, radius, _, location = cv2.minMaxLoc(distance, mask=valid_mask)
     return (int(location[0]), int(location[1])), float(radius)
 
 
@@ -1391,8 +1473,9 @@ def step_palm_reconstruct(frame: np.ndarray, state) -> np.ndarray:
         return frame
 
     # ---- 1) 距离变换 -> 掌心 C 与尺度 R ----
+    board_valid = _board_valid_for_threshold(mask.shape, state)
     distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-    _, radius, _, location = cv2.minMaxLoc(distance)
+    _, radius, _, location = cv2.minMaxLoc(distance, mask=board_valid)
     if radius < float(RECON_MIN_RADIUS_PX):
         print("[%s] 掌心半径只有 %.1f，太小，跳过重建" % (RECON_PLUGIN_NAME, radius))
         return frame
@@ -1400,6 +1483,8 @@ def step_palm_reconstruct(frame: np.ndarray, state) -> np.ndarray:
 
     # ---- 2) 种子 = 掌心核心 ----
     seed = (distance >= float(RECON_SEED_DT_FACTOR) * radius)
+    if board_valid is not None:
+        seed &= board_valid > 0
     seed_pixels = int(np.count_nonzero(seed))
     if seed_pixels < int(RECON_MIN_SEED_PIXELS):
         print("[%s] 种子只有 %d px，太小，跳过重建" % (RECON_PLUGIN_NAME, seed_pixels))
@@ -1416,6 +1501,12 @@ def step_palm_reconstruct(frame: np.ndarray, state) -> np.ndarray:
     cb0 = median_of(cb_plane)
     y0 = median_of(y_plane)
 
+    background = state.flags.get("scene_bg_estimate")
+    background_crcb = ((background["bg_cr"], background["bg_cb"])
+                       if background else None)
+    mask, shadow_filter = _reject_board_shadow_branches(
+        mask, ycrcb, board_valid, background_crcb, seed, radius)
+
     # ---- 4) 允许区 = 掩膜 ∩ 三个"相对掌心核心"的区间 ----
     #     注意：上下限都是 (Cr0 ± 容差) 算出来的，每帧自适应。
     cr_lo = int(round(max(0.0, cr0 - float(RECON_TOL_CR))))
@@ -1430,7 +1521,6 @@ def step_palm_reconstruct(frame: np.ndarray, state) -> np.ndarray:
     # On a verified board, thresholding already admitted observed dark skin.
     # Preserve it here while retaining chroma, input-mask and seed-connectivity
     # constraints. Outside the board, the original luminance gate still holds.
-    board_valid = _board_valid_for_threshold(mask.shape, state)
     if board_valid is not None:
         cv2.bitwise_or(reconstruction_y, board_valid, dst=reconstruction_y)
     cv2.bitwise_and(allowed, reconstruction_y, dst=allowed)
@@ -1460,7 +1550,7 @@ def step_palm_reconstruct(frame: np.ndarray, state) -> np.ndarray:
     #      种子必须落在实际掩膜的厚区里；若用闭运算后的大 R，
     #      "DT >= 0.7*R" 会直接落空（实测 03_busy 就会种不出东西）。
     #      所以这里只把**报出去的**掌心换成稳健版，供 hand_recognize 使用。
-    (palm_cx, palm_cy), palm_radius = _estimate_palm_robust(result)
+    (palm_cx, palm_cy), palm_radius = _estimate_palm_robust(result, board_valid)
 
     # ---- 7.5) 顺便更新 ROI 锚点，让**下一帧**的 ROI 朝手的位置靠过去 ----
     #   放在这里的原因：ROI 是在最前面 color_threshold 那层用的，本帧早就用完了，
@@ -1477,6 +1567,7 @@ def step_palm_reconstruct(frame: np.ndarray, state) -> np.ndarray:
     segment_stats["palm_radius_raw"] = float(radius)
     segment_stats["seed_pixels"] = seed_pixels
     segment_stats["color_base"] = (cr0, cb0, y0)
+    segment_stats["shadow_filter"] = shadow_filter
     segment_stats["foreground_ratio"] = float(np.count_nonzero(result)) / float(result.size)
     state.flags["segment_stats"] = segment_stats
 
@@ -1973,7 +2064,10 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
             # aspect alone would also accept a tiny, needle-like mask burr.
             if (feature["extended"] and feature["has_branch_extent"] and
                     feature["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r and
-                    feature["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max):
+                    (feature["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max or
+                     FG._is_lateral_thumb_branch(
+                         feature, np.asarray(palm_center, dtype=float),
+                         np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG))):
                 promoted.append(dict(cap, closed_support=False,
                                      promotion="contour_shaft_extent"))
             else:
@@ -2167,7 +2261,8 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
     palm_center = segment_stats.get("palm_center")
     radius = segment_stats.get("palm_radius")
     if palm_center is None or not radius:
-        palm_center, radius = _estimate_palm_robust(mask)
+        palm_center, radius = _estimate_palm_robust(
+            mask, _board_valid_for_threshold(mask.shape, state))
         if float(radius) < float(RECON_MIN_RADIUS_PX):
             return None
     palm_center = np.array([float(palm_center[0]), float(palm_center[1])], dtype=np.float64)
@@ -4179,7 +4274,7 @@ def register(api) -> None:
     api.add(ROI_PLUGIN_NAME, step_roi_boundary, enabled=True)
 
 
-# Background board localization, bundled for the three-file release.
+# Board localization is bundled to keep the development copy self-contained.
 def _fit_edge(points, extent):
     """Deterministic consensus line: dependent coordinate = a * axis + b."""
     points = np.asarray(points, np.float64)

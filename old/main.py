@@ -9,7 +9,7 @@
 
 * 输入：用下面的 `SOURCE` 或命令行切换：
     - ``"video"``（当前默认）：读取 data/test/test1.mp4，逐帧识别并循环播放。
-      空格暂停/继续，暂停后 n 单步，R 从头重播。
+      N/右箭头下一视频，P/左箭头上一视频，空格暂停/继续，R 从头重播。
     - ``"image"``：读磁盘上的单张图片，**在循环里反复处理同一张**，
       方便一边看叠加结果一边开关插件、调参数。按 n / p 切换图片，按 R 重载。
     - ``"camera"``：原来的摄像头路径（2K 采集），代码完整保留，随时切回去。
@@ -40,7 +40,7 @@
 运行方式：执行 main.py。
 键位：q 退出，空格暂停/继续，d 显示信息叠加，m 镜像开关，f 全屏开关，
       l 列出插件，r ROI限制 开关，b 自动裁板，7 查看定位；
-      视频：暂停后 n 单步、R 重播；图片：n 下一张、p 上一张、R 重载。
+      视频：N/P 或方向键换视频、R 重播、O ROI；图片：n/p 换图、R 重载。
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from __future__ import annotations
 import collections
 import importlib
 import os
+from pathlib import Path
 import re
 import sys
 import time
@@ -57,7 +58,7 @@ from typing import Any, Callable, Optional
 import cv2
 import numpy as np
 
-# This source archive shares the repository data directory.
+# Development and deployment share the repository material directory.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---------------------------------------------------------------------------
@@ -88,7 +89,10 @@ VIDEO_LOOP = True                      # True = 播完从头循环；False = 播
 # 逐帧读入 -> 完整计算 -> 显示当前帧结果 -> 停留 -> 再读下一帧。
 # 停留时间从结果显示后计起，不扣除计算耗时；视频不使用上一帧稳定结果覆盖。
 VIDEO_FRAME_HOLD_MS = 0              # 每帧结果显示后的停留毫秒数，可调大以便观察
-# 空格暂停/继续，暂停后 n 前进一步，R 从头重播（保留暂停状态）。
+# 视频控制与 end 一致；照片模式的大写 R 重载、小写 r ROI 保持原样。
+VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".webm", ".mts"}
+NEXT_VIDEO_KEYS = {ord("n"), ord("N"), 0x270000, 65363, 16777236}
+PREVIOUS_VIDEO_KEYS = {ord("p"), ord("P"), 0x250000, 65361, 16777234}
 
 # --- 手势素材数据集 ---------------------------------------------------------
 # 中国式数字手势素材。目前有**三组**（同一个手势在不同背景/光照下各拍一次）：
@@ -573,6 +577,52 @@ def resolve_video_path(filename: str) -> str:
     return os.path.join(PROJECT_ROOT, VIDEO_DATA_DIR, filename)
 
 
+def collect_videos(path: Path) -> tuple[list[Path], int]:
+    """Natural sibling playlist; only a user key changes the selected video."""
+    path = Path(path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"视频或文件夹不存在：{path}")
+    folder = path if path.is_dir() else path.parent
+    videos = sorted((item for item in folder.iterdir()
+                     if item.is_file() and item.suffix.lower() in VIDEO_SUFFIXES),
+                    key=lambda item: image_sort_key(item.name))
+    if not videos:
+        raise ValueError(f"文件夹中没有视频：{folder}")
+    if path.is_file() and path not in videos:
+        raise ValueError(f"不支持的视频扩展名：{path.suffix}")
+    return videos, 0 if path.is_dir() else videos.index(path)
+
+
+def _video_player_view(canvas, videos, index, frame_no, frame_count, paused, error):
+    """Use the end player's footer while preserving the development view above."""
+    height, width = canvas.shape[:2]
+    scale = min(1280 / width, 710 / height, 1.0)
+    if scale < 1:
+        canvas = cv2.resize(canvas, (max(1, round(width * scale)),
+                                    max(1, round(height * scale))), interpolation=cv2.INTER_AREA)
+    shown = cv2.copyMakeBorder(canvas, 0, 90 if error else 58,
+                              0, max(0, 860 - canvas.shape[1]),
+                              cv2.BORDER_CONSTANT, value=(25, 25, 25))
+    status = "已停止" if error else "已暂停" if paused else "播放中"
+    loop = "循环当前视频" if VIDEO_LOOP else "播完退出"
+    lines = [f"{index + 1}/{len(videos)}  {videos[index].name}  "
+             f"帧 {frame_no}/{frame_count or '?'}  {status}  | {loop}",
+             "N/右箭头 下一视频   P/左箭头 上一视频   空格 暂停   R 重播   H 详情   Q/Esc 退出"]
+    if error:
+        lines.append(f"{error}  | N/P 切换，R 重试，Q 退出")
+    module = sys.modules.get("plugins")
+    if module is not None:
+        module.draw_text_lines(shown,
+                               [(line, 16, (90, 120, 255) if row == 2 else (230, 230, 230))
+                                for row, line in enumerate(lines)], (10, canvas.shape[0] + 6))
+    else:
+        cv2.putText(shown, f"{index+1}/{len(videos)}  {videos[index].name}  {frame_no}/{frame_count}",
+                    (10, canvas.shape[0]+22), cv2.FONT_HERSHEY_SIMPLEX, .55, (230,230,230), 1)
+        cv2.putText(shown, "N/P video | Space pause | R replay | H details | Q quit",
+                    (10, canvas.shape[0]+46), cv2.FONT_HERSHEY_SIMPLEX, .55, (230,230,230), 1)
+    return shown
+
+
 def _try_open(index: int, backend: Optional[int], width: int, height: int,
               fps: float) -> Optional[cv2.VideoCapture]:
     """尝试用指定后端打开摄像头并读取一帧；失败返回 None。"""
@@ -706,6 +756,10 @@ def step_info_overlay(frame: np.ndarray, state: FrameState) -> np.ndarray:
        挪到右上角，两边各占一边，互不干扰。
     """
     if not state.show_overlay:
+        return frame
+    if state.flags.get("video_mode"):
+        # The player footer reports the current clip even while paused/error;
+        # do not bake the obsolete per-frame shortcut strip into the image.
         return frame
     module = sys.modules.get("plugins")
     debug = bool(getattr(module, "DISPLAY_DEBUG", False))
@@ -968,7 +1022,7 @@ def _select_view_mode(key: int, state: FrameState,
 
 def _handle_key(key: int, state: FrameState, registry: PluginRegistry) -> Optional[str]:
     """处理一个按键，返回 "quit"/"fullscreen" 等动作，未识别时返回 None。"""
-    if key in (ord("q"), 27):
+    if key in (ord("q"), ord("Q"), 27):
         return "quit"
     # 数字键切换显示模式（1 原图 / 2 掩膜 / 3 清理后）。放前面，优先于其他开关。
     if _select_view_mode(key, state, registry):
@@ -987,7 +1041,7 @@ def _handle_key(key: int, state: FrameState, registry: PluginRegistry) -> Option
     elif key == ord("m"):
         state.mirror = not state.mirror
         print("[main] 镜像：%s" % ("开" if state.mirror else "关"))
-    elif key == ord("r"):
+    elif key == (ord("o") if state.flags.get("video_mode") else ord("r")):
         # 控制**真正生效**的 ROI 限制（实现在 plugins.py 里），
         # 而不是那个"只画不裁"的示例框。按一下就能对比限制/不限制的效果。
         module = sys.modules.get("plugins")
@@ -1133,16 +1187,14 @@ def main() -> int:
         arg2 = str(sys.argv[2]).strip().lower() if len(sys.argv) > 2 else ""
         if SOURCE == "video" and arg2:
             pick = str(sys.argv[2]).strip()
-            if os.path.isabs(pick):
-                VIDEO_FILE = pick
-            else:
-                cand = pick if pick.lower().endswith((".mp4", ".avi", ".mov", ".mkv")) \
-                    else "gesture_video_%s.mp4" % pick
-                if os.path.exists(resolve_video_path(cand)):
-                    VIDEO_FILE = cand
-                else:
-                    print("[main] 找不到视频素材 %r（试过 %s）" % (pick, cand))
-                    return 1
+            candidates = [resolve_video_path(pick), os.path.abspath(pick),
+                          os.path.join(PROJECT_ROOT, pick),
+                          resolve_video_path("gesture_video_%s.mp4" % pick)]
+            selected = next((path for path in candidates if os.path.exists(path)), None)
+            if selected is None:
+                print("[main] 找不到视频或文件夹：%s" % pick)
+                return 1
+            VIDEO_FILE = selected
         elif SOURCE == "image" and arg2:
             if arg2 in ("camera", "cam"):
                 DATA_DIR = "data/" + CAMERA_SHOT_DIR
@@ -1196,6 +1248,11 @@ def main() -> int:
         registry.enable(plugins_module.STABILITY_PLUGIN_NAME, False)
 
     video_period_ms = 0.0
+    videos = []
+    video_index = video_frames = video_frame_no = 0
+    video_error = ""
+    video_had_error = False
+    open_video_requested = False
     cap: Optional[cv2.VideoCapture] = None
     image_source: Optional[ImageSource] = None
     photo_display_labels: dict[str, str] = {}
@@ -1220,26 +1277,15 @@ def main() -> int:
         print("[image] 循环处理同一张；n 下一张，p 上一张，R 从磁盘重载")
         frame_delay_ms = FRAME_DELAY_MS_IMAGE
     elif is_video:
-        video_path = resolve_video_path(VIDEO_FILE)
-        if not os.path.exists(video_path):
-            print("[error] 视频文件不存在：%s" % video_path)
-            print("        改 VIDEO_FILE（相对 VIDEO_DATA_DIR=\"%s\"），"
-                  "或把 SOURCE 换回 \"image\"。" % VIDEO_DATA_DIR)
+        try:
+            videos, video_index = collect_videos(Path(resolve_video_path(VIDEO_FILE)))
+        except (OSError, ValueError) as error:
+            print("[error] %s" % error)
             return 1
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print("[error] 打不开视频：%s（编码可能不被 OpenCV 支持）" % video_path)
-            return 1
-        video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        video_fps = float(cap.get(cv2.CAP_PROP_FPS))
-        if np.isfinite(video_fps) and video_fps > 0.0:
-            video_period_ms = 1000.0 / video_fps
-        print("[video] %s  %dx%d  %.1f fps  共 %d 帧"
-              % (os.path.basename(video_path),
-                 int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                 int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                 video_fps, video_frames))
-        print("[video] %s" % ("播完自动循环" if VIDEO_LOOP else "播完自动退出"))
+        open_video_requested = True
+        print("[video] 共 %d 段；当前 %s；%s"
+              % (len(videos), videos[video_index].name,
+                 "默认循环当前视频，按 N/P 切换" if VIDEO_LOOP else "当前视频播完退出"))
         print("[video] 逐帧计算并显示当前结果；显示后停留 %d ms，再读取下一帧"
               % VIDEO_FRAME_HOLD_MS)
         frame_delay_ms = FRAME_DELAY_MS_CAMERA
@@ -1255,6 +1301,7 @@ def main() -> int:
     # 4) 建立这一轮运行共享的状态对象（帧号、FPS、裁切区、各种开关都在里面）
     state = FrameState(plugins=registry.names())
     state.flags["still_image"] = is_image
+    state.flags["video_mode"] = is_video
     state.flags["roi"] = True              # 内置 ROI 示例框默认开启
     # 磁盘照片和视频保留拍摄方向；摄像头沿用配置，m 键可手动切换。
     state.mirror = False if (is_image or is_video) else MIRROR_DEFAULT
@@ -1274,18 +1321,59 @@ def main() -> int:
     failures = 0                           # 连续读帧失败计数
     last_displayed: Optional[np.ndarray] = None    # 最近一帧"处理完、还没做显示适配"的画面
     refresh_requested = False              # 暂停时改变视图只重算当前帧
-    advance_requested = False              # 视频单步/重播显式读取下一帧
+    advance_requested = False              # 切换/重播后即使暂停也展示首帧
     last_input: Optional[np.ndarray] = None # 保留未裁板/未转正的当前源帧
-    print("[main] 按键：q 退出，空格暂停，1~7 切换显示模式，b 自动裁板，d 叠加，h 详细标记，m 镜像，r ROI限制，f 全屏，l 列出插件"
+    print("[main] 按键：q 退出，空格暂停，1~7 切换显示模式，b 自动裁板，d 叠加，h 详细标记，m 镜像，%s ROI限制，f 全屏，l 列出插件" % ("o" if is_video else "r")
           + ("，n/p 换图，R 重载" if image_source is not None else
-             "，暂停后 n 单步，R 从头重播" if is_video else ""))
+             "，N/右箭头 下一视频，P/左箭头 上一视频，R/r 重播（字母不区分大小写）" if is_video else ""))
 
     try:
         while True:
             iteration_started = time.perf_counter()
-            # 暂停刷新不消费视频帧，只有显式 n/R 才推进输入。
-            if (not state.paused) or refresh_requested or advance_requested:
-                reuse_input = bool(state.paused and not advance_requested
+            processed_video_frame = False
+            if is_video and open_video_requested:
+                # Opening, EOF and explicit navigation share one reset path.
+                # Do not carry masks, recognition or tracking from another clip.
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                _reset_processing_state(plugins_module)
+                recent_dt.clear()
+                state.index = 0
+                state.fps = state.dt = 0.0
+                state.raw_frame = None
+                retained = {key: value for key, value in state.flags.items()
+                            if key in {"still_image", "video_mode", "roi", "manual_roi",
+                                       "roi_fallback_enabled", "board_roi_enabled", "view_mode",
+                                       "view_mode_has_mask"}}
+                state.flags.clear()
+                state.flags.update(retained)
+                video_frames = video_frame_no = 0
+                last_input = None
+                last_displayed = np.zeros((480, 860, 3), np.uint8)
+                video_error = ""
+                video_period_ms = 1000.0 / 30.0
+                refresh_requested = advance_requested = False
+                open_video_requested = False
+                try:
+                    cap = cv2.VideoCapture(str(videos[video_index]))
+                    if not cap.isOpened():
+                        raise ValueError("无法打开视频")
+                    reported_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    video_frames = int(reported_count) if np.isfinite(reported_count) and reported_count > 0 else 0
+                    fps = float(cap.get(cv2.CAP_PROP_FPS))
+                    if np.isfinite(fps) and fps > 0:
+                        video_period_ms = 1000.0 / fps
+                    advance_requested = True
+                    print("[video] %d/%d %s" % (video_index+1, len(videos), videos[video_index].name))
+                except Exception as error:
+                    video_error = "无法打开视频：%s" % error
+                    video_had_error = True
+                    print("[error] %s" % video_error)
+            # A view refresh reuses the current source even during playback.
+            if ((not state.paused) or refresh_requested or advance_requested) and not video_error:
+                reuse_input = bool((state.paused or (is_video and refresh_requested))
+                                   and not advance_requested
                                    and last_input is not None and not is_image)
                 refresh_requested = False
                 advance_requested = False
@@ -1297,27 +1385,28 @@ def main() -> int:
                         print("[error] 当前图片读取失败")
                         return 1
                 else:
-                    ok, raw = cap.read()
+                    try:
+                        ok, raw = cap.read()
+                    except Exception as error:
+                        if not is_video:
+                            raise
+                        video_error = "读取失败：%s" % error
+                        video_had_error = True
+                        print("[error] %s" % video_error)
+                        continue
                     if not ok or raw is None or raw.size == 0:
                         if is_video:
                             # 只有至少读过一帧且已到片尾才当作正常结束。
-                            pos = float(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                            if last_input is None or (video_frames > 0 and pos < video_frames):
-                                print("[error] 视频帧读取失败，停止播放")
-                                return 1
+                            if video_frame_no == 0 or (video_frames > 0 and video_frame_no < video_frames):
+                                video_error = "读取停止于帧 %d/%s" % (video_frame_no, video_frames or "?")
+                                video_had_error = True
+                                print("[error] %s" % video_error)
+                                continue
                             if not VIDEO_LOOP:
                                 print("[video] 播放结束")
-                                return 0
-                            if not cap.set(cv2.CAP_PROP_POS_FRAMES, 0):
-                                print("[error] 视频无法回到开头")
-                                return 1
-                            _reset_processing_state(plugins_module)
-                            recent_dt.clear()
-                            state.index = 0
-                            ok, raw = cap.read()
-                            if not ok or raw is None or raw.size == 0:
-                                print("[error] 视频回到开头后仍无法读取，停止播放")
-                                return 1
+                                return int(video_had_error)
+                            open_video_requested = True
+                            continue
                         else:
                             failures += 1
                             if failures >= MAX_CONSECUTIVE_READ_FAILURES:
@@ -1329,8 +1418,10 @@ def main() -> int:
                     failures = 0
                 if not reuse_input:
                     last_input = raw.copy()
+                    if is_video:
+                        video_frame_no += 1
                 if is_video:
-                    state.flags["video_frame"] = max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES))-1)
+                    state.flags["video_frame"] = video_frame_no - 1
                     state.flags["video_frames"] = video_frames
 
                 # 5.2 计算本帧时间间隔，并用最近 30 帧的平均间隔换算平滑 FPS
@@ -1364,9 +1455,19 @@ def main() -> int:
                 #   判断不出来时*不转*（返回 0），保持原行为 ✓
                 state.flags["input_frame"] = raw
                 if plugins_module is not None:
-                    raw, preprocessing = plugins_module.prepare_hand_frame(
-                        raw, board_enabled=state.flags.get("board_roi_enabled"))
-                    state.flags["preprocess"] = preprocessing
+                    try:
+                        raw, preprocessing = plugins_module.prepare_hand_frame(
+                            raw, board_enabled=state.flags.get("board_roi_enabled"))
+                        state.flags["preprocess"] = preprocessing
+                    except Exception as error:
+                        if not is_video:
+                            raise
+                        video_error = "帧 %d 预处理失败：%s" % (video_frame_no, error)
+                        video_had_error = True
+                        state.flags.pop("recognize", None)
+                        last_displayed = last_input.copy()
+                        print("[error] %s" % video_error)
+                        continue
 
                 # 5.3 把本帧信息写进共享状态，插件通过 state 读取原图尺寸和裁切区
                 state.raw_frame = raw
@@ -1388,12 +1489,23 @@ def main() -> int:
                 state.flags.pop("recognize", None)  # Never display a previous photo after failure/view changes.
                 try:
                     frame = registry.run(frame, state, strict=is_video)
-                except RuntimeError as error:
-                    print("[error] 当前帧处理失败，停止播放：%s" % error)
-                    return 1
+                except Exception as error:
+                    if not is_video:
+                        print("[error] 当前帧处理失败，停止播放：%s" % error)
+                        return 1
+                    video_error = "帧 %d 处理失败：%s" % (video_frame_no, error)
+                    video_had_error = True
+                    state.flags.pop("recognize", None)
+                    last_displayed = last_input.copy()
+                    print("[error] %s" % video_error)
+                    continue
                 if is_video and frame is None:
-                    print("[error] 当前视频帧没有输出，停止播放，未跳到下一帧")
-                    return 1
+                    video_error = "帧 %d 没有处理结果" % video_frame_no
+                    video_had_error = True
+                    state.flags.pop("recognize", None)
+                    last_displayed = last_input.copy()
+                    print("[error] %s" % video_error)
+                    continue
                 # 5.5 有可显示的帧就送进窗口。
                 #     ★ 送之前先过一遍 _display_frame：等比缩放 + 补黑边，
                 #       保证任何宽高比的素材都不会被 imshow 拉变形（见该函数注释）。
@@ -1403,7 +1515,10 @@ def main() -> int:
                                            "hand_recognize" in registry.enabled_names(),
                                            photo_display_labels, plugins_module)
                     last_displayed = frame
-                    cv2.imshow(WINDOW_NAME, _display_frame(frame))
+                    if not is_video:
+                        cv2.imshow(WINDOW_NAME, _display_frame(frame))
+                    else:
+                        processed_video_frame = True
 
                 # 5.6 帧号加一，然后处理键盘：waitKey 需要每帧调用一次来驱动界面事件。
             #     图片模式下用较大的延时，既避免空转烧 CPU，也保证按键能响应。
@@ -1414,7 +1529,7 @@ def main() -> int:
                 # 5.6b 暂停中：**也要重绘**。
                 #      以前暂停就完全不 imshow，结果画面冻结、连"PAUSED"都画不出来，
                 #      用户分不清是暂停还是卡死；按 n 换图也只是终端变了、画面不动。
-                if last_displayed is not None:
+                if last_displayed is not None and not is_video:
                     # ★ 先做显示适配，再画暂停标记 —— 这样标记是在 1280x720 的
                     #   画布上画的，字号恒定，不会因为原图大小而忽大忽小。
                     paused_canvas = _display_frame(last_displayed)
@@ -1422,29 +1537,41 @@ def main() -> int:
                     cv2.imshow(WINDOW_NAME, paused_canvas)
 
             # 5.7 键盘。这一句在 if 外面，暂停时也要执行，否则界面会僵住。
+            if is_video and last_displayed is not None:
+                shown = _video_player_view(last_displayed, videos, video_index,
+                                           video_frame_no, video_frames, state.paused, video_error)
+                cv2.imshow(WINDOW_NAME, shown)
             wait_ms = FRAME_DELAY_MS_IMAGE if state.paused else frame_delay_ms
-            if is_video and not state.paused and video_period_ms > 0.0:
+            if is_video and processed_video_frame and video_period_ms > 0.0:
                 elapsed_ms = (time.perf_counter() - iteration_started) * 1000.0
                 wait_ms = max(1, int(np.ceil(video_period_ms - elapsed_ms)))
-            if is_video and not state.paused:
+            if is_video and processed_video_frame:
                 # 必须在 imshow 后等待。计算慢只会延长播放时间，不能缩短结果停留。
                 wait_ms = max(wait_ms, max(1, int(VIDEO_FRAME_HOLD_MS)))
-            key = cv2.waitKey(wait_ms) & 0xFF
-
-            if is_video and key == ord("R"):
-                if not cap.set(cv2.CAP_PROP_POS_FRAMES, 0):
-                    print("[error] 视频无法回到开头")
-                    return 1
-                _reset_processing_state(plugins_module)
-                recent_dt.clear()
-                state.index = 0
-                last_input = None
-                advance_requested = True
-                print("[video] 从头重播%s" % ("（保持暂停）" if state.paused else ""))
-                continue
-            if is_video and state.paused and key == ord("n"):
-                advance_requested = True
-                continue
+            if is_video:
+                if not processed_video_frame:
+                    wait_ms = 30
+                key = cv2.waitKeyEx(wait_ms)
+                # Preserve extended arrow key codes; normalize only video
+                # letters so the photo R/reload and r/ROI meanings stay intact.
+                if ord("A") <= key <= ord("Z"):
+                    key += ord("a") - ord("A")
+                if key in (ord("q"), 27):
+                    return int(video_had_error)
+                try:
+                    if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                        return int(video_had_error)
+                except cv2.error:
+                    return int(video_had_error)
+                if key in NEXT_VIDEO_KEYS or key in PREVIOUS_VIDEO_KEYS:
+                    video_index = (video_index + (1 if key in NEXT_VIDEO_KEYS else -1)) % len(videos)
+                    open_video_requested = True
+                    continue
+                if key == ord("r"):
+                    open_video_requested = True
+                    continue
+            else:
+                key = cv2.waitKey(wait_ms) & 0xFF
 
             # 5.8 图片模式专有按键：换图 / 从磁盘重载
             if image_source is not None and key in (ord("n"), ord("p"), ord("R")):
@@ -1464,7 +1591,7 @@ def main() -> int:
             # 5.9 _handle_key：把按键翻译成开关动作；返回 "quit"/"fullscreen" 时需额外处理
             #     空格键会翻转 state.paused，下一轮循环的 5.0 就会真的停下处理。
             action = _handle_key(key, state, registry)
-            if key in (ord("b"), ord("r"), ord("m"), ord("d"), ord("h")) or any(
+            if key in (ord("b"), ord("o") if is_video else ord("r"), ord("m"), ord("d"), ord("h")) or any(
                     key == mode[0] for mode in VIEW_MODES):
                 refresh_requested = True
             if action == "quit":

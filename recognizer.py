@@ -441,10 +441,32 @@ def clean_mask(frame: np.ndarray, state) -> np.ndarray:
     removed_components = 0
     kept_components = 0
     min_area_used = 0.0
+    unsupported_board_components = 0
+    board_valid = _board_valid_for_threshold((height, width), state)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     if count > 1:
-        areas = stats[1:, cv2.CC_STAT_AREA].astype(np.float64)
-        largest = float(areas.max())
+        eligible = np.ones(count, dtype=bool)
+        eligible[0] = False
+        if board_valid is not None:
+            # Slanted board corners and replicated rotation borders can contain
+            # room background. Components crossing the measured board edge
+            # need a palm-sized core inside it before hole filling. Keep a
+            # supported hand whole so its forearm and wrist axes do not change.
+            inside = cv2.bitwise_and(mask, board_valid)
+            padded = cv2.copyMakeBorder(
+                inside, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0
+            )
+            distance = cv2.distanceTransform(padded, cv2.DIST_L2, 5)[1:-1, 1:-1]
+            outside_labels = np.unique(labels[board_valid == 0])
+            core_labels = np.unique(labels[distance >= float(RECON_MIN_RADIUS_PX)])
+            eligible[outside_labels] = False
+            eligible[core_labels] = True
+            eligible[0] = False
+            unsupported_board_components = int(np.count_nonzero(~eligible[1:]))
+        # Rejected outside blobs must not suppress a smaller supported hand
+        # by raising the relative area threshold.
+        areas = stats[eligible, cv2.CC_STAT_AREA].astype(np.float64)
+        largest = float(areas.max()) if areas.size else 0.0
         absolute_min = float(CLEANUP_MIN_AREA_RATIO) * float(
             roi_area_pixels((height, width), enabled)
         )
@@ -452,7 +474,7 @@ def clean_mask(frame: np.ndarray, state) -> np.ndarray:
         min_area_used = max(1.0, absolute_min, relative_min)
         lut = np.zeros(count, np.uint8)
         for label in range(1, int(count)):
-            if float(stats[label, cv2.CC_STAT_AREA]) >= min_area_used:
+            if eligible[label] and float(stats[label, cv2.CC_STAT_AREA]) >= min_area_used:
                 lut[label] = 255
                 kept_components += 1
             else:
@@ -465,6 +487,8 @@ def clean_mask(frame: np.ndarray, state) -> np.ndarray:
         filled_pixels = int(np.count_nonzero(mask)) - before
     segment_stats = dict(state.flags.get("segment_stats") or {})
     segment_stats["cleaned"] = True
+    segment_stats["board_component_filter"] = board_valid is not None
+    segment_stats["unsupported_board_components"] = unsupported_board_components
     segment_stats["foreground_ratio"] = float(np.count_nonzero(mask)) / float(mask.size)
     segment_stats["removed_components"] = removed_components
     segment_stats["kept_components"] = kept_components
@@ -474,7 +498,61 @@ def clean_mask(frame: np.ndarray, state) -> np.ndarray:
     return cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
 
-def _estimate_palm_robust(mask: np.ndarray):
+def _reject_board_shadow_branches(mask, ycrcb, board_valid, background_crcb,
+                                  palm_seed, palm_radius):
+    """Remove thinly attached board shadows using this frame's two chroma centers.
+
+    Opening supplies connectivity evidence; it never replaces the hand mask.
+    Palm-supported components and skin-colored thin fingers retain their
+    original outline. Only board-colored detached branches are removed.
+    """
+    diagnostic = dict(applied=False, rejected_branches=0, removed_pixels=0)
+    if (ycrcb is None or board_valid is None or background_crcb is None or
+            palm_radius <= 0 or not np.any(palm_seed)):
+        return mask, diagnostic
+    foreground = np.median(ycrcb[:, :, 1:][palm_seed].astype(np.float32), axis=0)
+    background = np.asarray(background_crcb, np.float32)
+    direction = foreground - background
+    separation = float(direction @ direction)
+    if not np.isfinite(separation) or separation <= 0:
+        return mask, diagnostic
+    # The existing minimum flesh support defines a scale-relative thin neck.
+    size = max(3, int(round(palm_radius * RECOG_TIP_MIN_THICKNESS)) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
+    diagnostic.update(applied=True, kernel=size, components=count - 1)
+    if count <= 2:
+        return mask, diagnostic
+    protected = np.zeros(count, bool)
+    protected[np.unique(labels[palm_seed])] = True
+    protected[0] = False
+    outside_votes = np.bincount(labels[board_valid == 0], minlength=count)
+    possible = (~protected) & (outside_votes == 0)
+    possible[0] = False
+    if not np.any(possible):
+        return mask, diagnostic
+    # Only detached, board-contained components need a color vote. Avoid
+    # converting/scoring every background and palm pixel of the full frame.
+    selected = possible[labels]
+    selected_labels = labels[selected]
+    score = (ycrcb[:, :, 1:][selected].astype(np.float32) - background) @ direction
+    foreground_votes = np.bincount(
+        selected_labels[score >= 0.5 * separation], minlength=count)
+    rejected = possible & (foreground_votes * 2 < stats[:, cv2.CC_STAT_AREA])
+    diagnostic["rejected_branches"] = int(rejected.sum())
+    if not np.any(rejected):
+        return mask, diagnostic
+    remove = cv2.dilate((rejected.astype(np.uint8) * 255)[labels], kernel)
+    remove[protected[labels]] = 0
+    erased = (remove > 0) & (mask > 0)
+    diagnostic["removed_pixels"] = int(erased.sum())
+    result = mask.copy()
+    result[erased] = 0
+    return result, diagnostic
+
+
+def _estimate_palm_robust(mask: np.ndarray, valid_mask=None):
     """估掌心 (C, R)：先对**一份副本**做闭运算，再取最大内切圆。
 
     为什么这么做（完整理由见配置区 RECON_PALM_CLOSE_RATIO 的注释）：
@@ -491,8 +569,8 @@ def _estimate_palm_robust(mask: np.ndarray):
     """
     area = int(np.count_nonzero(mask))
     if area <= 0:
-        return ((0, 0), 0.0)
-    scale = float(np.sqrt(float(area) / np.pi))
+        return (0, 0), 0.0
+    scale = float(np.sqrt(float(area) / np.pi))       # 等效半径，抗割口
     size = int(round(float(RECON_PALM_CLOSE_RATIO) * scale))
     if size >= 3:
         if size % 2 == 0:
@@ -502,8 +580,10 @@ def _estimate_palm_robust(mask: np.ndarray):
     else:
         work = mask
     distance = cv2.distanceTransform(work, cv2.DIST_L2, 5)
-    _, radius, _, location = cv2.minMaxLoc(distance)
-    return ((int(location[0]), int(location[1])), float(radius))
+    # Keep the complete silhouette for wrist estimation, but a board-backed
+    # palm cannot be centered on replicated forearm/background outside it.
+    _, radius, _, location = cv2.minMaxLoc(distance, mask=valid_mask)
+    return (int(location[0]), int(location[1])), float(radius)
 
 
 def reconstruct_palm(frame: np.ndarray, state) -> np.ndarray:
@@ -514,12 +594,15 @@ def reconstruct_palm(frame: np.ndarray, state) -> np.ndarray:
     ycrcb = state.flags.get("segment_ycrcb")
     if ycrcb is None:
         return frame
+    board_valid = _board_valid_for_threshold(mask.shape, state)
     distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-    _, radius, _, location = cv2.minMaxLoc(distance)
+    _, radius, _, location = cv2.minMaxLoc(distance, mask=board_valid)
     if radius < float(RECON_MIN_RADIUS_PX):
         return frame
     cx, cy = (int(location[0]), int(location[1]))
     seed = distance >= float(RECON_SEED_DT_FACTOR) * radius
+    if board_valid is not None:
+        seed &= board_valid > 0
     seed_pixels = int(np.count_nonzero(seed))
     if seed_pixels < int(RECON_MIN_SEED_PIXELS):
         return frame
@@ -533,6 +616,11 @@ def reconstruct_palm(frame: np.ndarray, state) -> np.ndarray:
     cr0 = median_of(cr_plane)
     cb0 = median_of(cb_plane)
     y0 = median_of(y_plane)
+    background = state.flags.get("scene_bg_estimate")
+    background_crcb = ((background["bg_cr"], background["bg_cb"])
+                       if background else None)
+    mask, shadow_filter = _reject_board_shadow_branches(
+        mask, ycrcb, board_valid, background_crcb, seed, radius)
     cr_lo = int(round(max(0.0, cr0 - float(RECON_TOL_CR))))
     cr_hi = int(round(min(255.0, cr0 + float(RECON_TOL_CR))))
     cb_lo = int(round(max(0.0, cb0 - float(RECON_TOL_CB))))
@@ -541,7 +629,6 @@ def reconstruct_palm(frame: np.ndarray, state) -> np.ndarray:
     allowed = cv2.inRange(cr_plane, cr_lo, cr_hi)
     cv2.bitwise_and(allowed, cv2.inRange(cb_plane, cb_lo, cb_hi), dst=allowed)
     reconstruction_y = cv2.inRange(y_plane, y_lo, 255)
-    board_valid = _board_valid_for_threshold(mask.shape, state)
     if board_valid is not None:
         cv2.bitwise_or(reconstruction_y, board_valid, dst=reconstruction_y)
     cv2.bitwise_and(allowed, reconstruction_y, dst=allowed)
@@ -555,7 +642,7 @@ def reconstruct_palm(frame: np.ndarray, state) -> np.ndarray:
         lookup[label] = 255
     result = lookup[labels]
     result = _fill_internal_holes(result)
-    (palm_cx, palm_cy), palm_radius = _estimate_palm_robust(result)
+    (palm_cx, palm_cy), palm_radius = _estimate_palm_robust(result, board_valid)
     segment_stats = dict(state.flags.get("segment_stats") or {})
     segment_stats["reconstructed"] = True
     segment_stats["palm_center"] = (palm_cx, palm_cy)
@@ -563,6 +650,7 @@ def reconstruct_palm(frame: np.ndarray, state) -> np.ndarray:
     segment_stats["palm_radius_raw"] = float(radius)
     segment_stats["seed_pixels"] = seed_pixels
     segment_stats["color_base"] = (cr0, cb0, y0)
+    segment_stats["shadow_filter"] = shadow_filter
     segment_stats["foreground_ratio"] = float(np.count_nonzero(result)) / float(result.size)
     state.flags["segment_stats"] = segment_stats
     return cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
@@ -799,9 +887,8 @@ def _truncate_forearm(mask: np.ndarray, palm_center, up, radius: float) -> np.nd
     return cv2.bitwise_and(mask, allowed)
 
 
-def _detect_fingertips(
-    contour, mask: np.ndarray, palm_center, radius: float, up, *, closed_candidates=None
-):
+def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up,
+                       *, closed_candidates=None):
     """在轮廓上找指尖。返回（候选列表, 距离剖面）。
 
     判据（全部按 R 归一化）：
@@ -814,76 +901,78 @@ def _detect_fingertips(
     """
     count = int(contour.shape[0])
     if count < 8:
-        return ([], None)
+        return [], None
     points = contour.reshape(count, 2).astype(np.float64)
     distances = np.linalg.norm(points - np.asarray(palm_center).reshape(1, 2), axis=1)
+
     window = max(2, int(round(RECOG_TIP_PEAK_WINDOW * float(radius))))
     floor_min, floor_max = _circular_window_extrema(distances, window)
+
+    # 先用纯向量化的三条门槛筛掉绝大多数轮廓点（快）
     keep = distances >= RECOG_TIP_MIN_DISTANCE * float(radius)
-    keep &= floor_max <= distances + 1e-09
-    keep &= distances - floor_min >= RECOG_TIP_MIN_PROMINENCE * float(radius)
+    keep &= floor_max <= distances + 1e-9
+    keep &= (distances - floor_min) >= RECOG_TIP_MIN_PROMINENCE * float(radius)
     local_points = _to_local_points(points, palm_center, up, radius)
+    # Reject wrist-cut corners before ranking/capping the candidates, so
+    # invalid distant points cannot consume the slots of real fingertips.
     keep &= local_points[:, 1] <= float(RECOG_TIP_PALM_SIDE_MAX)
     candidate_indices = np.nonzero(keep)[0]
     if candidate_indices.size == 0:
-        return ([], distances)
+        return [], distances
+
+    # 剩下少数候选才算形态和厚度（贵的那部分）
     thickness = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     candidates = []
     for raw_index in candidate_indices:
         index = int(raw_index)
         ratio, angle = _tip_sharpness(contour, index, window)
-        inner = points[index] + (np.asarray(palm_center) - points[index]) * float(
-            RECOG_TIP_THICKNESS_SAMPLE
-        )
+        inner = points[index] + (np.asarray(palm_center) - points[index]) * \
+            float(RECOG_TIP_THICKNESS_SAMPLE)
         thickness_ratio = _sample_plane(thickness, inner) / float(radius)
-        if ratio < RECOG_TIP_MIN_TURN_RATIO and thickness_ratio > RECOG_TIP_THICKNESS_MAX:
+        if ratio < RECOG_TIP_MIN_TURN_RATIO and \
+                thickness_ratio > RECOG_TIP_THICKNESS_MAX:
             continue
         if angle > RECOG_TIP_MAX_ANGLE_DEG:
             continue
-        if angle < RECOG_TIP_MIN_ANGLE_DEG and thickness_ratio < RECOG_TIP_MIN_THICKNESS:
-            shaft = FG._measure_tip(
-                contour,
-                points[index],
-                np.asarray(palm_center, dtype=float),
-                np.asarray(up, dtype=float),
-                radius,
-                FG.DEFAULT_CONFIG,
-            )
-            if not (
-                shaft["width_r"] >= 2.0 * RECOG_TIP_MIN_THICKNESS
-                and shaft["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r
-                and (shaft["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max)
-                and (shaft["shaft_width_ratio"] <= FG.DEFAULT_CONFIG.base_width_factor)
-            ):
+        # 针状毛刺：夹角和厚度同时极端小 -> 不是指尖（真指尖是圆帽，两者都不会这么极端）
+        if angle < RECOG_TIP_MIN_ANGLE_DEG and \
+                thickness_ratio < RECOG_TIP_MIN_THICKNESS:
+            # The radial sample can cross a finger gap. Rescue only a long
+            # local shaft with opposing sides that do not markedly taper.
+            shaft = FG._measure_tip(contour, points[index],
+                                    np.asarray(palm_center, dtype=float),
+                                    np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG)
+            if not (shaft["width_r"] >= 2.0 * RECOG_TIP_MIN_THICKNESS and
+                    shaft["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r and
+                    shaft["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max and
+                    shaft["shaft_width_ratio"] <=
+                    FG.DEFAULT_CONFIG.base_width_factor):
                 continue
+        # ★主力判据：凸出长度。真手指是细长凸出，指节凸起是圆钝鼓包。
+        #   这一条同时管住了两头 —— 既排掉拳头的指节凸起，又保住很短的小指。
         protrusion = _protrusion_length(thickness, points[index], palm_center, radius)
         closed = protrusion < float(RECOG_TIP_PROTRUSION_MIN)
         if closed and closed_candidates is None:
             continue
-        candidates.append(
-            {
-                "closed_support": closed,
-                "point": points[index].copy(),
-                "local": (float(local_points[index, 0]), float(local_points[index, 1])),
-                "distance": float(distances[index]),
-                "turn_ratio": float(ratio),
-                "angle_deg": float(angle),
-                "thickness_ratio": float(thickness_ratio),
-                "protrusion_ratio": float(protrusion),
-            }
-        )
+        candidates.append({
+            "closed_support": closed,
+            "point": points[index].copy(),
+            "local": (float(local_points[index, 0]), float(local_points[index, 1])),
+            "distance": float(distances[index]),
+            "turn_ratio": float(ratio),
+            "angle_deg": float(angle),
+            "thickness_ratio": float(thickness_ratio),
+            "protrusion_ratio": float(protrusion),
+        })
 
+    # Keep the original strong-tip ranking independent of closed caps. A
+    # knuckle cannot displace a real tip or change the extended-finger count.
     def merge(items):
         items = sorted(items, key=lambda item: -item["distance"])
         merged = []
         for item in items:
-            if any(
-                (
-                    float(np.linalg.norm(item["point"] - kept["point"]))
-                    < RECOG_TIP_DEDUP * float(radius)
-                    for kept in merged
-                )
-            ):
+            if any(float(np.linalg.norm(item["point"] - kept["point"]))
+                   < RECOG_TIP_DEDUP * float(radius) for kept in merged):
                 continue
             merged.append(item)
             if len(merged) >= int(RECOG_TIP_MAX_COUNT):
@@ -894,31 +983,28 @@ def _detect_fingertips(
     strong = merge([item for item in candidates if not item["closed_support"]])
     if closed_candidates is not None:
         caps = [item for item in merge(candidates) if item["closed_support"]]
-        promoted, remaining = ([], [])
+        promoted, remaining = [], []
         for cap in caps:
-            if any(
-                (
-                    float(np.linalg.norm(cap["point"] - tip["point"]))
-                    < RECOG_TIP_DEDUP * float(radius)
-                    for tip in strong
-                )
-            ):
+            # The mixed candidate merge can prefer a farther closed cap over
+            # a nearby strong tip. Keep the strong observation and avoid
+            # counting that same local contour cap again after promotion.
+            if any(float(np.linalg.norm(cap["point"] - tip["point"])) <
+                   RECOG_TIP_DEDUP * float(radius) for tip in strong):
                 continue
-            feature = FG._measure_tip(
-                contour,
-                np.asarray(cap["point"], dtype=float),
-                np.asarray(palm_center, dtype=float),
-                np.asarray(up, dtype=float),
-                radius,
-                FG.DEFAULT_CONFIG,
-            )
-            if (
-                feature["extended"]
-                and feature["has_branch_extent"]
-                and (feature["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r)
-                and (feature["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max)
-            ):
-                promoted.append(dict(cap, closed_support=False, promotion="contour_shaft_extent"))
+            feature = FG._measure_tip(contour, np.asarray(cap["point"], dtype=float),
+                                      np.asarray(palm_center, dtype=float),
+                                      np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG)
+            # Radial reach can underestimate a spread little finger. Require
+            # a real narrow shaft spanning the full existing axis window;
+            # aspect alone would also accept a tiny, needle-like mask burr.
+            if (feature["extended"] and feature["has_branch_extent"] and
+                    feature["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r and
+                    (feature["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max or
+                     FG._is_lateral_thumb_branch(
+                         feature, np.asarray(palm_center, dtype=float),
+                         np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG))):
+                promoted.append(dict(cap, closed_support=False,
+                                     promotion="contour_shaft_extent"))
             else:
                 remaining.append(cap)
         if len(strong) + len(promoted) <= 5:
@@ -926,8 +1012,9 @@ def _detect_fingertips(
             strong.sort(key=lambda item: float(np.arctan2(item["local"][1], item["local"][0])))
             closed_candidates.extend(remaining)
         else:
+            # Conflicting evidence cannot introduce more anatomical fingers.
             closed_candidates.extend(caps)
-    return (strong, distances)
+    return strong, distances
 
 
 def _detect_gaps(contour, tips, palm_center, radius: float, up):
@@ -1044,7 +1131,8 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
     palm_center = segment_stats.get("palm_center")
     radius = segment_stats.get("palm_radius")
     if palm_center is None or not radius:
-        palm_center, radius = _estimate_palm_robust(mask)
+        palm_center, radius = _estimate_palm_robust(
+            mask, _board_valid_for_threshold(mask.shape, state))
         if float(radius) < float(RECON_MIN_RADIUS_PX):
             return None
     palm_center = np.array([float(palm_center[0]), float(palm_center[1])], dtype=np.float64)
