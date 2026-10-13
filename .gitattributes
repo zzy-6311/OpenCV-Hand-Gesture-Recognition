@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Bundle the videos as ordinary binary Git files, without line-ending conversion.
+*.mp4 binary

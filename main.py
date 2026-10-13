@@ -1,1480 +1,227 @@
-# -*- coding: utf-8 -*-
-"""视频处理骨架：视频/图像/摄像头输入 -> 插件式中间处理 -> 窗口显示。
-
-设计目标
---------
-把「输入 / 处理 / 显示」彻底解耦，中间的每一步都是一个可插拔的函数：
-
-    输入（单张图片 或 摄像头 2K）  ->  [插件 1] -> [插件 2] -> ...  ->  显示
-
-* 输入：用下面的 `SOURCE` 或命令行切换：
-    - ``"video"``（当前默认）：读取 data/test/test1.mp4，逐帧识别并循环播放。
-      空格暂停/继续，暂停后 n 单步，R 从头重播。
-    - ``"image"``：读磁盘上的单张图片，**在循环里反复处理同一张**，
-      方便一边看叠加结果一边开关插件、调参数。按 n / p 切换图片，按 R 重载。
-    - ``"camera"``：原来的摄像头路径（2K 采集），代码完整保留，随时切回去。
-* 处理：默认先自动定位背景板并裁剪，再估计手臂方向和转正。
-  板定位不确定时保留原画布，使用原 ROI 处理；r 键可手动覆盖。
-  想回到「先裁成 1280x720 再交给插件」的旧行为，把 `PLUGIN_FULL_RESOLUTION`
-  改成 False 即可。
-* 显示：窗口固定 1280x720（WINDOW_NORMAL 会把大图按比例缩放进窗口显示）。
-
-插件来源
---------
-1. 本文件内置的三个示例插件（镜像、ROI 框、FPS/信息叠加）；
-2. 同目录下的 `plugins.py`（如果存在）：里面定义 `register(api)`，用它拿到的
-   `api.add(name, func, enabled=...)` 注册任意多个处理函数。
-
-插件函数约定
-------------
-    def my_step(frame: np.ndarray, state: FrameState) -> np.ndarray | None
-
-* `frame`：**插件工作帧**。默认是原图整帧（当前 2560x1440），
-  若 `PLUGIN_FULL_RESOLUTION = False` 则是裁切后的 720p。
-  想知道本帧尺寸请读 `state.raw_size`，不要写死。
-  注意 `frame` 是一份**拷贝**，就地修改不会污染 `state.raw_frame`；
-* `state`：本帧的共享状态（帧号、时间、FPS、原始帧、裁切区域、运行时开关），
-  插件之间靠它传递数据和开关，不需要全局变量；
-* 返回 `None`：表示「本帧不处理/丢弃」，主循环会跳过后续插件与显示（用于省算力）。
-
-运行方式：执行 main.py。
-键位：q 退出，空格暂停/继续，d 显示信息叠加，m 镜像开关，f 全屏开关，
-      l 列出插件，r ROI限制 开关，b 自动裁板，7 查看定位；
-      视频：暂停后 n 单步、R 重播；图片：n 下一张、p 上一张、R 重载。
-"""
-
+"""Video only: read one frame, recognize it, display it, then read the next."""
 from __future__ import annotations
 
-import collections
-import importlib
-import os
+import argparse
+import math
+from pathlib import Path
 import re
 import sys
-import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from time import perf_counter
+
+sys.dont_write_bytecode = True
 
 import cv2
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# 配置区
-# ---------------------------------------------------------------------------
-
-# --- 素材目录 ---------------------------------------------------------------
-# 所有图片/视频素材都放在这个子目录里（相对本文件所在目录）。
-# 代码文件和素材分开，目录看起来清爽，也避免素材文件混进 git 之类的场景。
-#
-# ⚠️ 改了这个常量，下面 GESTURE_SAMPLES 和 IMAGE_FILES 里的文件名**不用动** ——
-#    解析路径时会统一拼上这个前缀（见 resolve_image_paths 的调用处）。
-#    写成 "" 就退回"素材和代码放同一个目录"的老做法。
-DATA_DIR = "data"
-
-# --- 输入源 -----------------------------------------------------------------
-# "image"  = 读磁盘单张图片，循环反复处理（调算法时用这个）
-# "camera" = 摄像头实时采集
-# "video"  = 读磁盘上的**视频文件**（走和摄像头同一条 cv2.VideoCapture 路径，
-#            区别只在"读到结尾怎么办"，见下面的 VIDEO_LOOP）
-SOURCE = "video"
-
-# --- 视频文件模式（SOURCE = "video" 时生效）---------------------------------
-# 默认读取用户提供的独立测试视频；这里只配置路径，不读取答案或调整算法。
-VIDEO_FILE = "test1.mp4"               # 相对 VIDEO_DATA_DIR；也可写绝对路径
-VIDEO_DATA_DIR = "data/test"           # 与照片素材目录 DATA_DIR 独立
-VIDEO_LOOP = True                      # True = 播完从头循环；False = 播完自动退出
-# 逐帧读入 -> 完整计算 -> 显示当前帧结果 -> 停留 -> 再读下一帧。
-# 停留时间从结果显示后计起，不扣除计算耗时；视频不使用上一帧稳定结果覆盖。
-VIDEO_FRAME_HOLD_MS = 0              # 每帧结果显示后的停留毫秒数，可调大以便观察
-# 空格暂停/继续，暂停后 n 前进一步，R 从头重播（保留暂停状态）。
-
-# --- 手势素材数据集 ---------------------------------------------------------
-# 中国式数字手势素材。目前有**三组**（同一个手势在不同背景/光照下各拍一次）：
-#   第一组  gesture_<NN>.jpg        白板干净背景、明亮白光、横幅
-#   第二组  gesture_<NN>_busy.jpg   斑驳桌面背景、明亮、横幅（手离镜头更近）
-#   第三组  gesture_<NN>_s3.jpg     印花床单背景 + 暗暖光、竖幅、手在画面左侧
-# 三组放在同一行，方便直接对比"换背景/换光照之后算法有没有受影响"。
-# 按 n / p 浏览时会三组依次出现（00 → 00_busy → 00_s3 → 01 → …），正好对着看。
-#
-# 每项是 (手势标签, 这个手势是怎么比的, 样张文件名元组)。
-#
-# ★ 标签沿用你拍照时的编号，没改 —— 它**直接当分类结果用**。
-#   ⚠️ 标签不一定是数字：不是数字手势的（比如 "ye"）就写个短名字，
-#      classify_gesture() 返回什么标签，这里就写什么。
-# ★ 第 2 列（手势说明）是我**按照片实际内容**写的。如果和你的本意不符，
-#   只改文字就行，文件名不用动。
-# ★ 加新样张：在对应手势的元组里追加文件名即可，命名沿用
-#   gesture_<编号>[_<场景>].jpg（编号可以是数字，也可以是短名字，如 gesture_ye.jpg）。
-#
-# ★ 编号 3/33 和 6/66 分别是**同一个数字的两种比法**，编号不同但分类结果相同：
-#      3   = 食指 + 中指 + 无名指（拇指收在掌前）
-#      33  = 拇指 + 食指 + 中指（最左边那根是拇指）        -> 也判 3
-#      6   = 点赞，只伸拇指
-#      66  = 拇指 + 小指（"六"的另一种比法）              -> 也判 6
-#    分类器的主判据是"伸出手指的根数"，所以两种比法**自然归成一类、不用写特例**。
-#    想合并成一行，把 33 / 66 的条目并到 3 / 6 的元组里即可。
-#
-# （第二组最初把"8"的文件名误写成了 7.jpg，已按你确认改为 gesture_08_busy.jpg。）
-#
-# ⚠️ 第三组的 gesture_01_s3.jpg（真值 1）已移到 ./不能识别/ 目录，**故意不加载**：
-#    它会把"只伸食指"误判成 2，原因是床单上的粉色花纹紧贴食指、颜色和肤色撞车，
-#    在掩膜里和手指连成一片、多出一个假指尖。详见 不能识别/说明.txt。
-GESTURE_SAMPLES = (
-    (0,  "握拳",                  ("gesture_00.jpg", "gesture_00_busy.jpg", "gesture_00_s3.jpg")),
-    (1,  "只伸食指",              ("gesture_01.jpg", "gesture_01_busy.jpg")),
-    (2,  "食指+中指（剪刀）",      ("gesture_02.jpg", "gesture_02_busy.jpg", "gesture_02_s3.jpg")),
-    (3,  "三指（西式：食+中+无名）", ("gesture_03.jpg", "gesture_03_busy.jpg", "gesture_03_s3.jpg")),
-    (4,  "四指",                  ("gesture_04.jpg", "gesture_04_busy.jpg", "gesture_04_s3.jpg")),
-    (5,  "五指张开",              ("gesture_05.jpg", "gesture_05_busy.jpg", "gesture_05_s3.jpg")),
-    (6,  "点赞（只伸拇指）",       ("gesture_06.jpg", "gesture_06_busy.jpg", "gesture_06_s3.jpg")),
-    (8,  "手枪（拇指+食指）",      ("gesture_08.jpg", "gesture_08_busy.jpg", "gesture_08_s3.jpg")),
-    (33, "三指（中式：拇+食+中）",  ("gesture_33.jpg", "gesture_33_busy.jpg", "gesture_33_s3.jpg")),
-    (66, "六（拇指+小指）",        ("gesture_66_s3.jpg",)),
-    ("ye", "耶（食指+小指+拇指）",  ("gesture_ye.jpg",)),
-)
-
-# ===========================================================================
-#  ★★ 第四批素材：FPGA 摄像头实拍（2026-10-08，40 张）★★
-# ===========================================================================
-# 特点（和前三批很不一样）：
-#   · **1280x720 横幅**，来自 FPGA 驱动的摄像头。
-#     JSON 参数 40 张**完全相同**：RGB888 / BGGR / 曝光 1900 / 增益 125 / 无手动白平衡
-#   · **颜色比手机拍的偏暗**（图像均值 100~117，前三批是 110~210）
-#   · **手在画面里占比很大**（离镜头近）-> 所以 ROI 限制默认关掉（见 plugins.py）
-#   · 斜视角、灰板背景，手从画面右侧伸入
-#
-# 原批次 29 张标准照片按拍摄顺序命名，位于 data/new。
-# 后续开发照片也放在 data/new，主程序动态枚举，不限制为原来的 29 张。
-# 真值表供独立评测及最终显示核对；编号和答案不进入预处理或识别计算。
-CAMERA_SHOT_DIR = "new"               # 相对 data；当前开发素材
-# ★ 29 张【标准】照片（掩膜里 5 根手指都看得见、不重叠）★
-#   另有 10 张"不太标准"的（手指有重叠/遮挡）已挪到旧数据目录：
-#       data/不标准/nonstd_01.png ... nonstd_10.png
-#       真值和对照表也保存在 data/不标准/，通过 image nonstd 单独浏览。
-CAMERA_SHOTS = tuple("shot_%02d.png" % i for i in range(1, 30))
-CAMERA_SAMPLES = tuple((i, "标准 %02d" % i, (name,))
-                       for i, name in enumerate(CAMERA_SHOTS, 1))
-
-# 前三批（手机拍的）保留在变量里，命令行给 "old" 时用它
-_OLD_GESTURE_SAMPLES = GESTURE_SAMPLES
-
-# ---- 用哪一批素材？--------------------------------------------------------
-#   "old"    = 前三批（gesture_*.jpg + shou1/2.png，DATA_DIR="data/old"）
-#   "new"    = 当前开发素材（默认，DATA_DIR="data/new"）；camera 为兼容入口。
-#   "test"   = 留出测试集，显式选择；不用于开发调参。
-#   ⚠️ 命令行也能直接切：python main.py image old   /   python main.py image camera
-ACTIVE_MATERIAL = "new"
-
-if ACTIVE_MATERIAL == "camera":
-    DATA_DIR = "data/" + CAMERA_SHOT_DIR
-    GESTURE_SAMPLES = CAMERA_SAMPLES
-elif ACTIVE_MATERIAL in ("new", "test"):
-    DATA_DIR = "data/" + ACTIVE_MATERIAL
-    GESTURE_SAMPLES = ()               # 文件列表稍后枚举；答案不进入识别程序
-else:
-    DATA_DIR = "data/old"
-
-# 图片模式下要处理的图片（相对 DATA_DIR）。按 n / p 在列表里循环切换。
-# 直接由上面的素材表展平而来 —— 只有一处需要维护，加素材只改素材表。
-# "old" 那批里额外带上：
-#   · shou1/shou2（布背景、五指张开）—— 留着当"难例"做对比
-OLD_EXTRA_FILES = ["shou1.png", "shou2.png"]
-IMAGE_FILES = (
-    [name for _label, _desc, names in GESTURE_SAMPLES for name in names]
-    + (OLD_EXTRA_FILES if ACTIVE_MATERIAL == "old" else [])
-)
-IMAGE_START_INDEX = 0                  # 启动时先用列表里的第几张（从 0 开始）
-
-# --- 插件工作分辨率 ---------------------------------------------------------
-# True  = 把原图整帧交给插件（不裁切、不缩放），细节保留最好
-# False = 沿用旧行为：先按显示比例裁切并缩放到 DISPLAY_WIDTH x DISPLAY_HEIGHT
-PLUGIN_FULL_RESOLUTION = True
-
-# --- 循环节流 ---------------------------------------------------------------
-# 图片模式下一帧处理很快，不加节流会空转烧 CPU。这个值同时决定按键响应速度。
-FRAME_DELAY_MS_IMAGE = 30              # 图片模式：约 33 次/秒
-FRAME_DELAY_MS_CAMERA = 1              # 摄像头模式：只要能泵事件即可
-
-CAMERA_INDEX = 0
-
-CAPTURE_WIDTH = 2560                   # 期望采集宽度（2K）
-CAPTURE_HEIGHT = 1440                  # 期望采集高度（2K）
-CAPTURE_FPS = 30.0
-
-# --- 图片载入时的降采样（"压到 2K"）------------------------------------------
-# 相机/手机的原图往往 4000x3000 以上，整条链直接跑会很慢：
-#   实测 4096x3072 要 360~470 ms/帧，而 2560x1440 只要 ~139 ms。
-# 这里在**载入的时候压一次**，之后每帧都直接用压好的小图，不会重复计算。
-#
-# 规则：按 (IMAGE_MAX_WIDTH, IMAGE_MAX_HEIGHT) 装框，**保持宽高比**，只缩不放。
-#   4096x3072 -> 1920x1440    （4:3 装进 16:9 的框，受高度限制）
-#   2560x1440 -> 原样不动      （本来就在框内）
-# 所以老的 shou1/shou2.png 不受影响。
-#
-# ★★ 注意：这个降采样**只作用于图片模式** ★★
-#    视频 / 摄像头那条路径走的是 cv2.VideoCapture，**完全不经过这里** ——
-#    所以要单独用下面的 VIDEO_MAX_LONG_SIDE 限一下（见那里的说明）。
-#
-# 想改大小就改这两个数（比如两个都乘 2 就回到全分辨率）。
-IMAGE_MAX_WIDTH = 2560
-IMAGE_MAX_HEIGHT = 1440
-
-# --- ★★ 视频 / 摄像头帧的长边上限（像素）。0 = 不限制 ★★ ---------------------
-# ⚠️ 为什么必须有这个：图片模式的降采样**只在 ImageSource.load() 里做**，
-#    视频/摄像头这条路径（cv2.VideoCapture）**完全不经过它** ✗
-#    所以以前 1080x1920 的视频是整幅 **2.07 Mpx** 进流水线的。
-#
-# 实测（1080x1920 竖幅，完整链，模式 6）耗时分布：
-#     色彩阈值      8.8 ms
-#     掩膜清理     16.2 ms
-#     **掌心重建   85.6 ms  ← 占 62%，瓶颈就是它**
-#     识别骨架     16.5 ms
-#     画图 + ROI    4.0 ms
-#     合计        137 ms
-#   瓶颈按像素数线性涨，所以**降采样是最划算的一刀**：
-#     不限制 -> 1080x1920 = 2.07 Mpx -> 137 ms（7.3 fps）
-#     长边 1280 ->  720x1280 = 0.92 Mpx ->  约 50 ms（20 fps）
-#     长边  960 ->  540x960  = 0.52 Mpx ->  约 29 ms（34 fps）
-#
-# ⚠️ 1280 的取值理由：掌心半径 R 在 720x1280 下约 113 px，
-#    而指尖/指缝这些几何判据都是**按 R 归一化**的，113 px 足够稳 ✓
-#    再小就要重新验证精度了（改完记得跑 28 张静态图回归）。
-VIDEO_MAX_LONG_SIDE = 1280
-
-DISPLAY_WIDTH = 1280                   # 显示窗口宽度（720p）
-DISPLAY_HEIGHT = 720                   # 显示窗口高度（720p）
-
-# --- 显示适配（★ 必须自己做，不能交给 cv2.imshow）----------------------------
-# ⚠️ 踩过的坑：窗口客户区固定是 DISPLAY_WIDTH x DISPLAY_HEIGHT，而
-#    **cv2.imshow 会把画面拉满整个窗口**。素材宽高比五花八门
-#    （4:3 横幅 / 9:16 竖幅 / 16:9），直接丢给 imshow 就会被**非等比拉伸**：
-#      实测 810x1440 的竖幅素材在 1280x720 的窗口里被横向拉满，手明显变扁。
-#
-#    一开始以为 WINDOW_NORMAL 会保持宽高比（它的常量值确实和 WINDOW_KEEPRATIO
-#    相同，都是 0），但**后端实际并不保证** —— 实测就是拉满了。
-#    所以**不要依赖 imshow 的行为**。
-#
-# ★ 修法：先自己把画面**等比缩放**到能装进窗口，再**居中补黑边**凑满整块画布，
-#    然后才 imshow。这样无论什么宽高比都不会变形。
-DISPLAY_FIT = True                     # False = 退回老行为（直接丢给 imshow，会拉伸）
-DISPLAY_BG = (0, 0, 0)                 # 补边的颜色（BGR），黑边
-
-WINDOW_NAME = "video pipeline"
-
-MIRROR_DEFAULT = False                # ★ 默认不镜像
-#   ⚠️ 用户的要求：机械手是**右手**，拍的照片/视频也**全是右手**，所以**
-#      绝对不要自动镜像** —— 镜像会把左右手弄反，拇指和小指互换。
-#      （以前这里是 True，理由是"符合照镜子式交互习惯"，现在作废。）
-#      按 m 键仍可手动切换，但默认必须是关的。
-SHOW_OVERLAY_DEFAULT = True            # 默认显示 FPS / 分辨率等信息
-MAX_CONSECUTIVE_READ_FAILURES = 30     # 连续读不到帧多少次后退出
-
-# --- 显示模式（数字键切换）--------------------------------------------------
-# 每项是 (按键, 模式名, 这一模式下要启用的插件名)。
-# 按对应数字键时：列表里出现过的插件中，只启用本模式列出的那些，其余全部关掉。
-#
-# 六种模式是**递进**的：
-#     1 原图       -> 一个处理插件都不开，画面就是原始帧
-#     2 掩膜       -> 只开颜色阈值，看到的是原始二值掩膜
-#     3 清理后     -> 再开清理层（开运算 + 面积过滤 + 填洞）
-#     4 掌心重建   -> 再开重建层（从掌心核心做颜色约束重建）
-#     5 识别(掩膜) -> 再开识别骨架，并把结果画在掩膜上
-#     6 识别(原图) -> 识别骨架，结果画在原图上（同一份结果，只是底图不同）
-#
-# 想加新模式：在 plugins.py 注册插件，然后在这里追加一项、分配一个没被占用的
-# 按键即可，主循环不用改。
-#
-# ⚠️ 这里的开关只作用于列表里出现的这些"处理类"插件；
-#    ROI 边界、信息叠加这些绘制类插件不受影响，任何模式下都照常工作。
-VIEW_MODES = (
-    (ord("1"), "原图",       ()),
-    (ord("2"), "掩膜",       ("color_threshold",)),
-    (ord("3"), "清理后",     ("color_threshold", "mask_cleanup")),
-    (ord("4"), "掌心重建",   ("color_threshold", "mask_cleanup", "palm_reconstruct")),
-    (ord("5"), "识别(掩膜)", ("color_threshold", "mask_cleanup", "palm_reconstruct",
-                              "hand_recognize", "recognize_on_mask")),
-    (ord("6"), "识别(原图)", ("color_threshold", "mask_cleanup", "palm_reconstruct",
-                              "hand_recognize", "recognize_on_original")),
-    (ord("7"), "背景板定位", ("board_preview",)),
-)
-
-# 默认模式（索引，5 = VIEW_MODES 里的第六项「识别(原图)」）
-VIEW_MODE_DEFAULT = 5
-
-# 每个显示模式下"画面里是不是掩膜"。决定要不要做触边检查 + ROI 外擦黑 ——
-# 模式 1（原图）和模式 6（原图+标注）都不是掩膜，不能把 ROI 外擦黑。
-VIEW_MODE_HAS_MASK = (False, True, True, True, True, False, False)
+from recognizer import draw_text_lines, recognize, render_result
 
 
-# ---------------------------------------------------------------------------
-# 每帧共享状态：插件之间靠它传递数据与开关
-# ---------------------------------------------------------------------------
-@dataclass
-class FrameState:
-    """一帧在流水线中流转时携带的状态。
+DEFAULT_VIDEO = Path(__file__).resolve().parent / "data/test"
+VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".webm", ".mts"}
+WINDOW_NAME = "Finger recognition - video"
+FRAME_HOLD_MS = 0  # Additional minimum display time, after this frame is recognized.
+NEXT_KEYS = {ord("n"), ord("N"), 0x270000, 65363, 16777236}
+PREVIOUS_KEYS = {ord("p"), ord("P"), 0x250000, 65361, 16777234}
 
-    字段说明：
-      index         当前帧序号（从 0 开始）
-      time          本帧开始处理的时刻，time.perf_counter()
-      dt            与上一帧的间隔（秒），第一帧为 0
-      fps           平滑后的实时帧率
-      raw_frame     采集到的原始帧（通常 2K），只读参考，不要就地改
-      raw_size      原始帧尺寸 (宽, 高)
-      display_size  显示尺寸 (宽, 高)
-      crop          本帧从原始帧裁切出的区域 (x, y, w, h)
-      mirror        当前是否水平镜像
-      show_overlay  当前是否绘制信息叠加
-      paused        主循环是否处于暂停状态
-      plugins       已注册插件的名字列表（只读，便于插件了解自身位置）
-      flags         插件自由使用的字典，用于自定义开关，例如 flags["roi"] = True
+
+def collect_videos(path: Path) -> tuple[list[Path], int]:
+    """Sort sibling videos naturally; an explicit file selects the starting clip."""
+    path = Path(path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Video or folder does not exist: {path}")
+    folder = path if path.is_dir() else path.parent
+    videos = [item for item in folder.iterdir()
+              if item.is_file() and item.suffix.lower() in VIDEO_SUFFIXES]
+    if path.is_file() and path not in videos:
+        raise ValueError(f"Unsupported video extension: {path.suffix}")
+    videos.sort(key=lambda item: [int(part) if part.isdigit() else part.casefold()
+                                 for part in re.split(r"(\d+)", item.name)])
+    if not videos:
+        raise ValueError(f"No videos found in: {folder}")
+    return videos, 0 if path.is_dir() else videos.index(path)
+
+
+def _positive_number(value: float, fallback: float) -> float:
+    return value if math.isfinite(value) and value > 0 else fallback
+
+
+def _player_view(canvas: np.ndarray, videos: list[Path], index: int,
+                 frame_no: int, frame_count: int, paused: bool,
+                 error: str) -> np.ndarray:
+    """Add a small player footer without covering the recognition overlay."""
+    height, width = canvas.shape[:2]
+    scale = min(1280 / width, 710 / height, 1.0)
+    if scale < 1:
+        canvas = cv2.resize(canvas, (max(1, round(width * scale)),
+                                    max(1, round(height * scale))),
+                            interpolation=cv2.INTER_AREA)
+    footer_height = 90 if error else 58
+    shown = cv2.copyMakeBorder(canvas, 0, footer_height,
+                              0, max(0, 860 - canvas.shape[1]),
+                              cv2.BORDER_CONSTANT, value=(25, 25, 25))
+    top = canvas.shape[0]
+    total = str(frame_count) if frame_count else "?"
+    status = "已停止" if error else "已暂停" if paused else "播放中"
+    lines = [f"{index + 1}/{len(videos)}  {videos[index].name}  "
+             f"帧 {frame_no}/{total}  {status}  | 循环当前视频",
+             "N/右箭头 下一视频   P/左箭头 上一视频   空格 暂停   R 重播   H 详情   Q/Esc 退出"]
+    if error:
+        lines.append(f"{error}  | Press N/P/R or Q.")
+    draw_text_lines(shown,
+                    [(line, 16, (90, 120, 255) if row == 2 else (230, 230, 230))
+                     for row, line in enumerate(lines)],
+                    (10, top + 6))
+    return shown
+
+
+def play_videos(videos: list[Path], index: int = 0, *, recognize_frame=None,
+                render_frame=None, capture_factory=None, clock=perf_counter) -> int:
+    """Sequential playback. EOF repeats this clip; only N/P selects another clip.
+
+    The callbacks/factory permit testing playback without a GUI or video decoder.
+    Pausing and toggling details reuse the last result; they never run inference.
+    Decode/inference errors freeze this clip for inspection and manual navigation.
     """
-
-    index: int = 0
-    time: float = 0.0
-    dt: float = 0.0
-    fps: float = 0.0
-    raw_frame: Optional[np.ndarray] = None
-    raw_size: tuple[int, int] = (0, 0)
-    display_size: tuple[int, int] = (DISPLAY_WIDTH, DISPLAY_HEIGHT)
-    crop: tuple[int, int, int, int] = (0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT)
-    mirror: bool = MIRROR_DEFAULT
-    show_overlay: bool = SHOW_OVERLAY_DEFAULT
-    paused: bool = False
-    plugins: tuple[str, ...] = ()
-    flags: dict[str, Any] = field(default_factory=dict)
-
-
-# 插件函数签名：输入 (720p 帧, 状态)，输出处理后的帧或 None
-PluginFunc = Callable[[np.ndarray, FrameState], Optional[np.ndarray]]
-
-
-class PluginRegistry:
-    """有序插件表：注册、启停、按顺序执行。"""
-
-    def __init__(self) -> None:
-        self._items: list[list[Any]] = []          # [name, func, enabled]
-
-    def add(self, name: str, func: PluginFunc, enabled: bool = True) -> None:
-        """注册一个处理函数；同名会覆盖原来的函数，保持原有顺序。"""
-        for item in self._items:
-            if item[0] == name:
-                item[1] = func
-                item[2] = bool(enabled)
-                return
-        self._items.append([name, func, bool(enabled)])
-
-    def remove(self, name: str) -> None:
-        """按名字移除插件。"""
-        self._items = [item for item in self._items if item[0] != name]
-
-    def enable(self, name: str, enabled: bool) -> None:
-        """开启或关闭某个插件，运行中可以随时切换。"""
-        for item in self._items:
-            if item[0] == name:
-                item[2] = bool(enabled)
-                return
-
-    def names(self) -> tuple[str, ...]:
-        """返回全部插件名（含被关闭的），顺序即执行顺序。"""
-        return tuple(item[0] for item in self._items)
-
-    def enabled_names(self) -> list[str]:
-        """返回当前开启的插件名。"""
-        return [item[0] for item in self._items if item[2]]
-
-    def run(self, frame: np.ndarray, state: FrameState, *, strict: bool = False) -> Optional[np.ndarray]:
-        """按顺序执行所有已启用插件；任一插件返回 None 则整条流水线短路。"""
-        current: Optional[np.ndarray] = frame
-        for name, func, enabled in self._items:
-            if not enabled or current is None:
-                continue
-            try:
-                result = func(current, state)
-            except Exception as error:  # 单个插件出错不应该让整个程序崩掉
-                if strict:
-                    raise RuntimeError("Plugin %s failed" % name) from error
-                print("[plugin:%s] 处理失败：%s: %s" % (name, type(error).__name__, error))
-                continue
-            if result is None:
-                print("[plugin:%s] 丢弃本帧" % name)
-                return None
-            current = result
-        return current
-
-
-# ---------------------------------------------------------------------------
-# 图片输入：读单张图，循环反复交给流水线（用于算法调试）
-# ---------------------------------------------------------------------------
-def fit_within(image: np.ndarray, max_width: int, max_height: int) -> np.ndarray:
-    """把图片按比例缩到 (max_width, max_height) 这个框内。只缩不放。
-
-    **保持宽高比**（这一点很重要）：绝对不能用 cv2.resize 直接拉到固定尺寸，
-    那样会把 4:3 的图压成 16:9，手部被非等比拉伸，后面所有"按 R 归一化"的
-    长度判据都会失真。
-
-    用 INTER_AREA 而不是默认的 INTER_LINEAR：缩小时 INTER_AREA 是抗混叠的，
-    等价于先低通再抽取，不会在掩膜上产生锯齿/摩尔纹。
-    """
-    height, width = image.shape[:2]
-    if width <= 0 or height <= 0:
-        return image
-    scale = min(float(max_width) / float(width), float(max_height) / float(height))
-    if scale >= 1.0:                      # 本来就在框内，原样返回
-        return image
-    new_width = max(1, int(round(width * scale)))
-    new_height = max(1, int(round(height * scale)))
-    return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
-
-
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-
-
-def image_sort_key(name: str) -> list:
-    """Natural filename order for browsing; filenames carry no recognition input."""
-    return [int(part) if part.isdigit() else part.casefold()
-            for part in re.split(r"(\d+)", name)]
-
-
-def image_filenames(folder: str) -> list[str]:
-    """List immediate photo files only; never load labels or image contents."""
-    if not os.path.isdir(folder):
-        return []
-    return sorted((name for name in os.listdir(folder)
-                   if os.path.isfile(os.path.join(folder, name))
-                   and os.path.splitext(name)[1].lower() in IMAGE_SUFFIXES),
-                  key=image_sort_key)
-
-
-# 默认开发素材按目录内容枚举，不把文件名或正确答案写进算法。
-if ACTIVE_MATERIAL in ("new", "test", "camera"):
-    IMAGE_FILES = image_filenames(os.path.join(os.path.dirname(os.path.abspath(__file__)), DATA_DIR))
-
-
-def read_image(path: str) -> Optional[np.ndarray]:
-    """Decode images using Unicode-safe Windows file I/O."""
-    try:
-        encoded = np.fromfile(path, dtype=np.uint8)
-        return cv2.imdecode(encoded, cv2.IMREAD_COLOR) if encoded.size else None
-    except (OSError, ValueError, cv2.error):
-        return None
-
-
-class ImageSource:
-    """把磁盘上的图片伪装成"视频源"，接口与 ``cv2.VideoCapture`` 对齐。
-
-    设计要点：
-
-    * ``read()`` **每次返回一份拷贝**。因为插件约定里允许"就地修改 frame"，
-      如果反复交出同一个数组，第一帧画上去的叠加层会残留在第二帧上、
-      镜像插件会把上一次的结果再翻一次 —— 所以必须拷贝。
-    * 读不到文件时**保留上一张好图**并记下原因，避免突然黑屏，
-      让使用者还有机会按 R 重载或按 n 换一张。
-    """
-
-    def __init__(self, paths: list[str], start_index: int = 0) -> None:
-        self.paths = list(paths)
-        self.index = int(start_index) % len(self.paths) if self.paths else 0
-        self.frame: Optional[np.ndarray] = None
-        self.loaded_path: Optional[str] = None
-        self.message = ""
-        if self.paths:
-            self.load()
-
-    # --- 查询 ---
-    @property
-    def current_path(self) -> str:
-        return self.paths[self.index] if self.paths else ""
-
-    @property
-    def current_name(self) -> str:
-        return os.path.basename(self.current_path) if self.current_path else "(无)"
-
-    def position_text(self) -> str:
-        """形如 ``shou1.png (1/2)``，给信息面板用。"""
-        if not self.paths:
-            return "(无图片)"
-        return "%s (%d/%d)" % (self.current_name, self.index + 1, len(self.paths))
-
-    # --- 载入 ---
-    def load(self, path: Optional[str] = None) -> bool:
-        """载入指定图片（默认当前张），并按 IMAGE_MAX_* 压到 2K。成功返回 True。"""
-        target = path if path is not None else self.current_path
-        if not target:
-            self.message = "没有可用的图片路径"
-            return False
-
-        image = read_image(target)
-        if image is None or image.size == 0:
-            self.message = "读不到图片：%s" % target
-            return False
-
-        original_h, original_w = image.shape[:2]
-        image = fit_within(image, IMAGE_MAX_WIDTH, IMAGE_MAX_HEIGHT)
-
-        self.frame = image
-        self.loaded_path = target
-        if (image.shape[1], image.shape[0]) != (original_w, original_h):
-            self.message = "已载入 %s  %dx%d -> 压到 %dx%d" % (
-                os.path.basename(target), original_w, original_h,
-                image.shape[1], image.shape[0])
-        else:
-            self.message = "已载入 %s  %dx%d" % (
-                os.path.basename(target), image.shape[1], image.shape[0])
-        return True
-
-    # --- 与 VideoCapture 对齐的接口 ---
-    def read(self) -> tuple[bool, Optional[np.ndarray]]:
-        """返回 ``(ok, frame)``；frame 是拷贝，随便插件怎么改。"""
-        if self.frame is None:
-            return False, None
-        return True, self.frame.copy()
-
-    def release(self) -> None:
-        self.frame = None
-
-    # --- 切换 ---
-    def step(self, delta: int) -> bool:
-        """在图片列表里前后切换（delta = +1 / -1），到头就绕回。"""
-        if len(self.paths) <= 1:
-            self.message = "列表里只有一张图，没有可切换的" if self.paths else "没有可用图片"
-            return False
-        self.index = (self.index + int(delta)) % len(self.paths)
-        return self.load()
-
-    def reload(self) -> bool:
-        """从磁盘重新读当前张（改了图不用重启程序）。"""
-        return self.load()
-
-
-def resolve_image_paths(names: list[str], base_dir: str) -> list[str]:
-    """把配置里的文件名解析成绝对路径，并报告缺失的文件。"""
-    found: list[str] = []
-    missing: list[str] = []
-    for name in names:
-        path = name if os.path.isabs(name) else os.path.join(base_dir, name)
-        if os.path.isfile(path):
-            found.append(path)
-        else:
-            missing.append(name)
-    if missing:
-        print("[image] 跳过不存在的图片：%s" % "、".join(missing))
-    return found
-
-
-# ---------------------------------------------------------------------------
-# 采集：优先 2K，拿不到就退而求其次
-# ---------------------------------------------------------------------------
-def resolve_video_path(filename: str) -> str:
-    """Resolve videos relative to this project, independent of photo selection/CWD."""
-    if os.path.isabs(filename):
-        return filename
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), VIDEO_DATA_DIR, filename)
-
-
-def _try_open(index: int, backend: Optional[int], width: int, height: int,
-              fps: float) -> Optional[cv2.VideoCapture]:
-    """尝试用指定后端打开摄像头并读取一帧；失败返回 None。"""
-    cap = cv2.VideoCapture(index) if backend is None else cv2.VideoCapture(index, backend)
-    if cap is None or not cap.isOpened():
-        if cap is not None:
-            cap.release()
-        return None
-    try:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
-        cap.set(cv2.CAP_PROP_FPS, float(fps))
-    except Exception:
-        pass
-    ok, frame = cap.read()
-    if not ok or frame is None or frame.size == 0:
-        cap.release()
-        return None
-    return cap
-
-
-def open_camera(index: int = CAMERA_INDEX,
-                width: int = CAPTURE_WIDTH,
-                height: int = CAPTURE_HEIGHT,
-                fps: float = CAPTURE_FPS) -> cv2.VideoCapture:
-    """打开摄像头并尽量配置成给定分辨率。
-
-    输出：可用的 ``cv2.VideoCapture``。
-    失败：所有后端都拿不到有效帧时抛出 ``RuntimeError``。
-    """
-    backends = [(cv2.CAP_DSHOW, "DirectShow"), (cv2.CAP_MSMF, "MediaFoundation"),
-                (None, "默认后端")]
-    problems: list[str] = []
-    for backend, label in backends:
-        cap = _try_open(index, backend, width, height, fps)
-        if cap is None:
-            problems.append(label)
-            continue
-        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        print("[camera] 已打开（%s）实际分辨率 %dx%d @ %.1f fps"
-              % (label, actual_w, actual_h, actual_fps))
-        if actual_w < width or actual_h < height:
-            print("[camera] 注意：摄像头没有提供 %dx%d，实际只有 %dx%d，"
-                  "显示会按实际画面裁切" % (width, height, actual_w, actual_h))
-        return cap
-
-    raise RuntimeError("摄像头 index=%d 打不开或读不到画面（尝试过后端：%s）"
-                       % (index, "、".join(problems)))
-
-
-def compute_crop(raw_size: tuple[int, int],
-                 display_size: tuple[int, int] = (DISPLAY_WIDTH, DISPLAY_HEIGHT),
-                 anchor: tuple[float, float] = (0.5, 0.5)) -> tuple[int, int, int, int]:
-    """按显示宽高比从原始画面中裁出最大区域，返回 ``(x, y, 宽, 高)``。
-
-    ``anchor`` 是裁切窗口在原始画面中的相对位置，(0.5, 0.5) 表示居中；
-    后续做手部跟踪时，把它往左上/右下挪就能让 ROI 跟着手移动。
-    """
-    raw_w, raw_h = int(raw_size[0]), int(raw_size[1])
-    disp_w, disp_h = int(display_size[0]), int(display_size[1])
-    if raw_w <= 0 or raw_h <= 0:
-        return (0, 0, disp_w, disp_h)
-    target_ratio = disp_w / float(disp_h)
-    raw_ratio = raw_w / float(raw_h)
-    if raw_ratio >= target_ratio:          # 原始画面更宽：裁左右
-        crop_w = int(round(raw_h * target_ratio))
-        crop_h = raw_h
-    else:                                  # 原始画面更高：裁上下
-        crop_w = raw_w
-        crop_h = int(round(raw_w / target_ratio))
-    crop_w = max(1, min(crop_w, raw_w))
-    crop_h = max(1, min(crop_h, raw_h))
-    x = int(round((raw_w - crop_w) * float(anchor[0])))
-    y = int(round((raw_h - crop_h) * float(anchor[1])))
-    x = max(0, min(x, raw_w - crop_w))
-    y = max(0, min(y, raw_h - crop_h))
-    return (x, y, crop_w, crop_h)
-
-
-def crop_for_display(frame: np.ndarray,
-                     display_size: tuple[int, int] = (DISPLAY_WIDTH, DISPLAY_HEIGHT),
-                     anchor: tuple[float, float] = (0.5, 0.5)) -> np.ndarray:
-    """把原始帧裁切成显示尺寸；宽高比不一致时才做一次缩放兜底。"""
-    x, y, crop_w, crop_h = compute_crop(frame.shape[1::-1], display_size, anchor)
-    patch = frame[y:y + crop_h, x:x + crop_w]
-    disp_w, disp_h = int(display_size[0]), int(display_size[1])
-    if patch.shape[1] != disp_w or patch.shape[0] != disp_h:
-        patch = cv2.resize(patch, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
-    return np.ascontiguousarray(patch)
-
-
-# ---------------------------------------------------------------------------
-# 内置示例插件：演示「在这三行里插入任何处理」
-# ---------------------------------------------------------------------------
-def step_mirror(frame: np.ndarray, state: FrameState) -> np.ndarray:
-    """水平镜像，让画面像照镜子。"""
-    if state.mirror:
-        return cv2.flip(frame, 1)
-    return frame
-
-
-def step_roi_outline(frame: np.ndarray, state: FrameState) -> np.ndarray:
-    """画一个居中的 50%x80% 矩形 ROI，仅作示例；state.flags["roi"] 控制开关。"""
-    if not state.flags.get("roi", True):
-        return frame
-    height, width = frame.shape[:2]
-    x0 = int(width * 0.25)
-    y0 = int(height * 0.10)
-    x1 = int(width * 0.75)
-    y1 = int(height * 0.90)
-    cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 255), 2)
-    cv2.putText(frame, "ROI (example)", (x0 + 6, y0 + 26),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
-    return frame
-
-
-def _draw_shortcut_footer(frame: np.ndarray, hint: str) -> None:
-    """A single text pass on a dark strip avoids font-thickness advance differences."""
-    strip = frame[max(0, frame.shape[0] - 36):]
-    cv2.addWeighted(strip, 0.28, np.full_like(strip, 16), 0.72, 0.0, dst=strip)
-    cv2.putText(frame, hint, (12, frame.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX,
-                0.55, (235, 235, 235), 1, cv2.LINE_AA)
-
-
-def step_info_overlay(frame: np.ndarray, state: FrameState) -> np.ndarray:
-    """在**右上角**显示采集分辨率、显示分辨率、FPS、帧号与插件数量。
-
-    ⚠️ 原来画在左上角，会和插件里那块"手势分类"面板叠在一起（实测严重重叠）。
-       挪到右上角，两边各占一边，互不干扰。
-    """
-    if not state.show_overlay:
-        return frame
-    module = sys.modules.get("plugins")
-    debug = bool(getattr(module, "DISPLAY_DEBUG", False))
-    if not debug:
-        hint = ("n next | p previous | R reload | h details | 1-7 view | q quit"
-                if state.flags.get("still_image") else
-                "space pause | n step | R replay | h details | q quit")
-        _draw_shortcut_footer(frame, hint)
-        return frame
-    lines = [
-        "working %dx%d" % state.raw_size,
-        "display %dx%d" % state.display_size,
-        "fps %.1f" % state.fps,
-        ("frame %d / %s" % (state.flags["video_frame"] + 1,
-                            state.flags.get("video_frames") or "?")
-         if "video_frame" in state.flags else "frame %d" % state.index),
-        "plugins %d" % len(state.plugins),
-    ]
-    if "video_frame" in state.flags:
-        lines.append("per-frame | hold %d ms" % VIDEO_FRAME_HOLD_MS)
-    if state.paused:
-        lines.append("PAUSED")
-
-    height, width = frame.shape[:2]
-    scale = 0.6
-    thickness = 1
-    line_h = 24
-    pad = 10
-    text_w = max(cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0]
-                 for t in lines)
-    panel_w = text_w + pad * 2
-    panel_h = line_h * len(lines) + pad * 2
-    x1 = width - 12
-    x0 = max(0, x1 - panel_w)
-    y0 = 12
-    y1 = min(height, y0 + panel_h)
-
-    # 半透明底衬，白底/花背景上也能看清
-    region = frame[y0:y1, x0:x1]
-    dark = np.full_like(region, 16)
-    cv2.addWeighted(region, 0.38, dark, 0.62, 0.0, dst=region)
-    cv2.rectangle(frame, (x0, y0), (x1 - 1, y1 - 1), (95, 95, 95), 1)
-
-    for line_index, text in enumerate(lines):
-        color = (0, 140, 255) if text == "PAUSED" else (0, 255, 0)
-        baseline = y0 + pad + line_h * line_index + 18
-        cv2.putText(frame, text, (x0 + pad, baseline), cv2.FONT_HERSHEY_SIMPLEX,
-                    scale, color, thickness, cv2.LINE_AA)
-
-    # 底部按键提示（整宽，单独一条，和上面的面板不冲突）
-    hint = "q quit | space pause | 1-7 view | b board | d overlay | m mirror | r ROI | f fullscreen"
-    _draw_shortcut_footer(frame, hint)
-    return frame
-
-
-def build_default_pipeline() -> PluginRegistry:
-    """建立默认流水线里的**处理类**插件（先执行，会改变图像数据）。
-
-    这里只放真正处理图像的东西。绘制类插件（ROI 参考框、信息叠加）在
-    :func:`add_display_plugins` 里，它们要等到外部处理插件都注册完之后才加，
-    这样画上去的标注不会被后续处理（例如二值化）当成图像内容吃掉。
-    """
-    registry = PluginRegistry()
-    registry.add("mirror", step_mirror)
-    return registry
-
-
-def add_display_plugins(registry: PluginRegistry) -> None:
-    """注册**绘制类**插件（最后执行，只往画面上叠标注）。
-
-    ⚠️ 必须排在所有处理类插件之后。
-    否则它们画出来的东西会被后面的插件当成图像内容处理掉 ——
-    表现就是「按 d / 按 r 画面没反应」。这个坑踩过一次。
-    """
-    # roi_outline 只是画一个参考框，它不裁任何东西。
-    # 真正生效的识别区域限制在 plugins.py 的 ROI_RELATIVE 里，
-    # 所以这里默认关闭，免得画面上出现两个框分不清。按 r 可以打开作参考。
-    registry.add("roi_outline", step_roi_outline, enabled=False)
-    registry.add("info_overlay", step_info_overlay)
-
-
-# ---------------------------------------------------------------------------
-# 外部插件：同目录 plugins.py 定义 register(api) 即可接入
-# ---------------------------------------------------------------------------
-class _PluginApi:
-    """交给外部插件的注册接口。"""
-
-    def __init__(self, registry: PluginRegistry) -> None:
-        self._registry = registry
-
-    def add(self, name: str, func: PluginFunc, enabled: bool = True) -> None:
-        """注册一个处理函数（通常追加在最后）。"""
-        self._registry.add(name, func, enabled)
-
-    def remove(self, name: str) -> None:
-        """移除某个插件。"""
-        self._registry.remove(name)
-
-    def build_pipeline(self) -> PluginRegistry:
-        """返回内部插件表，供高级用法直接操作。"""
-        return self._registry
-
-
-def load_external_plugins(registry: PluginRegistry,
-                          module_name: str = "plugins") -> bool:
-    """导入同目录的 ``plugins.py`` 并调用它的 ``register(api)``。
-
-    返回是否成功接入；文件不存在时返回 False 并给出提示，不影响程序运行。
-    """
-    try:
-        module = importlib.import_module(module_name)
-    except ModuleNotFoundError:
-        print("[plugins] 未找到 %s.py，当前只运行内置插件（可新建该文件来插入处理）"
-              % module_name)
-        return False
-    except Exception as error:
-        print("[plugins] 导入 %s.py 失败：%s: %s" % (module_name, type(error).__name__, error))
-        return False
-
-    register = getattr(module, "register", None)
-    if not callable(register):
-        print("[plugins] %s.py 里没有可调用的 register(api)，已跳过" % module_name)
-        return False
-    try:
-        register(_PluginApi(registry))
-    except Exception as error:
-        print("[plugins] register(api) 执行失败：%s: %s" % (type(error).__name__, error))
-        return False
-    print("[plugins] 已接入 %s.py，当前插件：%s" % (module_name, list(registry.names())))
-    return True
-
-
-# ---------------------------------------------------------------------------
-# 主循环
-# ---------------------------------------------------------------------------
-def _display_frame(frame: np.ndarray) -> np.ndarray:
-    """把画面**等比缩放 + 居中补边**，凑成一块 DISPLAY_WIDTH x DISPLAY_HEIGHT 的画布。
-
-    ★ 为什么要自己做（而不是直接 imshow）：cv2.imshow 会把画面**拉满窗口**，
-      宽高比不一致就会**非等比拉伸**。实测 810x1440 的竖幅素材在 1280x720 的
-      窗口里被横向拉满、手明显变扁 —— 详见 DISPLAY_FIT 那段注释。
-
-    返回的一定是 (DISPLAY_HEIGHT, DISPLAY_WIDTH, 3) 的 BGR 图，
-    所以主循环里 imshow 的图像尺寸恒定，窗口不用跟着变。
-    """
-    if not DISPLAY_FIT:
-        return frame
-    canvas_h, canvas_w = int(DISPLAY_HEIGHT), int(DISPLAY_WIDTH)
-    height, width = frame.shape[:2]
-    if height <= 0 or width <= 0:
-        return frame
-    if frame.ndim == 2:                       # 单通道也允许传进来
-        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-    scale = min(canvas_w / float(width), canvas_h / float(height))
-    new_w = max(1, int(round(width * scale)))
-    new_h = max(1, int(round(height * scale)))
-    if (new_w, new_h) == (width, height):
-        resized = frame
-    else:
-        # 缩小用 INTER_AREA（抗混叠），放大用 INTER_LINEAR
-        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-        resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
-    if (new_w, new_h) == (canvas_w, canvas_h):
-        return resized                        # 比例刚好一致，不用补边
-    canvas = np.full((canvas_h, canvas_w, 3), DISPLAY_BG, dtype=np.uint8)
-    x0 = (canvas_w - new_w) // 2
-    y0 = (canvas_h - new_h) // 2
-    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
-    return canvas
-
-
-def _prepare_window() -> None:
-    """创建窗口并让它正好显示 720p 画面。
-
-    只调用一次 imshow/waitKey 时，WIN32UI 后端还沿用系统记忆的窗口尺寸（本机
-    1920x1080）；必须多泵几次事件循环、再显式 resizeWindow，客户区才会稳定在
-    1280x720。实测顺序：imshow -> 泵两次 -> resize -> 再泵一次。
-    """
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    placeholder = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
-    cv2.imshow(WINDOW_NAME, placeholder)
-    cv2.waitKey(1)
-    cv2.waitKey(1)
-    cv2.resizeWindow(WINDOW_NAME, DISPLAY_WIDTH, DISPLAY_HEIGHT)
-    cv2.waitKey(1)
-
-
-def _draw_paused_badge(frame: np.ndarray) -> None:
-    """在画面上方中央画一个 PAUSED 提示（就地修改）。
-
-    ⚠️ 为什么需要它：暂停时主循环不重绘，画面完全冻结 —— 用户分不清
-       "按了空格暂停"和"程序卡死"，而且按 n 换图也看不到任何变化
-       （终端提示变了、画面纹丝不动，这是实际踩到的坑）。
-       有了这个标记，暂停状态一眼可见。
-    """
-    text = "PAUSED   (press space to resume)"
-    scale, thickness = 0.85, 2
-    (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX,
-                                          scale, thickness)
-    height, width = frame.shape[:2]
-    x0 = max(0, (width - text_w) // 2 - 18)
-    x1 = min(width, x0 + text_w + 36)
-    y0 = 66
-    y1 = min(height, y0 + text_h + 28)
-    if x1 - x0 < 4 or y1 - y0 < 4:
-        return
-    region = frame[y0:y1, x0:x1]
-    dark = np.full_like(region, 20)
-    cv2.addWeighted(region, 0.35, dark, 0.65, 0.0, dst=region)
-    cv2.rectangle(frame, (x0, y0), (x1 - 1, y1 - 1), (0, 165, 255), 2)
-    cv2.putText(frame, text, (x0 + 18, y1 - 14), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
-    cv2.putText(frame, text, (x0 + 18, y1 - 14), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, (0, 165, 255), thickness, cv2.LINE_AA)
-
-
-def _set_fullscreen(enabled: bool) -> None:
-    """切换全屏；退出全屏时恢复成与图像等大的窗口。"""
-    if enabled:
-        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        cv2.waitKey(1)
-        return
-    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-    cv2.waitKey(1)
-    cv2.destroyWindow(WINDOW_NAME)
-    _prepare_window()
-
-
-def _select_view_mode(key: int, state: FrameState,
-                      registry: PluginRegistry) -> bool:
-    """数字键切换显示模式（原图 / 掩膜 / 清理后）。
-
-    返回 True 表示这个按键已经被处理掉了，调用方不用再往下判断。
-
-    做法：把 VIEW_MODES 里出现过的所有插件先全部关掉，再打开本模式列出的那些。
-    没在 VIEW_MODES 里出现过的插件（ROI 边界、信息叠加等）一律不动。
-    """
-    for index, (key_code, label, plugin_names) in enumerate(VIEW_MODES):
-        if key != key_code:
-            continue
-
-        # 先检查本模式需要的插件是否都注册了，避免切过去却发现什么都没开
-        missing = [name for name in plugin_names if name not in registry.names()]
-        if missing:
-            print("[main] 模式「%s」需要的插件没注册：%s（检查 plugins.py）"
-                  % (label, "、".join(missing)))
-            return True
-
-        for _, _, names in VIEW_MODES:
-            for name in names:
-                registry.enable(name, name in plugin_names)
-        state.flags["view_mode"] = label
-        state.flags["view_mode_has_mask"] = bool(
-            VIEW_MODE_HAS_MASK[index] if index < len(VIEW_MODE_HAS_MASK) else bool(plugin_names))
-        print("[main] 显示模式 -> %s（启用：%s）"
-              % (label, "、".join(plugin_names) if plugin_names else "无，原图透传"))
-        return True
-    return False
-
-
-def _handle_key(key: int, state: FrameState, registry: PluginRegistry) -> Optional[str]:
-    """处理一个按键，返回 "quit"/"fullscreen" 等动作，未识别时返回 None。"""
-    if key in (ord("q"), 27):
-        return "quit"
-    # 数字键切换显示模式（1 原图 / 2 掩膜 / 3 清理后）。放前面，优先于其他开关。
-    if _select_view_mode(key, state, registry):
-        return None
-    if key == ord(" "):
-        state.paused = not state.paused
-        print("[main] %s" % ("已暂停" if state.paused else "已继续"))
-    elif key == ord("d"):
-        state.show_overlay = not state.show_overlay
-        print("[main] 信息叠加：%s" % ("开" if state.show_overlay else "关"))
-    elif key == ord("h"):
-        module = sys.modules.get("plugins")
-        if module is not None:
-            module.DISPLAY_DEBUG = not module.DISPLAY_DEBUG
-            print("[main] 详细标记：%s" % ("开" if module.DISPLAY_DEBUG else "关"))
-    elif key == ord("m"):
-        state.mirror = not state.mirror
-        print("[main] 镜像：%s" % ("开" if state.mirror else "关"))
-    elif key == ord("r"):
-        # 控制**真正生效**的 ROI 限制（实现在 plugins.py 里），
-        # 而不是那个"只画不裁"的示例框。按一下就能对比限制/不限制的效果。
-        module = sys.modules.get("plugins")
-        active = module.roi_enabled_now(state) if module is not None else bool(
-            state.flags.get("roi_enabled", True))
-        state.flags["roi_enabled"] = not active
-        state.flags["manual_roi"] = state.flags["roi_enabled"]
-        print("[main] ROI 限制：%s" % ("开" if state.flags["roi_enabled"] else "关"))
-    elif key == ord("b"):
-        default = getattr(sys.modules.get("plugins"), "BOARD_ROI_ENABLED", True)
-        state.flags["board_roi_enabled"] = not state.flags.get("board_roi_enabled", default)
-        print("[main] 自动背景板裁剪：%s" % ("开" if state.flags["board_roi_enabled"] else "关"))
-    elif key == ord("l"):
-        print("[main] 插件顺序：%s" % " -> ".join(registry.names()))
-        print("[main] 已启用：%s" % ", ".join(registry.enabled_names()))
-    elif key == ord("f"):
-        return "fullscreen"
-    return None
-
-
-def _reset_processing_state(module) -> None:
-    """在源时间轴跳转后清除上一段视频/照片的历史。"""
-    if module is not None:
-        module.reset_auto_rotate()
-        module.reset_stability()
-        module.set_roi_anchor(None)
-        module.clear_roi_cache()
-
-
-def _load_photo_truths_for_display(folder: str) -> dict[str, str]:
-    """Read manual labels for the final photo HUD only; never used by processing."""
-    labels = {}
-    invalid = set()
-    try:
-        with open(os.path.join(folder, "_真值.tsv"), encoding="utf-8-sig") as stream:
-            for line in stream:
-                if not line.strip() or line.lstrip().startswith("#"):
-                    continue
-                parts = line.rstrip("\r\n").split("\t")
-                if len(parts) < 2:
-                    continue
-                name, code = parts[0].strip(), parts[1].strip()
-                if not name or any(c not in "TIMRP" for c in code) or len(set(code)) != len(code):
-                    continue
-                code = "".join(c for c in "TIMRP" if c in code)
-                if name in labels and labels[name] != code:
-                    invalid.add(name)
-                labels[name] = code
-    except (OSError, UnicodeError):
-        return {}
-    return {name: code for name, code in labels.items() if name not in invalid}
-
-
-def _photo_result_for_display(image_source, result, recognition_enabled: bool,
-                              labels: dict[str, str]) -> dict:
-    """Compare only AFTER recognition, without writing anything to FrameState."""
-    # A failed next/reload can leave the previous image visible. Use its actual
-    # loaded path, never the requested index, so that image and answer agree.
-    path = image_source.loaded_path or ""
-    name = os.path.basename(path)
-    match = re.fullmatch(r"(sample|nonstd)_(\d+)", os.path.splitext(name)[0])
-    number = (("非标 " if match.group(1) == "nonstd" else "") + match.group(2)
-              if match else name or "?")
-    position = image_source.paths.index(path) + 1 if path in image_source.paths else 0
-    expected = labels.get(name)
-    actual = None
-    if not recognition_enabled:
-        status, correct = "未运行识别", None
-    elif result is None or len(result.get("finger_states", [])) != 5:
-        status, correct = "未检测到手", False if expected is not None else None
-    else:
-        actual = "".join(c for c, on in zip("TIMRP", result["finger_states"]) if on)
-        correct = None if expected is None else actual == expected
-        status = "未标注" if correct is None else "正确" if correct else "不正确"
-    return dict(number=number, position=position, total=len(image_source.paths),
-                expected=expected, actual=actual, status=status, correct=correct)
-
-
-def _draw_photo_result(frame, image_source, result, recognition_enabled, labels, module):
-    """Display-only photo comparison; labels never enter the recognition pipeline."""
-    report = _photo_result_for_display(image_source, result, recognition_enabled, labels)
-    names = dict(zip("TIMRP", ("拇指", "食指", "中指", "无名指", "小指")))
-    def fingers(code):
-        return "拳头" if code == "" else "、".join(names[c] for c in code)
-    expected = "未标注" if report["expected"] is None else fingers(report["expected"])
-    actual = (fingers(report["actual"]) if report["actual"] is not None else
-              "未运行识别" if not recognition_enabled else "未检测到手")
-    verdict = report["status"]
-    if report["correct"] is False:
-        verdict = "不正确"  # Missing hand remains explicit on the actual-result line.
-    color = ((90, 235, 90) if report["correct"] is True else
-             (70, 100, 255) if report["correct"] is False else (0, 215, 255))
-    lines = [("照片 %s    %d / %d" % (report["number"], report["position"], report["total"]),
-              28, (255, 255, 255)),
-             ("预期：" + expected, 22, (235, 235, 235)),
-             ("识别：" + actual, 22, color),
-             (verdict, 28, color)]
-    if module is not None:
-        module.draw_text_lines(frame, lines, (16, 14), panel=True)
-    return frame
-
-
-def main() -> int:
-    """按 SOURCE 选择输入源，跑插件流水线并显示，直到用户退出。
-
-    返回 0 表示正常退出；图片不可用 / 摄像头不可用 / 读取连续失败时返回 1。
-
-    图片模式（SOURCE = "image"）下会**循环反复处理同一张图**，
-    每次循环都从磁盘缓存里拷一份出来，所以插件可以放心就地修改。
-    按 n / p 在 IMAGE_FILES 列表里切换，按 R 从磁盘重读当前张。
-
-    摄像头模式（SOURCE = "camera"）下行为与原来一致。
-    """
-    # 1) 建默认流水线里的处理类插件（镜像），顺序即执行顺序
-    registry = build_default_pipeline()
-    # 2) 若同目录有 plugins.py，就把它的 register(api) 里注册的处理函数追加进来
-    load_external_plugins(registry)
-    # 2.5) ★最后才加绘制类插件（ROI 参考框、信息叠加）。
-    #      放在外部处理插件之后，它们画的标注才不会被后续处理吃掉。
-    add_display_plugins(registry)
-
-    # 2.6) ★★ 命令行覆盖输入源 —— 方便**快速切换，不用改文件、不用重开编辑器** ★★
-    #        python main.py              用本文件里 SOURCE 的设定（默认 video）
-    #        python main.py image        强制照片流（按当前目录枚举，n/p 翻页）
-    #        python main.py video        强制视频流（用 VIDEO_FILE）
-    #        python main.py video test1.mp4  指定 VIDEO_DATA_DIR 中的视频
-    #        python main.py camera       摄像头
-    #      ★ 素材批次：new / camera / old / nonstd / test（标签仅在显示结束时核对）
-    #        python main.py image new    data/new 开发照片
-    #        python main.py image camera 历史 FPGA 标准素材
-    #        python main.py image old    前三批：gesture_*.jpg + shou1/2，共 30 张
-    #      ⚠️ 需要在函数里改全局，所以这里用 global 声明。
-    global SOURCE, VIDEO_FILE, DATA_DIR, GESTURE_SAMPLES, IMAGE_FILES
-    if len(sys.argv) > 1:
-        want = str(sys.argv[1]).strip().lower()
-        alias = {"image": "image", "img": "image", "photo": "image", "pic": "image",
-                 "video": "video", "vid": "video", "camera": "camera", "cam": "camera"}
-        if want not in alias:
-            print("[main] 无法识别的输入源 %r；可用：image / video / camera" % sys.argv[1])
-            print("       例：python main.py image new   python main.py video test1.mp4")
-            return 1
-        SOURCE = alias[want]
-        arg2 = str(sys.argv[2]).strip().lower() if len(sys.argv) > 2 else ""
-        if SOURCE == "video" and arg2:
-            pick = str(sys.argv[2]).strip()
-            if os.path.isabs(pick):
-                VIDEO_FILE = pick
-            else:
-                cand = pick if pick.lower().endswith((".mp4", ".avi", ".mov", ".mkv")) \
-                    else "gesture_video_%s.mp4" % pick
-                if os.path.exists(resolve_video_path(cand)):
-                    VIDEO_FILE = cand
-                else:
-                    print("[main] 找不到视频素材 %r（试过 %s）" % (pick, cand))
-                    return 1
-        elif SOURCE == "image" and arg2:
-            if arg2 in ("camera", "cam"):
-                DATA_DIR = "data/" + CAMERA_SHOT_DIR
-                GESTURE_SAMPLES = ()
-                IMAGE_FILES = image_filenames(os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), DATA_DIR))
-            elif arg2 in ("old", "legacy", "phone"):
-                DATA_DIR = "data/old"
-                GESTURE_SAMPLES = _OLD_GESTURE_SAMPLES
-                IMAGE_FILES = ([n for _l, _d, ns in GESTURE_SAMPLES for n in ns]
-                               + OLD_EXTRA_FILES)
-            elif arg2 in ("new", "nonstd", "test"):
-                DATA_DIR = "data/不标准" if arg2 == "nonstd" else "data/" + arg2
-                GESTURE_SAMPLES = ()
-                IMAGE_FILES = image_filenames(os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), DATA_DIR))
-                if arg2 == "test":
-                    print("[main] 显式浏览素材；答案仅供显示核对，不参与识别。")
-            else:
-                print("[main] 无法识别的素材批次 %r；可用：new（默认）/ test / camera / old / nonstd" % arg2)
-                return 1
-    # 拿到 plugins 模块的引用（自动转正要用它的 AUTO_ROTATE / auto_rotate_frame）
-    plugins_module = None
-    try:
-        import plugins as plugins_module
-    except Exception:
-        plugins_module = None
-
-    _kind = SOURCE.strip().lower()
-    # Processing is selected from image evidence, never the data-folder name.
-    # Uncertain board detection uses the same legacy ROI fallback for every source.
-
-    print("[main] 输入源 = %s%s   素材目录 = %s（%d 张）"
-          % (SOURCE, ("   视频 = %s" % VIDEO_FILE) if _kind == "video" else "",
-             VIDEO_DATA_DIR if _kind == "video" else DATA_DIR,
-             len(IMAGE_FILES) if _kind == "image" else 0))
-    print("[main] 换输入源/素材不用改文件："
-          "python main.py image [new|camera|old|nonstd|test] | video [文件名或绝对路径] | camera")
-
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    # ★ 素材统一放在 DATA_DIR 子目录里（见文件开头的配置）。
-    #   DATA_DIR 写成 "" 时 os.path.join 会给回 base_dir 本身，行为退回老样子。
-    data_dir = os.path.join(base_dir, DATA_DIR) if DATA_DIR else base_dir
-    source_kind = SOURCE.strip().lower()
-    is_video = (source_kind == "video")
-    is_image = (source_kind == "image")
-
-    if is_video and plugins_module is not None:
-        # 文件视频用于逐帧观察：当前帧算出的五指状态必须直接显示。
-        # 摄像头仍保留原稳定门控；这里不修改识别算法或运动判定阈值。
-        registry.enable(plugins_module.STABILITY_PLUGIN_NAME, False)
-
-    video_period_ms = 0.0
-    cap: Optional[cv2.VideoCapture] = None
-    image_source: Optional[ImageSource] = None
-    photo_display_labels: dict[str, str] = {}
-
-    # 3) 准备输入源
-    if source_kind == "image":
-        paths = resolve_image_paths(IMAGE_FILES, data_dir)
-        if not paths:
-            print("[error] 图片模式下一张可用图片都没有。")
-            print("        找素材的目录是：%s" % data_dir)
-            print("        （由 main.py 开头的 DATA_DIR 决定，当前是 \"%s\"）" % DATA_DIR)
-            print("        请把素材放进去，或把 SOURCE 改成 \"camera\"。")
-            return 1
-        image_source = ImageSource(paths, IMAGE_START_INDEX)
-        photo_display_labels = _load_photo_truths_for_display(data_dir)
-        if image_source.frame is None:
-            print("[error] %s" % image_source.message)
-            return 1
-        print("[image] 共 %d 张：%s"
-              % (len(paths), "、".join(os.path.basename(p) for p in paths)))
-        print("[image] %s" % image_source.message)
-        print("[image] 循环处理同一张；n 下一张，p 上一张，R 从磁盘重载")
-        frame_delay_ms = FRAME_DELAY_MS_IMAGE
-    elif is_video:
-        video_path = resolve_video_path(VIDEO_FILE)
-        if not os.path.exists(video_path):
-            print("[error] 视频文件不存在：%s" % video_path)
-            print("        改 VIDEO_FILE（相对 VIDEO_DATA_DIR=\"%s\"），"
-                  "或把 SOURCE 换回 \"image\"。" % VIDEO_DATA_DIR)
-            return 1
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print("[error] 打不开视频：%s（编码可能不被 OpenCV 支持）" % video_path)
-            return 1
-        video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        video_fps = float(cap.get(cv2.CAP_PROP_FPS))
-        if np.isfinite(video_fps) and video_fps > 0.0:
-            video_period_ms = 1000.0 / video_fps
-        print("[video] %s  %dx%d  %.1f fps  共 %d 帧"
-              % (os.path.basename(video_path),
-                 int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                 int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                 video_fps, video_frames))
-        print("[video] %s" % ("播完自动循环" if VIDEO_LOOP else "播完自动退出"))
-        print("[video] 逐帧计算并显示当前结果；显示后停留 %d ms，再读取下一帧"
-              % VIDEO_FRAME_HOLD_MS)
-        frame_delay_ms = FRAME_DELAY_MS_CAMERA
-    else:
-        try:
-            cap = open_camera()
-        except RuntimeError as error:
-            print("[error] %s" % error)
-            return 1
-        print("[camera] 循环采集")
-        frame_delay_ms = FRAME_DELAY_MS_CAMERA
-
-    # 4) 建立这一轮运行共享的状态对象（帧号、FPS、裁切区、各种开关都在里面）
-    state = FrameState(plugins=registry.names())
-    state.flags["still_image"] = is_image
-    state.flags["roi"] = True              # 内置 ROI 示例框默认开启
-    # 磁盘照片和视频保留拍摄方向；摄像头沿用配置，m 键可手动切换。
-    state.mirror = False if (is_image or is_video) else MIRROR_DEFAULT
-    # 启动时按 VIEW_MODE_DEFAULT 把显示模式设好（等价于自动按一下那个数字键）
-    if VIEW_MODES:
-        _index = min(max(VIEW_MODE_DEFAULT, 0), len(VIEW_MODES) - 1)
-        _key = VIEW_MODES[_index][0]
-        _bootstrap = FrameState(plugins=registry.names())
-        _select_view_mode(_key, _bootstrap, registry)
-        state.flags["view_mode"] = _bootstrap.flags.get("view_mode")
-        state.flags["view_mode_has_mask"] = _bootstrap.flags.get("view_mode_has_mask")
-    # 5) 创建 1280x720 的显示窗口，并先把客户区尺寸校准好
-    _prepare_window()
-    fullscreen = False
-    recent_dt: collections.deque = collections.deque(maxlen=30)   # 用于平滑算 FPS
-    last_time = time.perf_counter()
-    failures = 0                           # 连续读帧失败计数
-    last_displayed: Optional[np.ndarray] = None    # 最近一帧"处理完、还没做显示适配"的画面
-    refresh_requested = False              # 暂停时改变视图只重算当前帧
-    advance_requested = False              # 视频单步/重播显式读取下一帧
-    last_input: Optional[np.ndarray] = None # 保留未裁板/未转正的当前源帧
-    print("[main] 按键：q 退出，空格暂停，1~7 切换显示模式，b 自动裁板，d 叠加，h 详细标记，m 镜像，r ROI限制，f 全屏，l 列出插件"
-          + ("，n/p 换图，R 重载" if image_source is not None else
-             "，暂停后 n 单步，R 从头重播" if is_video else ""))
-
+    if not videos or not 0 <= index < len(videos):
+        raise ValueError("The starting video index is invalid.")
+    recognize_frame = recognize if recognize_frame is None else recognize_frame
+    render_frame = render_result if render_frame is None else render_frame
+    capture_factory = cv2.VideoCapture if capture_factory is None else capture_factory
+    capture = None
+    paused = False
+    detailed = False
+    open_clip = True
+    read_frame = True
+    redraw = True
+    result = None
+    canvas = np.zeros((480, 860, 3), np.uint8)
+    frame_no = frame_count = 0
+    period_ms = 1000 / 30
+    error = ""
+    had_error = False
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
     try:
         while True:
-            iteration_started = time.perf_counter()
-            # 暂停刷新不消费视频帧，只有显式 n/R 才推进输入。
-            if (not state.paused) or refresh_requested or advance_requested:
-                reuse_input = bool(state.paused and not advance_requested
-                                   and last_input is not None and not is_image)
-                refresh_requested = False
-                advance_requested = False
-                if reuse_input:
-                    raw = last_input.copy()
-                elif image_source is not None:
-                    ok, raw = image_source.read()
-                    if not ok or raw is None:
-                        print("[error] 当前图片读取失败")
-                        return 1
-                else:
-                    ok, raw = cap.read()
-                    if not ok or raw is None or raw.size == 0:
-                        if is_video:
-                            # 只有至少读过一帧且已到片尾才当作正常结束。
-                            pos = float(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                            if last_input is None or (video_frames > 0 and pos < video_frames):
-                                print("[error] 视频帧读取失败，停止播放")
-                                return 1
-                            if not VIDEO_LOOP:
-                                print("[video] 播放结束")
-                                return 0
-                            if not cap.set(cv2.CAP_PROP_POS_FRAMES, 0):
-                                print("[error] 视频无法回到开头")
-                                return 1
-                            _reset_processing_state(plugins_module)
-                            recent_dt.clear()
-                            state.index = 0
-                            ok, raw = cap.read()
-                            if not ok or raw is None or raw.size == 0:
-                                print("[error] 视频回到开头后仍无法读取，停止播放")
-                                return 1
-                        else:
-                            failures += 1
-                            if failures >= MAX_CONSECUTIVE_READ_FAILURES:
-                                print("[error] 连续 %d 帧读取失败，退出" % failures)
-                                return 1
-                            if cv2.waitKey(frame_delay_ms) & 0xFF in (ord("q"), 27):
-                                return 0
-                            continue
-                    failures = 0
-                if not reuse_input:
-                    last_input = raw.copy()
-                if is_video:
-                    state.flags["video_frame"] = max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES))-1)
-                    state.flags["video_frames"] = video_frames
-
-                # 5.2 计算本帧时间间隔，并用最近 30 帧的平均间隔换算平滑 FPS
-                now = time.perf_counter()
-                state.dt = 0.0 if state.index == 0 else now - last_time
-                last_time = now
-                if state.dt > 0.0:
-                    recent_dt.append(state.dt)
-                    average_dt = sum(recent_dt) / len(recent_dt)
-                    state.fps = 1.0 / average_dt if average_dt > 0 else 0.0
-
-                # 5.2.5 ★★ 视频/摄像头帧降采样（照片流早就在载入时降过了）★★                #   ⚠️ 为什么需要：图片模式的 fit_within 只在 ImageSource.load() 里调用，
-                #      **视频/摄像头这条路径完全不经过它** —— 以前 1080x1920 的视频
-                #      是整幅 2.07 Mpx 进流水线的 ✗
-                #   实测（1080x1920 竖幅，完整链）：
-                #        原始 1080x1920 -> 137 ms   |  长边限 1280 -> 720x1280 -> 约 50 ms
-                #        长边限  960    -> 540x960  -> 约 29 ms
-                #   瓶颈是 palm_reconstruct（占 62%），它按像素数线性涨，所以降采样最划算。
-                #   ⚠️ 必须放在 state.raw_size 赋值【之前】，否则 ROI 会按旧尺寸算。
-                if not is_image and VIDEO_MAX_LONG_SIDE > 0:
-                    long_side = max(raw.shape[0], raw.shape[1])
-                    if long_side > VIDEO_MAX_LONG_SIDE:
-                        raw = fit_within(raw, VIDEO_MAX_LONG_SIDE, VIDEO_MAX_LONG_SIDE)
-
-                # 5.2.6 ★★ 自动把手的方向转成「手指朝上」★★
-                #   整条流水线（手腕="下方最窄行"、截前臂、掌轴、所有角度判据）
-                #   **都写死了"小臂从画面下方入画、手指朝上"** ✓ 那是它 86% 的来源。
-                #   手一旦整体转 90°（比如"掌心朝镜头但手指朝左"），这条流水线就全错 ✗
-                #   ★ 解法不是把每个判据都改成旋转无关（试过，反而更差 ✗），
-                #     而是**先判断手朝哪边、把画面转正**，再走原来那条流水线 ✓
-                #   判断不出来时*不转*（返回 0），保持原行为 ✓
-                state.flags["input_frame"] = raw
-                if plugins_module is not None:
-                    raw, preprocessing = plugins_module.prepare_hand_frame(
-                        raw, board_enabled=state.flags.get("board_roi_enabled"))
-                    state.flags["preprocess"] = preprocessing
-
-                # 5.3 把本帧信息写进共享状态，插件通过 state 读取原图尺寸和裁切区
-                state.raw_frame = raw
-                state.raw_size = (raw.shape[1], raw.shape[0])
-
-                if PLUGIN_FULL_RESOLUTION:
-                    # 整帧交给插件，不裁不缩，指尖/指缝这类细节不被提前缩小。
-                    # 必须拷贝：插件允许就地修改 frame，而 raw 同时就是 state.raw_frame，
-                    # 直接把同一个数组交出去会被插件改坏。
-                    state.crop = (0, 0, state.raw_size[0], state.raw_size[1])
-                    frame = raw.copy()
-                else:
-                    # 旧行为：按 16:9 算出居中裁切区，再压到显示尺寸
-                    state.crop = compute_crop(state.raw_size, state.display_size)
-                    frame = crop_for_display(raw, state.display_size)
-
-                # 5.4 把工作帧按顺序交给所有插件；
-                #     registry.run 返回 None 表示某个插件要求丢弃本帧
-                state.flags.pop("recognize", None)  # Never display a previous photo after failure/view changes.
+            started = clock()
+            processed_frame = False
+            if open_clip:
+                if capture is not None:
+                    capture.release()
+                    capture = None
+                frame_no = frame_count = 0
+                result = None
+                error = ""
+                canvas = np.zeros((480, 860, 3), np.uint8)
                 try:
-                    frame = registry.run(frame, state, strict=is_video)
-                except RuntimeError as error:
-                    print("[error] 当前帧处理失败，停止播放：%s" % error)
-                    return 1
-                if is_video and frame is None:
-                    print("[error] 当前视频帧没有输出，停止播放，未跳到下一帧")
-                    return 1
-                # 5.5 有可显示的帧就送进窗口。
-                #     ★ 送之前先过一遍 _display_frame：等比缩放 + 补黑边，
-                #       保证任何宽高比的素材都不会被 imshow 拉变形（见该函数注释）。
-                if frame is not None:
-                    if image_source is not None and state.show_overlay:
-                        _draw_photo_result(frame, image_source, state.flags.get("recognize"),
-                                           "hand_recognize" in registry.enabled_names(),
-                                           photo_display_labels, plugins_module)
-                    last_displayed = frame
-                    cv2.imshow(WINDOW_NAME, _display_frame(frame))
+                    capture = capture_factory(str(videos[index]))
+                    if not capture.isOpened():
+                        raise ValueError("Cannot open video")
+                    fps = _positive_number(float(capture.get(cv2.CAP_PROP_FPS)), 30.0)
+                    period_ms = 1000 / fps
+                    frame_count = int(_positive_number(
+                        float(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 0.0))
+                    read_frame = True  # Switching/restarting shows frame one even while paused.
+                except Exception as exc:
+                    error = f"Cannot open video: {exc}"
+                    had_error = True
+                    print(f"{videos[index]}: {error}", file=sys.stderr)
+                    read_frame = False
+                open_clip = False
+                redraw = True
 
-                # 5.6 帧号加一，然后处理键盘：waitKey 需要每帧调用一次来驱动界面事件。
-            #     图片模式下用较大的延时，既避免空转烧 CPU，也保证按键能响应。
-                # 只有真正处理过一帧，帧号才加一（暂停时不涨）
-                if not reuse_input:
-                    state.index += 1
+            if read_frame and not error:
+                raw = None
+                try:
+                    ok, raw = capture.read()
+                    if not ok or raw is None:
+                        if frame_no == 0:
+                            raise ValueError("No decodable frames")
+                        if frame_count and frame_no < frame_count:
+                            raise ValueError(f"Decode stopped early at frame {frame_no}/{frame_count}")
+                        # Some containers do not report a frame count. A successful
+                        # pass may loop; an empty pass always stops, avoiding a spin.
+                        open_clip = True
+                        continue
+                    frame_no += 1
+                    result = recognize_frame(raw)
+                    canvas = render_frame(result, detailed=detailed)
+                    processed_frame = True
+                except Exception as exc:
+                    if raw is not None:
+                        canvas = raw.copy()
+                    result = None
+                    error = f"Frame {frame_no}: {exc}"
+                    had_error = True
+                    print(f"{videos[index]}: {error}", file=sys.stderr)
+                read_frame = False
+                redraw = True
+
+            if redraw:
+                shown = _player_view(canvas, videos, index, frame_no,
+                                     frame_count, paused, error)
+                cv2.imshow(WINDOW_NAME, shown)
+                redraw = False
+
+            # Source FPS is a maximum, not a deadline: never skip a decoded frame
+            # to catch up. Slow inference simply makes playback take longer.
+            elapsed_ms = (clock() - started) * 1000
+            delay_ms = max(1, FRAME_HOLD_MS, math.ceil(period_ms - elapsed_ms)) \
+                if processed_frame else 30
+            key = cv2.waitKeyEx(delay_ms)
+            if key in (27, ord("q"), ord("Q")):
+                break
+            try:
+                if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except cv2.error:
+                break
+
+            if key in NEXT_KEYS or key in PREVIOUS_KEYS:
+                index = (index + (1 if key in NEXT_KEYS else -1)) % len(videos)
+                open_clip = True
+            elif key in (ord("r"), ord("R")):
+                open_clip = True
+            elif key == ord(" "):
+                paused = not paused
+                redraw = True
+                read_frame = not paused and not error
+            elif key in (ord("h"), ord("H")):
+                detailed = not detailed
+                if result is not None and not error:
+                    try:
+                        canvas = render_frame(result, detailed=detailed)
+                    except Exception as exc:
+                        error = f"Cannot display result: {exc}"
+                        had_error = True
+                        print(f"{videos[index]}: {error}", file=sys.stderr)
+                redraw = True
             else:
-                # 5.6b 暂停中：**也要重绘**。
-                #      以前暂停就完全不 imshow，结果画面冻结、连"PAUSED"都画不出来，
-                #      用户分不清是暂停还是卡死；按 n 换图也只是终端变了、画面不动。
-                if last_displayed is not None:
-                    # ★ 先做显示适配，再画暂停标记 —— 这样标记是在 1280x720 的
-                    #   画布上画的，字号恒定，不会因为原图大小而忽大忽小。
-                    paused_canvas = _display_frame(last_displayed)
-                    _draw_paused_badge(paused_canvas)      # 就地修改，无返回值
-                    cv2.imshow(WINDOW_NAME, paused_canvas)
-
-            # 5.7 键盘。这一句在 if 外面，暂停时也要执行，否则界面会僵住。
-            wait_ms = FRAME_DELAY_MS_IMAGE if state.paused else frame_delay_ms
-            if is_video and not state.paused and video_period_ms > 0.0:
-                elapsed_ms = (time.perf_counter() - iteration_started) * 1000.0
-                wait_ms = max(1, int(np.ceil(video_period_ms - elapsed_ms)))
-            if is_video and not state.paused:
-                # 必须在 imshow 后等待。计算慢只会延长播放时间，不能缩短结果停留。
-                wait_ms = max(wait_ms, max(1, int(VIDEO_FRAME_HOLD_MS)))
-            key = cv2.waitKey(wait_ms) & 0xFF
-
-            if is_video and key == ord("R"):
-                if not cap.set(cv2.CAP_PROP_POS_FRAMES, 0):
-                    print("[error] 视频无法回到开头")
-                    return 1
-                _reset_processing_state(plugins_module)
-                recent_dt.clear()
-                state.index = 0
-                last_input = None
-                advance_requested = True
-                print("[video] 从头重播%s" % ("（保持暂停）" if state.paused else ""))
-                continue
-            if is_video and state.paused and key == ord("n"):
-                advance_requested = True
-                continue
-
-            # 5.8 图片模式专有按键：换图 / 从磁盘重载
-            if image_source is not None and key in (ord("n"), ord("p"), ord("R")):
-                if key == ord("n"):
-                    image_source.step(+1)
-                elif key == ord("p"):
-                    image_source.step(-1)
-                else:
-                    image_source.reload()
-                    photo_display_labels = _load_photo_truths_for_display(data_dir)
-                _reset_processing_state(plugins_module)
-                print("[image] %s%s" % (image_source.message,
-                                        "  [暂停中，已强制刷新一帧]" if state.paused else ""))
-                refresh_requested = True      # ★ 暂停时也要立刻把新图显示出来
-                continue
-
-            # 5.9 _handle_key：把按键翻译成开关动作；返回 "quit"/"fullscreen" 时需额外处理
-            #     空格键会翻转 state.paused，下一轮循环的 5.0 就会真的停下处理。
-            action = _handle_key(key, state, registry)
-            if key in (ord("b"), ord("r"), ord("m"), ord("d"), ord("h")) or any(
-                    key == mode[0] for mode in VIEW_MODES):
-                refresh_requested = True
-            if action == "quit":
-                return 0
-            if action == "fullscreen":
-                fullscreen = not fullscreen
-                # _set_fullscreen：在全屏和 720p 窗口之间切换
-                _set_fullscreen(fullscreen)
+                read_frame = not paused and not error
     finally:
-        # 6) 无论正常退出还是异常退出，都释放输入源并销毁窗口
-        if cap is not None:
-            cap.release()
-        cv2.destroyAllWindows()
+        if capture is not None:
+            capture.release()
+        try:
+            cv2.destroyWindow(WINDOW_NAME)
+        except cv2.error:
+            pass
+    return 1 if had_error else 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description="逐帧识别视频；当前视频默认循环，按 N 才播放下一段。")
+    parser.add_argument("video", nargs="?", type=Path, default=DEFAULT_VIDEO,
+                        help="视频或文件夹路径；默认仓库内 data/test，文件按自然顺序排列")
+    args = parser.parse_args(argv)
+    try:
+        videos, index = collect_videos(args.video)
+        print("N/右箭头 下一视频；P/左箭头 上一视频；空格 暂停；R 重播；H 详情；Q/Esc 退出。")
+        print(f"当前视频：{videos[index]}（默认循环此视频）")
+        return play_videos(videos, index)
+    except (OSError, ValueError, cv2.error) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
