@@ -58,8 +58,10 @@ from typing import Any, Callable, Optional
 import cv2
 import numpy as np
 
-# Development and deployment share the repository material directory.
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Code and helper modules live in win_yuan; shared data lives in its parent.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # ---------------------------------------------------------------------------
 # 配置区
@@ -453,7 +455,7 @@ def image_filenames(folder: str) -> list[str]:
 
 # 默认开发素材按目录内容枚举，不把文件名或正确答案写进算法。
 if ACTIVE_MATERIAL in ("new", "test", "camera"):
-    IMAGE_FILES = image_filenames(os.path.join(PROJECT_ROOT, DATA_DIR))
+    IMAGE_FILES = image_filenames(os.path.join(str(PROJECT_ROOT), DATA_DIR))
 
 
 def read_image(path: str) -> Optional[np.ndarray]:
@@ -574,7 +576,7 @@ def resolve_video_path(filename: str) -> str:
     """Resolve videos relative to this project, independent of photo selection/CWD."""
     if os.path.isabs(filename):
         return filename
-    return os.path.join(PROJECT_ROOT, VIDEO_DATA_DIR, filename)
+    return os.path.join(str(PROJECT_ROOT), VIDEO_DATA_DIR, filename)
 
 
 def collect_videos(path: Path) -> tuple[list[Path], int]:
@@ -610,7 +612,7 @@ def _video_player_view(canvas, videos, index, frame_no, frame_count, paused, err
              "N/右箭头 下一视频   P/左箭头 上一视频   空格 暂停   R 重播   H 详情   Q/Esc 退出"]
     if error:
         lines.append(f"{error}  | N/P 切换，R 重试，Q 退出")
-    module = sys.modules.get("plugins")
+    module = sys.modules.get("win_yuan.plugins")
     if module is not None:
         module.draw_text_lines(shown,
                                [(line, 16, (90, 120, 255) if row == 2 else (230, 230, 230))
@@ -761,7 +763,7 @@ def step_info_overlay(frame: np.ndarray, state: FrameState) -> np.ndarray:
         # The player footer reports the current clip even while paused/error;
         # do not bake the obsolete per-frame shortcut strip into the image.
         return frame
-    module = sys.modules.get("plugins")
+    module = sys.modules.get("win_yuan.plugins")
     debug = bool(getattr(module, "DISPLAY_DEBUG", False))
     if not debug:
         hint = ("n next | p previous | R reload | h details | 1-7 view | q quit"
@@ -864,7 +866,7 @@ class _PluginApi:
 
 
 def load_external_plugins(registry: PluginRegistry,
-                          module_name: str = "plugins") -> bool:
+                          module_name: str = "win_yuan.plugins") -> bool:
     """导入同目录的 ``plugins.py`` 并调用它的 ``register(api)``。
 
     返回是否成功接入；文件不存在时返回 False 并给出提示，不影响程序运行。
@@ -1034,7 +1036,7 @@ def _handle_key(key: int, state: FrameState, registry: PluginRegistry) -> Option
         state.show_overlay = not state.show_overlay
         print("[main] 信息叠加：%s" % ("开" if state.show_overlay else "关"))
     elif key == ord("h"):
-        module = sys.modules.get("plugins")
+        module = sys.modules.get("win_yuan.plugins")
         if module is not None:
             module.DISPLAY_DEBUG = not module.DISPLAY_DEBUG
             print("[main] 详细标记：%s" % ("开" if module.DISPLAY_DEBUG else "关"))
@@ -1044,14 +1046,14 @@ def _handle_key(key: int, state: FrameState, registry: PluginRegistry) -> Option
     elif key == (ord("o") if state.flags.get("video_mode") else ord("r")):
         # 控制**真正生效**的 ROI 限制（实现在 plugins.py 里），
         # 而不是那个"只画不裁"的示例框。按一下就能对比限制/不限制的效果。
-        module = sys.modules.get("plugins")
+        module = sys.modules.get("win_yuan.plugins")
         active = module.roi_enabled_now(state) if module is not None else bool(
             state.flags.get("roi_enabled", True))
         state.flags["roi_enabled"] = not active
         state.flags["manual_roi"] = state.flags["roi_enabled"]
         print("[main] ROI 限制：%s" % ("开" if state.flags["roi_enabled"] else "关"))
     elif key == ord("b"):
-        default = getattr(sys.modules.get("plugins"), "BOARD_ROI_ENABLED", True)
+        default = getattr(sys.modules.get("win_yuan.plugins"), "BOARD_ROI_ENABLED", True)
         state.flags["board_roi_enabled"] = not state.flags.get("board_roi_enabled", default)
         print("[main] 自动背景板裁剪：%s" % ("开" if state.flags["board_roi_enabled"] else "关"))
     elif key == ord("l"):
@@ -1188,7 +1190,7 @@ def main() -> int:
         if SOURCE == "video" and arg2:
             pick = str(sys.argv[2]).strip()
             candidates = [resolve_video_path(pick), os.path.abspath(pick),
-                          os.path.join(PROJECT_ROOT, pick),
+                          os.path.join(str(PROJECT_ROOT), pick),
                           resolve_video_path("gesture_video_%s.mp4" % pick)]
             selected = next((path for path in candidates if os.path.exists(path)), None)
             if selected is None:
@@ -1200,7 +1202,7 @@ def main() -> int:
                 DATA_DIR = "data/" + CAMERA_SHOT_DIR
                 GESTURE_SAMPLES = ()
                 IMAGE_FILES = image_filenames(os.path.join(
-                    PROJECT_ROOT, DATA_DIR))
+                    str(PROJECT_ROOT), DATA_DIR))
             elif arg2 in ("old", "legacy", "phone"):
                 DATA_DIR = "data/old"
                 GESTURE_SAMPLES = _OLD_GESTURE_SAMPLES
@@ -1210,7 +1212,7 @@ def main() -> int:
                 DATA_DIR = "data/不标准" if arg2 == "nonstd" else "data/" + arg2
                 GESTURE_SAMPLES = ()
                 IMAGE_FILES = image_filenames(os.path.join(
-                    PROJECT_ROOT, DATA_DIR))
+                    str(PROJECT_ROOT), DATA_DIR))
                 if arg2 == "test":
                     print("[main] 显式浏览素材；答案仅供显示核对，不参与识别。")
             else:
@@ -1219,7 +1221,7 @@ def main() -> int:
     # 拿到 plugins 模块的引用（自动转正要用它的 AUTO_ROTATE / auto_rotate_frame）
     plugins_module = None
     try:
-        import plugins as plugins_module
+        from win_yuan import plugins as plugins_module
     except Exception:
         plugins_module = None
 
@@ -1234,7 +1236,7 @@ def main() -> int:
     print("[main] 换输入源/素材不用改文件："
           "python main.py image [new|camera|old|nonstd|test] | video [文件名或绝对路径] | camera")
 
-    base_dir = PROJECT_ROOT
+    base_dir = str(PROJECT_ROOT)
     # ★ 素材统一放在 DATA_DIR 子目录里（见文件开头的配置）。
     #   DATA_DIR 写成 "" 时 os.path.join 会给回 base_dir 本身，行为退回老样子。
     data_dir = os.path.join(base_dir, DATA_DIR) if DATA_DIR else base_dir

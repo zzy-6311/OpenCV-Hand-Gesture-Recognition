@@ -9,6 +9,9 @@
 !/data/test/test2.mp4
 !/data/test/test3.mp4
 
+# Generated development/evaluation output is not release source.
+/reports/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

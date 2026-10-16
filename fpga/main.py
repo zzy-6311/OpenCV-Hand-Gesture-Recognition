@@ -16,7 +16,7 @@ import numpy as np
 from recognizer import draw_text_lines, recognize, render_result
 
 
-DEFAULT_VIDEO = Path(__file__).resolve().parent / "data/test"
+DEFAULT_VIDEO = Path(__file__).resolve().parent.parent / "data/test"
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".webm", ".mts"}
 WINDOW_NAME = "Finger recognition - video"
 FRAME_HOLD_MS = 0  # Additional minimum display time, after this frame is recognized.
@@ -212,7 +212,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="逐帧识别视频；当前视频默认循环，按 N 才播放下一段。")
     parser.add_argument("video", nargs="?", type=Path, default=DEFAULT_VIDEO,
-                        help="视频或文件夹路径；默认仓库内 data/test，文件按自然顺序排列")
+                        help="视频或文件夹路径；默认 ../data/test，文件按自然顺序排列")
     args = parser.parse_args(argv)
     try:
         videos, index = collect_videos(args.video)

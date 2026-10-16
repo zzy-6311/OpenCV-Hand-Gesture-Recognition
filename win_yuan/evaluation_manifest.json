@@ -1,0 +1,33 @@
+{
+  "description": "Expected old image filenames; keep missing samples visible in evaluation.",
+  "old_filenames": [
+    "gesture_00.jpg",
+    "gesture_00_busy.jpg",
+    "gesture_00_s3.jpg",
+    "gesture_01.jpg",
+    "gesture_01_busy.jpg",
+    "gesture_02.jpg",
+    "gesture_02_busy.jpg",
+    "gesture_02_s3.jpg",
+    "gesture_03.jpg",
+    "gesture_03_busy.jpg",
+    "gesture_03_s3.jpg",
+    "gesture_04.jpg",
+    "gesture_04_busy.jpg",
+    "gesture_04_s3.jpg",
+    "gesture_05.jpg",
+    "gesture_05_busy.jpg",
+    "gesture_05_s3.jpg",
+    "gesture_06.jpg",
+    "gesture_06_busy.jpg",
+    "gesture_06_s3.jpg",
+    "gesture_08.jpg",
+    "gesture_08_busy.jpg",
+    "gesture_08_s3.jpg",
+    "gesture_33.jpg",
+    "gesture_33_busy.jpg",
+    "gesture_33_s3.jpg",
+    "gesture_66_s3.jpg",
+    "gesture_ye.jpg"
+  ]
+}

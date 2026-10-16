@@ -766,3 +766,4 @@ def refine_thumb_from_five_positions(measured, config=DEFAULT_CONFIG):
     result = _complete_digit_topology(measured, closed, "five_observed_positions_thumb")
     result["thumb_recovered"] = "five_observed_positions"
     return result
+
