@@ -13,6 +13,7 @@ sys.dont_write_bytecode = True
 import cv2
 import numpy as np
 
+import recognizer as recognizer_core
 from recognizer import draw_text_lines, recognize, render_result
 
 
@@ -213,9 +214,16 @@ def main(argv=None) -> int:
         description="逐帧识别视频；当前视频默认循环，按 N 才播放下一段。")
     parser.add_argument("video", nargs="?", type=Path, default=DEFAULT_VIDEO,
                         help="视频或文件夹路径；默认 ../data/test，文件按自然顺序排列")
+    parser.add_argument("--resolution", choices=("320x180", "640x360"),
+                        default="320x180",
+                        help="启动时选择整条识别通路的分辨率；默认 320x180")
     args = parser.parse_args(argv)
     try:
+        # One startup profile; all algorithm stages use this same fixed grid.
+        recognizer_core.INPUT_MAX_WIDTH, recognizer_core.INPUT_MAX_HEIGHT = (
+            int(value) for value in args.resolution.split("x"))
         videos, index = collect_videos(args.video)
+        print(f"识别计算分辨率：{args.resolution}；固定顺时针90度逻辑坐标。")
         print("N/右箭头 下一视频；P/左箭头 上一视频；空格 暂停；R 重播；H 详情；Q/Esc 退出。")
         print(f"当前视频：{videos[index]}（默认循环此视频）")
         return play_videos(videos, index)

@@ -1,7 +1,7 @@
 """FPGA-oriented numeric reference, with original-frame video drawing.
 
-The core uses a fixed 640x360 camera grid and coordinate ROI, with clockwise
-90-degree logical views (360x640) rather than arbitrary RGB warping. Hand
+The core defaults to a fixed 320x180 camera grid (optional 640x360) and
+coordinate ROI, with clockwise 90-degree logical views rather than RGB warping. Hand
 entry is from the right. Images are independently segmented and measured.
 Distance transforms use bounded 12-bit Q2 recurrence.
 Python uses uint16 containers; RTL must explicitly declare the logical width.
@@ -26,8 +26,8 @@ import cv2
 import numpy as np
 import finger_geometry as FG
 
-INPUT_MAX_WIDTH = 640
-INPUT_MAX_HEIGHT = 360
+INPUT_MAX_WIDTH = 320
+INPUT_MAX_HEIGHT = 180
 
 DT_FRACTION_BITS = 2
 DT_WORD_BITS = 12
@@ -37,6 +37,31 @@ DT_FINITE_MAX = DT_INFINITY - 1
 DT_AXIAL_WEIGHT = DT_SCALE
 DT_DIAGONAL_WEIGHT = (14 * DT_SCALE + 5) // 10
 DT_KNIGHT_WEIGHT = (21969 * DT_SCALE + 5000) // 10000
+
+
+# Exact Q2 chamfer5 distance >= 8 pixels, with weights 4/6/9.
+# The forbidden offsets satisfy max(4*max(|x|,|y|)+min(|x|,|y|),
+# 3*(|x|+|y|)) < 32. This is not an approximate disk erosion.
+# RTL: 14 one-bit line delays and 185 selected binary AND taps; no full
+# distance frame or reverse pass is needed for this predicate consumer.
+_CORE8_HALF_SPANS = (3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 6, 5, 4, 3)
+_CORE8_KERNEL = np.asarray([
+    [abs(x - 7) <= span for x in range(15)]
+    for span in _CORE8_HALF_SPANS
+], dtype=np.uint8)
+
+
+def _distance_core8(mask: np.ndarray, *, border_value=255) -> np.ndarray:
+    """Exact fixed-threshold consumer; binary window, no distance map.
+
+    The full DT treats pixels beyond its domain as unavailable sources,
+    hence 255 outside. clean_mask's established explicit zero border is
+    fused by passing border_value=0; no padded full image is allocated.
+    """
+    if (DT_SCALE, DT_AXIAL_WEIGHT, DT_DIAGONAL_WEIGHT, DT_KNIGHT_WEIGHT) != (4, 4, 6, 9):
+        raise ValueError("The exact 8-pixel support kernel requires Q2 weights 4/6/9")
+    return cv2.erode(mask, _CORE8_KERNEL,
+                     borderType=cv2.BORDER_CONSTANT, borderValue=border_value) != 0
 
 
 def _distance_transform_fixed(mask: np.ndarray, *, diagnostics=None,
@@ -57,7 +82,7 @@ def _distance_transform_fixed(mask: np.ndarray, *, diagnostics=None,
     height, width = source.shape
     if max(height, width) > 32768:
         raise ValueError("Distance input dimensions exceed the bounded reference")
-    if output not in ("distance", "peak", "threshold"):
+    if output not in ("distance", "codes", "peak", "threshold"):
         raise ValueError("Unsupported distance consumer")
     if valid_mask is not None and (output != "peak" or np.shape(valid_mask) != source.shape):
         raise ValueError("Distance validity mask must match a peak input")
@@ -111,6 +136,8 @@ def _distance_transform_fixed(mask: np.ndarray, *, diagnostics=None,
                 return (-1, -1), 0.0
             y, x = divmod(int(positions[0]), width)
             return (x, y), float(np.finfo(np.float32).max)
+        if output == "codes":
+            return np.full(source.shape, DT_INFINITY, np.uint16)
         return np.full(source.shape, np.finfo(np.float32).max, np.float32)
 
     infinity = DT_INFINITY
@@ -197,9 +224,14 @@ def _distance_transform_fixed(mask: np.ndarray, *, diagnostics=None,
                          f"({DT_FINITE_MAX / DT_SCALE:g} px); capped={capped}, unreachable={unreachable}")
     if output == "peak":
         return peak_location, max(0, peak_code) / DT_SCALE
+    if output == "codes":
+        # Borrow the bounded integer state. Consumers scale isolated samples
+        # or thresholds, never allocate a second floating-point distance map.
+        return core
     result = core.astype(np.float32)
     result *= np.float32(1.0 / DT_SCALE)
     return result
+
 
 ROI_WIDTH_VS_SHORT = 0.75
 
@@ -294,26 +326,6 @@ FINGER_NAMES = ("thumb", "index", "middle", "ring", "pinky")
 FINGER_LABELS_CN = ("拇指", "食指", "中指", "无名指", "小指")
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 COLOR_BOUNDARY = (0, 200, 255)
 
 COLOR_TEXT = (255, 255, 255)
@@ -322,9 +334,6 @@ COLOR_PALM = (0, 165, 255)
 
 COLOR_WRIST = (0, 255, 255)
 
-COLOR_TIP = (0, 0, 255)
-
-COLOR_BASE = (255, 128, 0)
 
 COLOR_GAP = (255, 0, 255)
 
@@ -362,12 +371,6 @@ COLOR_FINGER_ON = (0, 220, 0)
 COLOR_FINGER_OFF = (120, 120, 120)
 
 FINGER_BOX_TAGS = ("T", "I", "M", "R", "P")
-
-
-
-
-
-
 
 
 # Frame measurements and display helpers.
@@ -434,7 +437,6 @@ def _active_rect(shape_hw, state):
     return roi_rect_pixels(shape_hw) if roi_enabled_now(state) else (0, 0, shape_hw[1], shape_hw[0])
 
 
-
 def _clip_active(mask, state):
     x0, y0, x1, y1 = _active_rect(mask.shape, state)
     mask[:y0] = 0
@@ -442,7 +444,6 @@ def _clip_active(mask, state):
     mask[:, :x0] = 0
     mask[:, x1:] = 0
     return mask
-
 
 
 def _finish_mask(mask: np.ndarray, state, method: str) -> np.ndarray:
@@ -470,6 +471,31 @@ def _threshold_source(frame, state):
     return frame
 
 
+def _median_u8_histogram(samples: np.ndarray) -> float:
+    """Exact color median through 256 integer bins; output is a Q1 scalar.
+
+    One channel has at most 640*360 samples. Bin/cumulative counts therefore
+    need 18 logical bits; the two middle values sum to at most 510 (9 bits).
+    uint32 is the host container, not an RTL precision increase. No floating
+    sample buffer or sorting/partitioning workspace is constructed.
+    """
+    values = np.asarray(samples)
+    if values.dtype != np.uint8:
+        raise ValueError("Color histogram median requires uint8 samples")
+    count = int(values.size)
+    if not 1 <= count <= 640 * 360:
+        raise ValueError("Color histogram median requires 1..230400 samples")
+    # NumPy bincount's native 256-bin integer result is cast immediately;
+    # only these small counts are stored as uint32, never float32 samples.
+    histogram = np.bincount(values.reshape(-1), minlength=256).astype(np.uint32)
+    cumulative = np.cumsum(histogram, dtype=np.uint32)
+    lower_rank = (count + 1) // 2
+    upper_rank = count // 2 + 1
+    lower = int(np.searchsorted(cumulative, lower_rank, side="left"))
+    upper = int(np.searchsorted(cumulative, upper_rank, side="left"))
+    return (lower + upper) * 0.5
+
+
 def _estimate_scene_shift(ycrcb: np.ndarray, state) -> tuple:
     """Measure background chroma from this frame’s ROI; reuse its board measurement when available."""
     height, width = ycrcb.shape[:2]
@@ -492,8 +518,8 @@ def _estimate_scene_shift(ycrcb: np.ndarray, state) -> tuple:
         if not np.any(sub_roi):
             state.flags.pop("scene_bg_estimate", None)
             return (0.0, 0.0)
-        bg_cr = float(np.median(ycrcb[::step, ::step, 1][sub_roi].astype(np.float32)))
-        bg_cb = float(np.median(ycrcb[::step, ::step, 2][sub_roi].astype(np.float32)))
+        bg_cr = _median_u8_histogram(ycrcb[::step, ::step, 1][sub_roi])
+        bg_cb = _median_u8_histogram(ycrcb[::step, ::step, 2][sub_roi])
     d_cr = bg_cr - float(SCENE_BASELINE_CR)
     d_cb = bg_cb - float(SCENE_BASELINE_CB)
     limit = float(SCENE_SHIFT_CLAMP)
@@ -573,23 +599,51 @@ def segment_skin(frame: np.ndarray, state) -> np.ndarray:
     return result
 
 
+HOLE_SCAN_ROUNDS = 2
+
+
 def _fill_internal_holes(binary: np.ndarray) -> np.ndarray:
-    """填掉前景**内部**的孔洞，完全不动外轮廓。
+    """Fixed-budget 4-connected background reachability, without flood queue.
 
-    做法：往外补一圈背景，再从角上 floodFill 把「外部背景」涂成 255。
-    补的那一圈保证「所有和图像边界相连的背景」都是连通的，
-    于是 floodFill 之后仍然是 0 的像素，就是被前景完全包住的内部空洞。
+    Each vertical sweep takes seeds from the already visited adjacent row and
+    all prior visits. A background row-run touching any seed becomes reachable
+    in full: RTL can implement this with left/right 1-bit latch propagation.
+    NumPy run reductions below are only the CPU expression of that row logic.
 
-    ⚠️ 为什么要补一圈：如果只在原图上从 (0,0) floodFill，而前景恰好把
-    画面上下切断（手贴到 ROI 左右边时就会这样），下半部分的背景就到不了，
-    会被误判成"空洞"整片填白。补一圈就彻底避免了这个坑。
+    This fixed number of sweeps is NOT exact for arbitrary serpentine mazes.
+    A background route with more vertical reversals than the scheduled sweeps
+    can be mistaken for a hole. No input-dependent convergence loop is used.
     """
-    height, width = binary.shape[:2]
-    padded = cv2.copyMakeBorder(binary, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
-    flood_mask = np.zeros((height + 4, width + 4), np.uint8)
-    cv2.floodFill(padded, flood_mask, (0, 0), 255)
-    holes = cv2.bitwise_not(padded)[1:-1, 1:-1]
-    return cv2.bitwise_or(binary, holes)
+    # The core sees a clockwise90 logical view; reachability sweeps operate
+    # in native camera row order. These axis changes are views, not resizes.
+    background = np.rot90(binary, 1) == 0
+    height, width = background.shape
+    reachable = np.zeros_like(background)
+    reachable[0] = background[0]
+    reachable[-1] = background[-1]
+    reachable[:, 0] = background[:, 0]
+    reachable[:, -1] = background[:, -1]
+    # Counts and run IDs need ceil(log2(width + 1)) bits, not float or int64.
+    for _ in range(HOLE_SCAN_ROUNDS):
+        for direction in (1, -1):
+            rows = range(height) if direction == 1 else range(height - 1, -1, -1)
+            for y in rows:
+                row = background[y]
+                starts = row & np.concatenate((np.ones(1, dtype=bool), ~row[:-1]))
+                indices = np.flatnonzero(starts)
+                if indices.size == 0:
+                    continue
+                seeds = reachable[y].copy()
+                previous = y - direction
+                if 0 <= previous < height:
+                    seeds |= reachable[previous]
+                seeds &= row
+                # Between starts, foreground positions cannot carry a seed.
+                active = np.concatenate((np.zeros(1, dtype=bool),
+                                         np.maximum.reduceat(seeds, indices)))
+                labels = np.cumsum(starts, dtype=np.uint16)
+                reachable[y] = row & active[labels]
+    return np.rot90(np.where(reachable, 0, 255).astype(np.uint8), -1)
 
 
 def roi_area_pixels(shape_hw: tuple, enabled: bool = None) -> int:
@@ -631,16 +685,13 @@ def clean_mask(frame: np.ndarray, state) -> np.ndarray:
             # need a palm-sized core inside it before hole filling. Keep a
             # supported hand whole so its forearm and wrist axes do not change.
             inside = cv2.bitwise_and(mask, board_valid)
-            padded = cv2.copyMakeBorder(
-                inside, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0
-            )
-            thick_core = _distance_transform_fixed(
-                padded, output="threshold", threshold_pixels=RECON_MIN_RADIUS_PX
-            )[1:-1, 1:-1]
+            if RECON_MIN_RADIUS_PX != 8:
+                raise ValueError("The streamed core predicate is compiled for an 8-pixel radius")
+            thick_core = _distance_core8(inside, border_value=0)
             outside_labels = np.unique(labels[board_valid == 0])
             core_labels = np.unique(labels[thick_core])
             # These full-size work planes have no later consumer in this stage.
-            del inside, padded, thick_core
+            del inside, thick_core
             eligible[outside_labels] = False
             eligible[core_labels] = True
             eligible[0] = False
@@ -683,19 +734,20 @@ def clean_mask(frame: np.ndarray, state) -> np.ndarray:
 
 def _reject_board_shadow_branches(mask, ycrcb, board_valid, background_crcb,
                                   palm_seed, palm_radius, *, foreground_crcb=None):
-    """Remove thinly attached board shadows using this frame's two chroma centers.
+    """One colour/support pipeline for connected and detached board shadows.
 
-    Opening supplies connectivity evidence; it never replaces the hand mask.
-    Palm-supported components and skin-colored thin fingers retain their
-    original outline. Only board-colored detached branches are removed.
+    Measured Q1 colour centres feed integer pixel comparisons, then a small
+    binary dilation protects mixed finger boundaries. No opening, component
+    labels, branch voting or separate detached-shadow classifier is needed.
     """
-    diagnostic = dict(applied=False, rejected_branches=0, removed_pixels=0)
+    diagnostic = dict(applied=False, removed_pixels=0, method="local_skin_support")
     if (ycrcb is None or board_valid is None or background_crcb is None or
             palm_radius <= 0 or not np.any(palm_seed)):
         return mask, diagnostic
     # The caller already measured the exact same uint8 seed medians for
     # reconstruction. Integer/half-integer medians are exact in float32.
-    foreground = (np.median(ycrcb[:, :, 1:][palm_seed].astype(np.float32), axis=0)
+    foreground = (np.asarray([_median_u8_histogram(ycrcb[:, :, channel][palm_seed])
+                              for channel in (1, 2)], np.float32)
                   if foreground_crcb is None else
                   np.asarray(foreground_crcb, np.float32))
     background = np.asarray(background_crcb, np.float32)
@@ -712,38 +764,23 @@ def _reject_board_shadow_branches(mask, ycrcb, board_valid, background_crcb,
     # The existing minimum flesh support defines a scale-relative thin neck.
     size = max(3, int(round(palm_radius * RECOG_TIP_MIN_THICKNESS)) | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
-    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
-    diagnostic.update(applied=True, kernel=size, components=count - 1)
-    if count <= 2:
-        return mask, diagnostic
-    protected = np.zeros(count, bool)
-    protected[np.unique(labels[palm_seed])] = True
-    protected[0] = False
-    outside_votes = np.bincount(labels[board_valid == 0], minlength=count)
-    possible = (~protected) & (outside_votes == 0)
-    possible[0] = False
-    if not np.any(possible):
-        return mask, diagnostic
-    # Only detached, board-contained components need a color vote. Avoid
-    # converting/scoring every background and palm pixel of the full frame.
-    selected = possible[labels]
-    selected_labels = labels[selected]
+
+    # The comparison is squared nearest-centre distance after cancelling the
+    # common pixel-square term. Q1 inputs need at most signed 21-bit 2*score.
+    selected = mask != 0
     offset2 = ycrcb[:, :, 1:][selected].astype(np.int32) * 2 - background2
     score4 = offset2 @ direction2
-    foreground_votes = np.bincount(
-        selected_labels[2 * score4 >= separation4], minlength=count)
-    rejected = possible & (foreground_votes * 2 < stats[:, cv2.CC_STAT_AREA])
-    diagnostic["rejected_branches"] = int(rejected.sum())
-    if not np.any(rejected):
-        return mask, diagnostic
-    remove = cv2.dilate((rejected.astype(np.uint8) * 255)[labels], kernel)
-    remove[protected[labels]] = 0
-    erased = (remove > 0) & (mask > 0)
-    diagnostic["removed_pixels"] = int(erased.sum())
-    result = mask.copy()
-    result[erased] = 0
-    return result, diagnostic
+    support = np.zeros_like(mask)
+    support[selected] = (2 * score4 >= separation4).astype(np.uint8)
+    cv2.dilate(support, kernel, dst=support)
+    erased = selected & (board_valid != 0) & (support == 0)
+    removed = int(np.count_nonzero(erased))
+    diagnostic.update(applied=True, support_filter_applied=True, support_kernel=size,
+                      connected_removed_pixels=removed, removed_pixels=removed)
+    if removed:
+        mask = mask.copy()
+        mask[erased] = 0
+    return mask, diagnostic
 
 
 def _estimate_palm_robust(mask: np.ndarray, valid_mask=None):
@@ -789,12 +826,20 @@ def reconstruct_palm(frame: np.ndarray, state) -> np.ndarray:
     if ycrcb is None:
         return mask
     board_valid = _board_valid_for_threshold(mask.shape, state)
-    distance = _distance_transform_fixed(mask)
-    _, radius, _, location = cv2.minMaxLoc(distance, mask=board_valid)
+    distance = _distance_transform_fixed(mask, output="codes")
+    _, radius_code, _, location = cv2.minMaxLoc(distance, mask=board_valid)
+    radius = (float(np.finfo(np.float32).max) if radius_code == DT_INFINITY
+              else radius_code / DT_SCALE)
     if radius < float(RECON_MIN_RADIUS_PX):
         return mask
     cx, cy = (int(location[0]), int(location[1]))
-    seed = distance >= float(RECON_SEED_DT_FACTOR) * radius
+    # Match the previous float32 distance-array comparison exactly. Only
+    # the scalar threshold is quantized; each stored distance stays 12-bit Q2.
+    if radius_code == DT_INFINITY:
+        seed = distance == DT_INFINITY
+    else:
+        seed_code = int(np.ceil(float(np.float32(float(RECON_SEED_DT_FACTOR) * radius)) * DT_SCALE))
+        seed = distance >= seed_code
     del distance
     if board_valid is not None:
         seed &= board_valid > 0
@@ -803,7 +848,7 @@ def reconstruct_palm(frame: np.ndarray, state) -> np.ndarray:
         return mask
 
     def median_of(plane):
-        return float(np.median(plane[seed]))
+        return _median_u8_histogram(plane[seed])
 
     cr_plane = ycrcb[:, :, 1]
     cb_plane = ycrcb[:, :, 2]
@@ -872,44 +917,6 @@ def _contour_point(contour, index) -> np.ndarray:
     """按环形索引取轮廓点（float64）。"""
     count = int(contour.shape[0])
     return contour[int(index) % count].reshape(2).astype(np.float64)
-
-
-def _turning_ratio(contour, index: int, window: int) -> float:
-    """轮廓在该点的「转折比」= 弯曲深度 / 弦长。
-
-    直线段接近 0，指尖圆帽明显更大。**不依赖像素尺度**，所以不用绝对阈值。
-    """
-    here = _contour_point(contour, index)
-    before = _contour_point(contour, index - window)
-    after = _contour_point(contour, index + window)
-    chord = after - before
-    chord_length = float(np.linalg.norm(chord))
-    if chord_length < 1e-06:
-        return 0.0
-    offset = here - before
-    perpendicular = abs(float(offset[0] * chord[1] - offset[1] * chord[0])) / chord_length
-    return float(np.clip(perpendicular / chord_length, 0.0, 1.0))
-
-
-def _contour_angle(contour, index: int, window: int) -> float:
-    """轮廓在该点的夹角（度）。越接近 180 越平，越小越尖。"""
-    here = _contour_point(contour, index)
-    before = _contour_point(contour, index - window) - here
-    after = _contour_point(contour, index + window) - here
-    na = float(np.linalg.norm(before))
-    nb = float(np.linalg.norm(after))
-    if na < 1e-06 or nb < 1e-06:
-        return 180.0
-    cos_value = float(np.clip(np.dot(before, after) / (na * nb), -1.0, 1.0))
-    return float(np.degrees(np.arccos(cos_value)))
-
-
-def _tip_sharpness(contour, index: int, window: int) -> tuple:
-    """多尺度地量"这里尖不尖"，返回（转折比, 夹角）。"""
-    windows = [max(2, int(round(window * factor))) for factor in (0.6, 1.0, 1.5)]
-    ratios = [_turning_ratio(contour, index, w) for w in windows]
-    angles = [_contour_angle(contour, index, w) for w in windows]
-    return (float(np.max(ratios)), float(np.median(angles)))
 
 
 # Limits depend on configuration only and become constants in RTL.
@@ -1025,7 +1032,8 @@ def _protrusion_length(thickness: np.ndarray, tip_point, palm_center, radius: fl
     xi = np.clip(np.round(xs).astype(np.int32), 0, width - 1)
     yi = np.clip(np.round(ys).astype(np.int32), 0, height - 1)
     values = thickness[yi, xi]
-    hit = np.nonzero(values >= float(RECOG_TIP_PALM_THICK) * float(radius))[0]
+    threshold_code = int(np.ceil(float(np.float32(float(RECOG_TIP_PALM_THICK) * float(radius))) * DT_SCALE))
+    hit = np.nonzero((values == DT_INFINITY) | (values >= threshold_code))[0]
     if hit.size == 0:
         return total / float(radius)
     return float(fractions[int(hit[0])]) * total / float(radius)
@@ -1078,36 +1086,27 @@ def _estimate_wrist_legacy(mask: np.ndarray, palm_center, radius: float):
 
 
 def _truncate_forearm(mask: np.ndarray, palm_center, up, radius: float) -> np.ndarray:
-    """前臂截断：只保留"掌心 + 手指那一侧"的**半平面**。
+    """Clip the wrist half-plane with row-local integer coordinate tests.
 
-    ⚠️ 这里踩过一个严重的坑，务必保留这个写法：
-       最初把多边形边距写成 `4R`（约 594 px）。结果多边形在**手指方向**也只
-       延伸了 594 px，而指尖离截断线有 601 px —— **整片指尖被削平了**。
-       表现在掩膜上就是出现一条水平直边，那条直边上的毛刺被当成了 4 个"指尖"，
-       于是指尖数从 5 变成 6，而且指根/长度全乱。
-       判据：手指区每行游程数在 y=330~390 全是 0，y=400 才突然冒出 3~5 个。
-
-       所以沿**两个方向**都要延伸到远大于图像尺寸 —— 等价于一个半平面，
-       这样无论手举多高、指尖离掌心多远都不会被误切。
+    There is no full-frame polygon-validity buffer. The retained side and
+    rounded cut endpoints follow the prior wrist geometry. A half-pixel
+    boundary allowance includes the rasterized cut edge, as a binary line.
     """
-    height, width = mask.shape[:2]
-    far = float(max(height, width)) * 2.0
-    origin = np.asarray(palm_center, dtype=np.float64) - np.asarray(up, dtype=np.float64) * (
-        float(RECOG_TRUNCATE_FACTOR) * float(radius)
-    )
-    along = np.array([-float(up[1]), float(up[0])], dtype=np.float64)
-    polygon = np.array(
-        [
-            origin + along * far,
-            origin - along * far,
-            origin - along * far + np.asarray(up) * far,
-            origin + along * far + np.asarray(up) * far,
-        ],
-        dtype=np.int32,
-    )
-    allowed = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillConvexPoly(allowed, polygon, 255)
-    return cv2.bitwise_and(mask, allowed)
+    height, width = mask.shape
+    far = 2.0 * max(height, width)
+    axis = np.asarray(up, dtype=np.float64)
+    origin = np.asarray(palm_center, dtype=np.float64) - axis * (RECOG_TRUNCATE_FACTOR * radius)
+    along = np.array([-axis[1], axis[0]])
+    first, second = np.asarray([origin + along * far, origin - along * far], dtype=np.int32)
+    dx, dy = (int(v) for v in second - first)
+    sign = 1 if dx * axis[1] - dy * axis[0] >= 0 else -1
+    allowance = max(abs(dx), abs(dy)) // 2
+    xterm = -dy * (np.arange(width, dtype=np.int32) - int(first[0]))
+    result = mask.copy()
+    for y in range(height):
+        values = dx * (y - int(first[1])) + xterm
+        result[y, sign * values < -allowance] = 0
+    return result
 
 
 def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up,
@@ -1144,14 +1143,17 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
         return [], distances
 
     # 剩下少数候选才算形态和厚度（贵的那部分）
-    thickness = _distance_transform_fixed(mask)
+    thickness = _distance_transform_fixed(mask, output="codes")
     candidates = []
     for raw_index in candidate_indices:
         index = int(raw_index)
         flat_turn, too_flat, too_sharp = _tip_shape_tests(contour, index, window)
         inner = points[index] + (np.asarray(palm_center) - points[index]) * \
             float(RECOG_TIP_THICKNESS_SAMPLE)
-        thickness_ratio = _sample_plane(thickness, inner) / float(radius)
+        sample_code = _sample_plane(thickness, inner)
+        sample_pixels = (float(np.finfo(np.float32).max) if sample_code == DT_INFINITY
+                         else sample_code / DT_SCALE)
+        thickness_ratio = sample_pixels / float(radius)
         if flat_turn and \
                 thickness_ratio > RECOG_TIP_THICKNESS_MAX:
             continue
@@ -1430,12 +1432,6 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
     result["finger_names"] = list(FINGER_NAMES)
     result["finger_text"] = finger_states_text(states)
     return result
-
-
-
-
-
-
 
 
 def _finger_states(
@@ -1869,20 +1865,6 @@ def _transform_recognition_for_display(result, matrix):
     return out
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def prepare_hand_frame(frame: np.ndarray):
     """Keep the full fixed grid; use coordinate limits, not a cropped RGB buffer.
 
@@ -1931,50 +1913,53 @@ def prepare_hand_frame(frame: np.ndarray):
 
 
 def _fit_edge(points, extent):
-    """Deterministic consensus line: dependent coordinate = a * axis + b."""
-    points = np.asarray(points, np.float64)
+    """One bounded Q8 slope/intercept voter shared by the four board sides.
+
+    Only row/column envelopes enter this stage, never point-pair matrices.
+    A fixed slope bank votes into a reusable 1-D histogram; two small
+    sum/count passes center its intercept. No least-squares square sums,
+    floating polynomial fit, or large regression divider is required.
+    """
+    points = np.asarray(points, np.int32)
     if len(points) < 12:
         return None
-    ids = np.unique(np.linspace(0, len(points) - 1, min(48, len(points))).astype(int))
-    selected = points[ids]
-    first, second = np.triu_indices(len(selected), 1)
-    delta = selected[second] - selected[first]
-    usable = np.abs(delta[:, 0]) >= 0.2 * np.ptp(points[:, 0])
-    delta, first = (delta[usable], first[usable])
-    slopes = delta[:, 1] / delta[:, 0]
-    intercepts = selected[first, 1] - slopes * selected[first, 0]
-    usable = np.abs(slopes) <= np.tan(np.deg2rad(20.0))
-    slopes, intercepts = (slopes[usable], intercepts[usable])
-    if not len(slopes):
-        return None
-    tolerance = max(1.5, 0.005 * extent)
+    x, y = points[:, 0], points[:, 1]
+    tolerance_q8 = max(384, extent * 32 // 25)
+    radius = (tolerance_q8 + 255) >> 8
     best = None
-    for start in range(0, len(slopes), 128):
-        aa, bb = (slopes[start : start + 128], intercepts[start : start + 128])
-        error = np.abs(points[None, :, 1] - aa[:, None] * points[None, :, 0] - bb[:, None])
-        inside = error <= tolerance
-        votes = inside.sum(axis=1)
-        score = votes - np.minimum(error, tolerance).mean(axis=1) / (2 * tolerance)
-        winner = int(np.argmax(score))
-        if best is None or score[winner] > best[0]:
-            best = (float(score[winner]), float(aa[winner]), float(bb[winner]))
-    _, slope, intercept = best
-    for _ in range(3):
-        keep = np.abs(points[:, 1] - slope * points[:, 0] - intercept) <= tolerance
-        if np.count_nonzero(keep) < 10:
+    # +/-92/256 bounds board tilt to the original roughly +/-20 degrees.
+    # A hardware scheduler reuses the voter; 185 slopes do not require 185
+    # parallel engines. Coordinates need 10 bits at the 640x360 contract.
+    for slope_q8 in range(-92, 93):
+        intercept = y - ((slope_q8 * x + 128) >> 8)
+        origin = int(intercept.min())
+        hist = np.bincount(intercept - origin)
+        votes = np.convolve(hist, np.ones(2 * radius + 1, np.int32), mode='full')
+        b = int(np.argmax(votes)) - radius + origin
+        error = np.abs(y * 256 - slope_q8 * x - b * 256)
+        keep = error <= tolerance_q8
+        score = int(keep.sum()) * 65536 - int(np.minimum(error, tolerance_q8).sum())
+        if best is None or score > best[0]:
+            best = score, slope_q8, b * 256
+    _, slope_q8, intercept_q8 = best
+    for _ in range(2):
+        error = np.abs(y * 256 - slope_q8 * x - intercept_q8)
+        keep = error <= tolerance_q8
+        n = int(keep.sum())
+        if n < 10:
             return None
-        slope, intercept = np.polyfit(points[keep, 0], points[keep, 1], 1)
-    residual = np.abs(points[:, 1] - slope * points[:, 0] - intercept)
-    keep = residual <= tolerance
-    span = np.ptp(points[keep, 0]) / max(1, np.ptp(points[:, 0]))
-    return {
-        "a": float(slope),
-        "b": float(intercept),
-        "support": float(keep.mean()),
-        "span": float(span),
-        "error": float(np.median(residual[keep])),
-        "tolerance": tolerance,
-    }
+        # 28 signed bits cover 640 samples of a signed Q8 coordinate;
+        # divisor needs 10 bits. Python's accumulator is only a host model.
+        intercept_q8 = (int((y[keep] * 256 - slope_q8 * x[keep]).sum()) + n // 2) // n
+    residual_q8 = np.abs(y * 256 - slope_q8 * x - intercept_q8)
+    keep = residual_q8 <= tolerance_q8
+    if not np.any(keep):
+        return None
+    return {"a": slope_q8 / 256.0, "b": intercept_q8 / 256.0,
+            "support": float(keep.mean()),
+            "span": float(np.ptp(x[keep]) / max(1, np.ptp(x))),
+            "error": float(np.median(residual_q8[keep]) / 256.0),
+            "tolerance": tolerance_q8 / 256.0}
 
 
 def _intersection(vertical, horizontal):
@@ -2140,29 +2125,28 @@ def detect_board(frame):
     )
     smooth = cv2.GaussianBlur(small, (5, 5), 0)
     gray = cv2.cvtColor(smooth, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(smooth, cv2.COLOR_BGR2HSV)
+    maximum = smooth.max(axis=2).astype(np.uint16)
+    minimum = smooth.min(axis=2).astype(np.uint16)
+    # Saturation <= 45/255, with nearest-integer rounding: eliminate HSV
+    # division and unused hue. 510 and 91 are constant shift/add products.
+    low_saturation = 510 * (maximum - minimum).astype(np.uint32) <= 91 * maximum.astype(np.uint32)
     threshold, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    pale = ((hsv[:, :, 1] <= 45) & (gray >= max(45, threshold))).astype(np.uint8)
+    pale = (low_saturation & (gray >= max(45, threshold))).astype(np.uint8)
     pale = cv2.morphologyEx(
         pale, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     )
-    result = _select(_regions(pale, height, width), fallback)
-    if result["detected"] or result["reason"] == "ambiguous_pale_regions":
-        return result
-    dx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    dy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    magnitude = np.clip(cv2.magnitude(dx, dy), 0, 255).astype(np.uint8)
+    # Fixed color/edge fusion: local gradient breaks bright surfaces joined
+    # across a visible border. One component pass and one geometry candidate
+    # stage replace the former first attempt plus Canny fallback.
+    dx = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+    dy = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
+    magnitude = np.minimum(np.abs(dx) + np.abs(dy), 255).astype(np.uint8)
     high, _ = cv2.threshold(magnitude, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    high = max(20.0, high)
-    image_edges = cv2.Canny(gray, 0.4 * high, high, L2gradient=True)
-    barrier = cv2.dilate(image_edges, np.ones((3, 3), np.uint8))
+    barrier = cv2.dilate((magnitude >= max(20, int(high))).astype(np.uint8),
+                         np.ones((3, 3), np.uint8))
     separated = pale & (barrier == 0).astype(np.uint8)
-    refined = _select(_regions(separated, height, width, restore=pale), fallback)
-    if refined["detected"]:
-        refined["candidate_source"] = "image_edges"
-        return refined
-    if refined["reason"] == "ambiguous_pale_regions":
-        return refined
+    result = _select(_regions(separated, height, width, restore=pale), fallback)
+    result["candidate_source"] = "fused_color_gradient"
     return result
 
 
@@ -2184,14 +2168,14 @@ class RecognitionResult:
 
 
 def recognize(frame: np.ndarray) -> RecognitionResult:
-    """Letterbox BGR into the fixed 640x360 grid, independently per frame."""
+    """Letterbox BGR into the selected fixed grid, independently per frame."""
     if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8:
         raise ValueError("Expected a BGR uint8 image")
     if frame.ndim != 3 or frame.shape[2] != 3 or not frame.size:
         raise ValueError("Expected a nonempty three-channel BGR image")
     started = perf_counter()
     height, width = frame.shape[:2]
-    # Host-only letterbox adapter. The camera core always receives 640x360;
+    # Host-only letterbox adapter. The core receives the selected fixed grid;
     # non-16:9 inputs preserve their proportions and expose valid coordinates.
     scale = min(INPUT_MAX_WIDTH / float(width), INPUT_MAX_HEIGHT / float(height))
     fit_width = max(1, min(INPUT_MAX_WIDTH, int(round(width * scale))))
