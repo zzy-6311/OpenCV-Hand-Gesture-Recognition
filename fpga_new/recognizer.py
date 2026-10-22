@@ -1,23 +1,27 @@
 """Fixed black-background gesture reference for a 250x180 native-right core.
 
-Camera input is fixed 320x180; the PC adapter physically crops x=40:290.
-No board search, image rotation, ROI bitmap, shadow reconstruction or scene
-calibration remains. Preprocessing is fixed luminance threshold, 3x3 opening,
-right-entry binary reachability and four-sweep hole filling. Palm uses
-three 3x3 square dilations followed by three erosions in a shared work frame.
-Palm selection scans row-generated background boundaries against at most
-33 candidate positions, followed by two fixed nine-position refinements.
-No distance image or full boundary image/list is produced. Tip thickness
-and length use the existing contour geometry. The wrist reuses the
-entry interval already found during cleanup. RTL may reuse the expired palm
-work bank for the clipped hand mask; no extra survival pre-scan is required.
-Five-finger geometry and the previously validated low precision are preserved.
-Candidate boundary distances use 11-bit Q2 codes; geometry retains
-pixel/normal/arc/root grids. The candidate table and arithmetic unit must
-be shared across passes in RTL, not unrolled into 33 parallel datapaths.
-This Python numerical reference still contains frame-based reachability,
-boundary scans and contour geometry; it is not a finished one-pass RTL core.
-Labels, filenames, playback state and past decisions never enter the core.
+The PC adapter resizes to 320x180 and physically crops x=40:290. Core input
+is exactly 250x180. No board search, rotation, ROI bitmap or shadow repair.
+Shared 3x3 morphology, bounded-sweep reachability and hole filling produce
+the binary hand. Palm uses three dilations and three erosions, followed by
+one row of unsigned8 largest-solid-square state. Half the square diagonal
+is a scale estimate (45/32 approximates sqrt(2)), not an inscribed circle.
+There is no palm candidate-score table, boundary scan or distance plane.
+
+The right-entry interval gives wrist direction; only points are projected.
+Contour peak/valley detection uses two bounded integer squared-distance
+queues, without full-contour distance/extrema/local-coordinate arrays.
+One shared finger measurement lane consumes paired contour samples and
+retains seven widths plus integer regression sums. At most16 intrinsic
+records are cached; identity projection does not repeat shape measurement.
+Three-scale turn/angle tests and the unreachable needle rescue are removed.
+
+The core retains pixel/Q5/Q4/Q6 geometry precision and a Q1 palm radius.
+Intermediates still include floating-point host calculations; this is a
+numerical reference, not finished fixed-point RTL. FPGA must serialize and
+share arithmetic/windows rather than unroll Python loops. Multi-pass binary
+cleanup and contour storage remain. Labels and previous frames never enter
+recognition. Display-only analysis is outside recognize_cropped().
 """
 
 from __future__ import annotations
@@ -68,13 +72,11 @@ CROP_WIDTH = 250
 CROP_HEIGHT = 180
 
 
-PALM_CANDIDATE_CAPACITY = 33
-PALM_SEED_COLUMN_STRIDE = 8
-PALM_SCORE_INFINITY = 2047
-PALM_SCORE_SCALE = 4
-
-
 PALM_MIN_RADIUS_PX = 8
+PALM_MAX_RADIUS_PX = 126.5
+
+# Side<=180 -> Q1 radius<=253 -> round(.45R)<=57.
+RADIAL_MAX_HALF_WINDOW = 57
 
 
 RECOG_WRIST_MIN_PIXELS = 12
@@ -89,9 +91,6 @@ RECOG_TRUNCATE_LINE_HALF = 1.6
 RECOG_TIP_MIN_DISTANCE = 1.0
 
 
-RECOG_TIP_PALM_THICK = 0.45
-
-
 RECOG_TIP_PROTRUSION_MIN = 1.45
 
 
@@ -99,24 +98,6 @@ RECOG_TIP_PEAK_WINDOW = 0.45
 
 
 RECOG_TIP_MIN_PROMINENCE = 0.2
-
-
-RECOG_TIP_MIN_TURN_RATIO = 0.1
-
-
-RECOG_TIP_MAX_ANGLE_DEG = 145.0
-
-
-RECOG_TIP_THICKNESS_SAMPLE = 0.2
-
-
-RECOG_TIP_THICKNESS_MAX = 0.45
-
-
-RECOG_TIP_MIN_ANGLE_DEG = 20.0
-
-
-RECOG_TIP_MIN_THICKNESS = 0.05
 
 
 RECOG_TIP_DEDUP = 0.35
@@ -346,126 +327,53 @@ def clean_mask(mask, state):
     return _fill_internal_holes(work, inplace=True) if kept else work
 
 
-def _palm_seed_candidates(work, candidates):
-    """Emit at most 33 integer seeds; no 250-column run/midpoint table.
-
-    Columns 0,8,...,248 and 249 are the fixed sampling schedule. A column's
-    longest foreground run contributes its midpoint, first run wins ties.
-    Remember only the first occupied column as fallback if every scheduled
-    column is empty. RTL reads the existing binary bank column by column;
-    only current-run/best-run counters and one fallback point are required.
-    Host column temporaries are bounded by height 180, not frame area.
-    """
-    height, width = work.shape
-    count = 0
-    fallback = None
-    for x in range(width):
-        selected = x % PALM_SEED_COLUMN_STRIDE == 0 or x == width - 1
-        if not selected and fallback is not None:
-            continue
-        active = work[:, x] != 0
-        changes = np.diff(np.concatenate(([False], active, [False])).astype(np.int8))
-        starts, ends = np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)
-        if starts.size == 0:
-            continue
-        k = int(np.argmax(ends - starts))
-        point = (x, (int(starts[k]) + int(ends[k]) - 1) // 2)
-        if fallback is None:
-            fallback = point
-        if selected:
-            if count >= PALM_CANDIDATE_CAPACITY:
-                raise ValueError("palm candidate capacity exceeded")
-            candidates[count] = point
-            count += 1
-    if count == 0 and fallback is not None:
-        candidates[0] = fallback
-        count = 1
-    return count
-
-
-def _palm_score_candidates(work, candidates, count, scores):
-    """One row scan updates <=33 candidate scores with Q2 chamfer distance.
-
-    Generate background pixels adjacent to foreground with a three-row
-    window. Discard each row after scoring; never create an HxW boundary
-    bitmap or a frame-length bx/by coordinate list. The NumPy vector below
-    is bounded by 33 and represents one shared RTL arithmetic lane iterated
-    over candidate RAM, NOT 33 required parallel lanes. Each update is
-    abs/subtract, min/max, shifts/add, and a min-score comparison.
-
-    Native coordinates fit uint8; refinement coordinates use signed 9 bits
-    (host int16). Valid coordinate differences are <=249/179 and score
-    <=1354, fitting unsigned 11 bits. 2047 means no in-frame background;
-    out-of-frame pixels are NOT invented as background. Candidate validity
-    is encoded as score zero; no per-frame validity plane is needed.
-    Hardware needs at most two previous binary rows plus the current row,
-    a 33-entry position/score table, and the existing palm work frame.
-    """
-    height, width = work.shape
-    points = candidates[:count]
-    values = scores[:count]
-    values.fill(PALM_SCORE_INFINITY)
-    for index, (raw_x, raw_y) in enumerate(points):
-        x, y = int(raw_x), int(raw_y)
-        if not (0 <= x < width and 0 <= y < height) or not work[y, x]:
-            values[index] = 0
-    for y in range(height):
-        near = np.zeros(width, dtype=np.bool_)
-        for yy in range(max(0, y - 1), min(height, y + 2)):
-            occupied = work[yy] != 0
-            near |= occupied
-            near[1:] |= occupied[:-1]
-            near[:-1] |= occupied[1:]
-        near &= work[y] == 0
-        for raw_x in np.flatnonzero(near):
-            dx = np.abs(points[:, 0] - np.int16(raw_x))
-            dy = np.abs(points[:, 1] - np.int16(y))
-            distance = (np.maximum(dx, dy) << 2) + (np.minimum(dx, dy) << 1)
-            np.minimum(values, distance, out=values, casting='unsafe')
-
-
-def _palm_from_boundary_rows(work):
-    """Fixed three boundary passes: <=33 seeds, nine stride-2, nine stride-1.
-
-    One reusable table: 33x(2 int16 coordinates + uint16 score) = 198 host
-    bytes; hardware payload is 33x(9+9+11)=957 logical bits, reducible
-    to 891 bits with invalid refinements rejected before uint8 storage.
-    No retained table of every column run or every boundary coordinate.
-    Equal scores prefer smaller y then smaller x, matching the reference.
-    This is bounded multipass processing, not a one-pass pixel pipeline.
-    """
-    if work.shape != (CROP_HEIGHT, CROP_WIDTH):
-        raise ValueError("palm input must be the fixed 180x250 mask")
-    candidates = np.empty((PALM_CANDIDATE_CAPACITY, 2), dtype=np.int16)
-    scores = np.empty(PALM_CANDIDATE_CAPACITY, dtype=np.uint16)
-    count = _palm_seed_candidates(work, candidates)
-    if count == 0:
-        return (0, 0), 0.0
-    best_value, best_point = -1, (0, 0)
-    for phase in range(3):
-        if phase:
-            stride = 2 if phase == 1 else 1
-            cx, cy = best_point
-            count = 0
-            for dy in (-stride, 0, stride):
-                for dx in (-stride, 0, stride):
-                    candidates[count] = cx + dx, cy + dy
-                    count += 1
-        _palm_score_candidates(work, candidates, count, scores)
-        for index in range(count):
-            x, y = map(int, candidates[index])
-            value = int(scores[index])
-            if value > best_value or (value == best_value and
-                                     (y, x) < (best_point[1], best_point[0])):
-                best_value, best_point = value, (x, y)
-    return best_point, best_value / PALM_SCORE_SCALE
-
-
 def _estimate_palm_robust(mask):
-    work=mask.copy()
-    for _ in range(3):cv2.dilate(work,_PALM_CLOSE_KERNEL,dst=work,iterations=1)
-    for _ in range(3):cv2.erode(work,_PALM_CLOSE_KERNEL,dst=work,iterations=1)
-    return _palm_from_boundary_rows(work)
+    work = mask.copy()
+    for _ in range(3):
+        cv2.dilate(work, _PALM_CLOSE_KERNEL, dst=work, iterations=1)
+    for _ in range(3):
+        cv2.erode(work, _PALM_CLOSE_KERNEL, dst=work, iterations=1)
+    if not np.any(work) or np.all(work):
+        return (0, 0), 0.0
+    return _palm_from_max_square(work)
+
+
+def _palm_from_max_square(work):
+    """Estimate palm from the largest solid square, using one 8-bit DP row.
+
+    Hardware recurrence for each foreground pixel is min(up, up_left, left)
+    + 1; background resets it to zero. Store only 250 unsigned 8-bit states,
+    plus scalar previous-left/up-left, best side and best center. Read each
+    old entry before overwriting it; no full-frame distance/boundary state
+    or candidate score table remains. The signed 16-bit host row expression
+    below vectorizes this serial recurrence; it is not an RTL state width.
+
+    Radius is half the square diagonal, with sqrt(2) approximated by 45/32
+    and floor to half a pixel. This is a palm scale estimate, NOT a claim
+    that the circumscribed circle is inside the mask. Max side 180 gives
+    radius Q1 code <=253 (8 bits). Keep earliest (y,x) center on size ties.
+    Outside-image pixels do not extend the solid square. An all-foreground
+    mask is rejected by the caller because it contains no usable hand edge.
+    """
+    # Largest solid square: a row of 8-bit DP state, three min inputs + 1.
+    # np.minimum.accumulate is a host vectorization of the left dependency.
+    # Border pixels outside the image are not assumed to continue foreground.
+    height,width=work.shape
+    previous=np.zeros(width,np.uint8)
+    positions=np.arange(width,dtype=np.int16)
+    best_size,best_point=0,(0,0)
+    for y in range(height):
+        up_left=np.concatenate((np.zeros(1,np.uint8),previous[:-1]))
+        base=np.where(work[y]!=0,np.minimum(previous,up_left).astype(np.int16)+1,0)
+        current=(np.minimum.accumulate(base-positions)+positions).astype(np.uint8)
+        size=int(current.max())
+        if size>=best_size and size:
+            end_x=int(np.flatnonzero(current==size)[0])
+            point=(end_x-(size-1)//2,y-(size-1)//2)
+            if size>best_size or (point[1],point[0])<(best_point[1],best_point[0]):
+                best_size,best_point=size,point
+        previous=current
+    return best_point,(best_size*45//32)/2.0
 
 
 def _to_local_points(points, origin, up, scale) -> np.ndarray:
@@ -480,94 +388,6 @@ def _to_local_points(points, origin, up, scale) -> np.ndarray:
     delta = pts - np.asarray(origin, dtype=np.float64).reshape(1, 2)
     safe = float(scale) if abs(float(scale)) > 1e-06 else 1.0
     return np.stack([delta @ right / safe, -(delta @ up) / safe], axis=1)
-
-
-def _contour_point(contour, index) -> np.ndarray:
-    """按环形索引取轮廓点（float64）。"""
-    count = int(contour.shape[0])
-    return contour[int(index) % count].reshape(2).astype(np.float64)
-
-
-_TIP_MAX_COS = float(np.cos(np.radians(RECOG_TIP_MAX_ANGLE_DEG)))
-
-
-_TIP_MIN_COS = float(np.cos(np.radians(RECOG_TIP_MIN_ANGLE_DEG)))
-
-
-def _angle_compare_vectors(first, second, cosine):
-    """Compare an angle with a fixed limit without sqrt/division/acos.
-
-    Return -1, 0 or 1 for below/equal/above the limit. A zero vector has
-    the old 180-degree meaning. Preserve signs before squaring so obtuse
-    and acute angles cannot be confused.
-    """
-    aa, bb = float(first @ first), float(second @ second)
-    if aa < 1e-12 or bb < 1e-12:
-        return 1
-    dot = float(first @ second)
-    if cosine >= 0:
-        if dot < 0:
-            return 1
-        lhs, rhs = dot * dot, cosine * cosine * aa * bb
-        return int(lhs < rhs) - int(lhs > rhs)
-    if dot >= 0:
-        return -1
-    lhs, rhs = dot * dot, cosine * cosine * aa * bb
-    return int(lhs > rhs) - int(lhs < rhs)
-
-
-def _tip_shape_tests(contour, index, window):
-    """Threshold-only versions of max turn ratio and median of 3 angles."""
-    here = _contour_point(contour, index)
-    enough_turn = False
-    above_max = below_min = 0
-    for factor in (0.6, 1.0, 1.5):
-        distance = max(2, int(round(window * factor)))
-        before = _contour_point(contour, index - distance)
-        after = _contour_point(contour, index + distance)
-        chord = after - before
-        chord2 = float(chord @ chord)
-        offset = here - before
-        cross = abs(float(offset[0] * chord[1] - offset[1] * chord[0]))
-        enough_turn |= (chord2 >= 1e-12 and
-                        cross >= RECOG_TIP_MIN_TURN_RATIO * chord2)
-        first, second = before - here, after - here
-        above_max += _angle_compare_vectors(first, second, _TIP_MAX_COS) > 0
-        below_min += _angle_compare_vectors(first, second, _TIP_MIN_COS) < 0
-    return not enough_turn, above_max >= 2, below_min >= 2
-
-
-def _circular_window_extrema(values, half_window):
-    """Exact min/max of the established circular contour-index window.
-
-    The existing peak thresholds are defined against a fixed number of
-    CHAIN_APPROX_NONE points. Keep that support unchanged; only replace the
-    repeated offset scans with monotone queues, using O(N + window) work.
-    """
-    half_window = int(half_window)
-    if half_window < 0:
-        raise ValueError("The contour window must be nonnegative")
-    minima, maxima = (np.empty_like(values), np.empty_like(values))
-    if len(values) == 0:
-        return (minima, maxima)
-    repeated = np.pad(values, (half_window, half_window), mode="wrap")
-    low, high = (deque(), deque())
-    right = 0
-    for index in range(len(values)):
-        while right <= index + 2 * half_window:
-            while low and repeated[low[-1]] >= repeated[right]:
-                low.pop()
-            while high and repeated[high[-1]] <= repeated[right]:
-                high.pop()
-            low.append(right)
-            high.append(right)
-            right += 1
-        while low and low[0] < index:
-            low.popleft()
-        while high and high[0] < index:
-            high.popleft()
-        minima[index], maxima[index] = (repeated[low[0]], repeated[high[0]])
-    return (minima, maxima)
 
 
 def _estimate_wrist(mask, palm_center, radius, entry_section=None):
@@ -651,74 +471,100 @@ def _compare_tip_polar(a, b, palm_center):
     cross = x1*y2-y1*x2
     return -1 if cross > 0 else (1 if cross < 0 else 0)
 
+def _radial_candidates(contour, palm_center, radius, up):
+    """Emit <=16 peaks without full distance, extrema or local-point planes.
+
+    Dense contour points are read cyclically through two monotone queues.
+    Each queue contains <=2*window+1 records: unsigned17 squared distance
+    (max249**2+179**2=94042) and unsigned12 scan index. The largest solid
+    square has side<=180, Q1 radius<=253, so window<=57 and each queue<=115
+    records (6670 logical bits for both queues, excluding control).
+    RTL shares comparison/square services and iterates queue pops; these
+    Python deques are bounded state, not an instruction to unroll hardware.
+    RTL uses compare-and-wrap counters, never a variable modulo divider;
+    center and incoming-point reads serialize on the shared contour RAM.
+    Center coordinates must be the core's native integer palm coordinates.
+    Only peaks surviving the half-plane check consume the sqrt service for
+    the original distance-minus-valley prominence. It remains distance,
+    never squared-distance difference. There is no radius approximation.
+    """
+    points = contour.reshape(-1, 2)
+    count = len(points)
+    cx, cy = map(int, palm_center)
+    if tuple(map(float, palm_center)) != (float(cx), float(cy)):
+        raise ValueError('Radial peak stream requires integer palm center')
+    window = max(2, int(round(RECOG_TIP_PEAK_WINDOW * float(radius))))
+    if window > RADIAL_MAX_HALF_WINDOW:
+        raise FG.GeometryCapacityError('radial_window_capacity_exceeded', window, RADIAL_MAX_HALF_WINDOW)
+    def square_at(index):
+        x, y = map(int, points[index % count])
+        dx, dy = x-cx, y-cy
+        return dx*dx + dy*dy
+    low, high = deque(), deque()
+    candidates = []
+    radial_gate2 = (RECOG_TIP_MIN_DISTANCE * float(radius)) ** 2
+    prominence_gate = RECOG_TIP_MIN_PROMINENCE * float(radius)
+    for scan in range(count + 2*window):
+        cutoff = scan - 2*window
+        while low and low[0][0] < cutoff:
+            low.popleft()
+        while high and high[0][0] < cutoff:
+            high.popleft()
+        value = square_at(scan-window)
+        while low and low[-1][1] >= value:
+            low.pop()
+        while high and high[-1][1] <= value:
+            high.pop()
+        low.append((scan, value))
+        high.append((scan, value))
+        if cutoff < 0:
+            continue
+        index = cutoff
+        center2 = square_at(index)
+        if center2 < radial_gate2 or high[0][1] > center2:
+            continue
+        local = _to_local_points(points[index:index+1], palm_center, up, radius)[0]
+        if local[1] > RECOG_TIP_PALM_SIDE_MAX:
+            continue
+        distance = float(np.sqrt(float(center2)))
+        if distance - float(np.sqrt(float(low[0][1]))) < prominence_gate:
+            continue
+        if len(candidates) >= FG.MAX_RAW_CANDIDATES:
+            raise FG.GeometryCapacityError('raw_candidate_capacity_exceeded', len(candidates)+1, FG.MAX_RAW_CANDIDATES)
+        candidates.append((index, (float(local[0]), float(local[1])), distance))
+    return candidates, window
+
+
 def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up,
                        *, measurement_context=None):
-    """在轮廓上找指尖。返回（候选列表, 距离剖面）。
+    """在轮廓上找指尖。返回（候选列表, None），不保存整条距离剖面。
 
     判据（全部按 R 归一化）：
       1. 到掌心的距离 >= 1.0R（RECOG_TIP_MIN_DISTANCE）
       2. 是该距离剖面的**局部极大**（环形邻域窗口）
       3. **突出度**足够（极大值要比邻域低谷高出 >= 0.2R）
-      4. 形态要"尖"：转折比够大，或夹角够小
-      5. 内部厚度不能太厚（排除掌缘/前臂那种厚凸起）
-      6. 必须落在**掌上方**（局部系里 y <= 0.15）
+      4. 必须落在**掌上方**（局部系里 y <= 0.15）
+      5. 使用局部双侧轮廓的长度和宽度判断伸指，再匹配身份
     """
     count = int(contour.shape[0])
     if count < 8:
         return [], None
-    points = contour.reshape(count, 2).astype(np.float64)
-    distances = np.linalg.norm(points - np.asarray(palm_center).reshape(1, 2), axis=1)
+    points = contour.reshape(count, 2)
+    candidate_data, _ = _radial_candidates(contour, palm_center, radius, up)
+    if not candidate_data:
+        return [], None
 
-    window = max(2, int(round(RECOG_TIP_PEAK_WINDOW * float(radius))))
-    floor_min, floor_max = _circular_window_extrema(distances, window)
-
-    # 先用纯向量化的三条门槛筛掉绝大多数轮廓点（快）
-    keep = distances >= RECOG_TIP_MIN_DISTANCE * float(radius)
-    keep &= floor_max <= distances + 1e-9
-    keep &= (distances - floor_min) >= RECOG_TIP_MIN_PROMINENCE * float(radius)
-    local_points = _to_local_points(points, palm_center, up, radius)
-    # Reject wrist-cut corners before ranking/capping the candidates, so
-    # invalid distant points cannot consume the slots of real fingertips.
-    keep &= local_points[:, 1] <= float(RECOG_TIP_PALM_SIDE_MAX)
-    candidate_indices = np.nonzero(keep)[0]
-    if candidate_indices.size == 0:
-        return [], distances
-    if candidate_indices.size > FG.MAX_RAW_CANDIDATES:
-        raise FG.GeometryCapacityError("raw_candidate_capacity_exceeded", candidate_indices.size, FG.MAX_RAW_CANDIDATES)
-
-    # 剩下少数候选才算形态和厚度（贵的那部分）
+    # Remaining candidates use the shared contour geometry measurement.
     # Tip measurements consume contour geometry; no distance plane is used.
     candidates = []
-    for raw_index in candidate_indices:
-        index = int(raw_index)
+    for index, local, distance in candidate_data:
         contour_index = _first_contour_occurrence(points, index)
-        flat_turn, too_flat, too_sharp = _tip_shape_tests(contour, index, window)
         feature = FG._measure_tip(contour, points[index],
                                   np.asarray(palm_center, dtype=float),
                                   np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG,
                                   contour_index=contour_index,
                                   measurement_context=measurement_context)
         thickness_ratio = 0.5 * feature["width_r"]
-        if flat_turn and \
-                thickness_ratio > RECOG_TIP_THICKNESS_MAX:
-            continue
-        if too_flat:
-            continue
-        # 针状毛刺：夹角和厚度同时极端小 -> 不是指尖（真指尖是圆帽，两者都不会这么极端）
-        if too_sharp and \
-                thickness_ratio < RECOG_TIP_MIN_THICKNESS:
-            # The radial sample can cross a finger gap. Rescue only a long
-            # local shaft with opposing sides that do not markedly taper.
-            shaft = FG._measure_tip(contour, points[index],
-                                    np.asarray(palm_center, dtype=float),
-                                    np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG,
-                                    contour_index=contour_index, measurement_context=measurement_context)
-            if not (shaft["width_r"] >= 2.0 * RECOG_TIP_MIN_THICKNESS and
-                    shaft["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r and
-                    shaft["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max and
-                    shaft["shaft_width_ratio"] <=
-                    FG.DEFAULT_CONFIG.base_width_factor):
-                continue
         # ★主力判据：凸出长度。真手指是细长凸出，指节凸起是圆钝鼓包。
         #   这一条同时管住了两头 —— 既排掉拳头的指节凸起，又保住很短的小指。
         protrusion = feature["length_r"]
@@ -736,8 +582,8 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
             "closed_support": closed,
             "contour_index": contour_index,
             "point": points[index].copy(),
-            "local": (float(local_points[index, 0]), float(local_points[index, 1])),
-            "distance": float(distances[index]),
+            "local": local,
+            "distance": distance,
             "turn_ratio": None,
             "angle_deg": None,
             "thickness_ratio": float(thickness_ratio),
@@ -787,7 +633,7 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
     if len(strong) + len(promoted) <= 5:
         strong.extend(promoted)
         strong.sort(key=cmp_to_key(lambda a, b: _compare_tip_polar(a, b, palm_center)))
-    return strong, distances
+    return strong, None
 
 
 def _detect_gaps(contour, tips, palm_center, radius: float, up):
@@ -909,10 +755,8 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
             return None
     palm_center = np.array([float(palm_center[0]), float(palm_center[1])], dtype=np.float64)
     radius = float(radius)
-    # A finite distance cannot exceed an axial path across this image.
-    # An all-foreground palm mask has no boundary and returns an infinity
-    # sentinel; reject it before converting that value into window sizes.
-    if not np.isfinite(radius) or radius > (mask.shape[0] - 1) + (mask.shape[1] - 1):
+    # The fixed 180-row crop bounds the largest square side and Q1 radius.
+    if not np.isfinite(radius) or radius > PALM_MAX_RADIUS_PX:
         state.flags["geometry_rejected"] = "invalid_palm_radius"
         return None
     wrist = _estimate_wrist(mask, palm_center, radius, getattr(state, "entry_section", None))
@@ -1560,8 +1404,6 @@ FOREGROUND_MIN_GRAY = 40
 
 
 _OPEN_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-
-
 
 
 _PALM_CLOSE_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))

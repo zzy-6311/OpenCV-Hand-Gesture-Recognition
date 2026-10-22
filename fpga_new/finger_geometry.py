@@ -21,7 +21,6 @@ tested numerical reference, not a complete fixed-point RTL implementation.
 The upstream mask, contour, palm center, axis and radius must already exist.
 """
 from dataclasses import asdict, dataclass
-from copy import deepcopy
 from functools import lru_cache
 from itertools import combinations
 
@@ -72,9 +71,10 @@ _ARC_SCALE = 16
 MAX_CONTOUR_POINTS = 2048
 MAX_RAW_CANDIDATES = 16
 MAX_TIP_SAMPLES = 61
+MAX_WIDTH_SAMPLES = 7
 MAX_IDENTIFICATION_TIPS = 6
-MAX_MEASUREMENT_REQUESTS = 2 * MAX_RAW_CANDIDATES + 2 * MAX_IDENTIFICATION_TIPS
-MAX_MEASUREMENT_COMPUTATIONS = MAX_RAW_CANDIDATES + MAX_IDENTIFICATION_TIPS
+MAX_MEASUREMENT_REQUESTS = MAX_RAW_CANDIDATES + 2 * MAX_IDENTIFICATION_TIPS
+MAX_MEASUREMENT_COMPUTATIONS = MAX_RAW_CANDIDATES
 
 
 class GeometryCapacityError(RuntimeError):
@@ -110,31 +110,18 @@ def _quantize(value, scale):
 
 
 @lru_cache(maxsize=64)
-def _axis_fit_constants(step_codes):
-    """Configuration-derived coefficients, independent of images or labels.
+def _axis_fit_divisor(step_codes):
+    """Configuration/prefix-only denominator ROM; no per-tip fit sample RAM.
 
-    c = n*w - sum(w) has exactly zero sum. It gives the same integer
-    accumulator as sum((n*pixel-sum(pixel))*w), without per-tip centering.
-    Default sampling uses 10 or 11 coefficients; custom configurations
-    generate their own table while retaining all rounding boundaries.
+    The centered samples preserve the reference nearest-even Q5 rounding.
+    Only the scalar divisor is cached; regression numerators are accumulated
+    directly from streamed integer midpoint/code/parity sufficient sums.
     """
     steps = np.asarray(step_codes, dtype=np.float64) / _NORMAL_SCALE
     centered = _quantize(steps - steps.mean(), _NORMAL_SCALE)
     denominator = _quantize(float(centered @ centered), _NORMAL_PRODUCT_SCALE)
-    weights = np.rint(centered * _NORMAL_SCALE).astype(np.int64)
-    coefficients = len(steps) * weights - weights.sum(dtype=np.int64)
-    coefficients.setflags(write=False)
-    centered.setflags(write=False)
-    divisor = len(steps) * _PIXEL_SCALE * _NORMAL_SCALE * max(1e-9, denominator)
-    return coefficients, divisor, centered
+    return len(steps) * _PIXEL_SCALE * _NORMAL_SCALE * max(1e-9, denominator)
 
-
-def _centered_axis_slope(mid, steps, centered=None, denominator=None):
-    pixel = np.rint(mid * _PIXEL_SCALE).astype(np.int64)
-    step_codes = tuple(np.rint(steps * _NORMAL_SCALE).astype(np.int64))
-    coefficients, divisor, _ = _axis_fit_constants(step_codes)
-    accumulated = (pixel * coefficients[:, None]).sum(axis=0, dtype=np.int64)
-    return accumulated.astype(float) / divisor
 
 
 def config_dict(config=DEFAULT_CONFIG):
@@ -192,11 +179,11 @@ def _tip_sampling_template(config):
     """Configuration-only samples; keep the reference floating-point values."""
     steps = np.arange(0.0, config.contour_limit_r + 1e-9, config.contour_step_r)
     width_samples = (steps >= config.width_start_r) & (steps <= config.width_end_r)
-    shaft_samples = ((steps >= config.axis_start_r - 1e-9) &
+    axis_samples = ((steps >= config.axis_start_r - 1e-9) &
                      (steps <= config.axis_end_r + 1e-9))
-    for values in (steps, width_samples, shaft_samples):
+    for values in (steps, width_samples, axis_samples):
         values.setflags(write=False)
-    return steps, width_samples, shaft_samples
+    return steps, width_samples, axis_samples
 
 
 def _validate_dense_contour(points):
@@ -215,44 +202,33 @@ def _validate_dense_contour(points):
 
 
 class TipMeasurementContext:
-    """One shared measurement service with 16 frame-local candidate records.
+    """One shared shape-measurement lane with 16 intrinsic candidate records.
 
-    The contour is immutable for this frame. Keys use the exact quantization
-    already performed by _measure_tip_impl, so tiny *pre-quantization* axis
-    differences no longer trigger duplicate work. A candidate's record can
-    be replaced if the identity stage uses a genuinely different quantized
-    axis. This is 16 storage slots, not 16 arithmetic engines.
-
-    At most 16 initial candidates, 16 optional needle checks, 6 cap checks,
-    and 6 identity requests are allowed (44 requests). Needle/cap requests
-    hit the same record; at most 16 + 6 computations are needed. Counters
-    explicitly enforce both bounds; cache size alone is not a work bound.
+    Contour shape is independent of the palm center and projected up vector.
+    A later normalized hand-axis request reuses the same intrinsic record
+    and only reprojects it. The cache never stores projected feature records.
+    Radius/configuration changes invalidate a record; contour changes require
+    a new frame-local context. Limits are 28 requests, at most 16 full
+    contour measurements and 16 cache entries, all explicitly enforced.
     """
 
     def __init__(self, contour):
         if len(contour) > MAX_CONTOUR_POINTS:
             raise GeometryCapacityError("contour_capacity_exceeded", len(contour), MAX_CONTOUR_POINTS)
         self._source_contour = contour
-        self._points = contour.reshape(-1, 2).astype(np.float64)
+        # Reuse the existing immutable integer contour; no float-coordinate
+        # duplicate or per-edge table is needed by the shared sampler.
+        self._points = contour.reshape(-1, 2).view()
         self._points.setflags(write=False)
         _validate_dense_contour(self._points)
-        self._points = _quantize(self._points, _PIXEL_SCALE)
-        self._points.setflags(write=False)
-        # No edge-code/edge-length RAM: steps are derived from existing points.
         self._measurements = {}
         self.requests = 0
         self.computations = 0
         self.cache_hits = 0
 
     @staticmethod
-    def _parameter_key(tip, center, up, radius, config):
-        # _measure_tip_impl converts each of these to float64 and rounds to
-        # exactly these grids *before* using it. No numerical precision is
-        # discarded by sharing equal rounded inputs.
-        return (tuple(_quantize(tip, _PIXEL_SCALE)),
-                tuple(_quantize(center, _PIXEL_SCALE)),
-                tuple(_quantize(up, _NORMAL_SCALE)),
-                float(_quantize(radius, _PIXEL_SCALE)), config)
+    def _parameter_key(tip, radius, config):
+        return (tuple(tip), float(radius), config)
 
     def measure(self, contour, tip, center, up, radius, config=DEFAULT_CONFIG, *, contour_index):
         if contour is not self._source_contour:
@@ -260,25 +236,30 @@ class TipMeasurementContext:
         if self.requests >= MAX_MEASUREMENT_REQUESTS:
             raise GeometryCapacityError("measurement_request_capacity_exceeded", self.requests + 1, MAX_MEASUREMENT_REQUESTS)
         self.requests += 1
+        tip = _quantize(tip, _PIXEL_SCALE)
+        center = _quantize(center, _PIXEL_SCALE)
+        up = _quantize(up, _NORMAL_SCALE)
+        radius = _quantize(radius, _PIXEL_SCALE)
+        if radius <= 0:
+            raise ValueError("Quantized palm radius is not positive")
         index = int(contour_index)
-        key = self._parameter_key(tip, center, up, radius, config)
-        if index != contour_index or not 0 <= index < len(self._points) or not np.array_equal(self._points[index], key[0]):
+        key = self._parameter_key(tip, radius, config)
+        if index != contour_index or not 0 <= index < len(self._points) or not np.array_equal(self._points[index], tip):
             raise ValueError("Candidate contour index does not match its point")
         cached = self._measurements.get(index)
         if cached is not None and cached[0] == key:
             self.cache_hits += 1
-            return deepcopy(cached[1])
-        if cached is None and len(self._measurements) >= MAX_RAW_CANDIDATES:
-            raise GeometryCapacityError("measurement_candidate_capacity_exceeded", len(self._measurements) + 1, MAX_RAW_CANDIDATES)
-        if self.computations >= MAX_MEASUREMENT_COMPUTATIONS:
-            raise GeometryCapacityError("measurement_computation_capacity_exceeded", self.computations + 1, MAX_MEASUREMENT_COMPUTATIONS)
-        result = _measure_tip_impl(contour, tip, center, up, radius, config,
-                                   points=self._points,
-                                   start_index=index,
-                                   points_quantized=True)
-        self.computations += 1
-        self._measurements[index] = (key, deepcopy(result))
-        return result
+            shape = cached[1]
+        else:
+            if cached is None and len(self._measurements) >= MAX_RAW_CANDIDATES:
+                raise GeometryCapacityError("measurement_candidate_capacity_exceeded", len(self._measurements) + 1, MAX_RAW_CANDIDATES)
+            if self.computations >= MAX_MEASUREMENT_COMPUTATIONS:
+                raise GeometryCapacityError("measurement_computation_capacity_exceeded", self.computations + 1, MAX_MEASUREMENT_COMPUTATIONS)
+            shape = _stream_tip_shape(self._points, index, tip, radius, config)
+            self.computations += 1
+            self._measurements[index] = (key, shape)
+        return _project_tip_shape(shape, center, up, radius, config)
+
 
 
 def _measure_tip(contour, tip, center, up, radius, config, *, contour_index, measurement_context=None):
@@ -287,20 +268,18 @@ def _measure_tip(contour, tip, center, up, radius, config, *, contour_index, mea
     return _measure_tip_impl(contour, tip, center, up, radius, config, start_index=contour_index)
 
 
-def _sample_tip_side(points, start, sign, targets):
-    """Stream one contour side into fixed sampling slots, without chain RAM.
+def _iter_tip_side(points, start, sign, steps, radius):
+    """Yield one interpolated contour sample at a time with two endpoint registers.
 
-    Keep just two contour endpoints and one Q4 arc accumulator. A point is
-    consumed at most once per side (including duplicate zero-length steps).
-    Output follows np.interp endpoint/duplicate behaviour; quantization is
-    still performed by the caller at the established pixel boundary.
+    There is no side-sample RAM, chain RAM or per-tip target-distance array.
+    A zero-length repeated edge advances the cursor without consuming a
+    target, preserving the reference interpolation and endpoint semantics.
     """
     count = len(points)
     if count > MAX_CONTOUR_POINTS:
         raise GeometryCapacityError("contour_capacity_exceeded", count, MAX_CONTOUR_POINTS)
-    if len(targets) > MAX_TIP_SAMPLES:
-        raise GeometryCapacityError("tip_sample_capacity_exceeded", len(targets), MAX_TIP_SAMPLES)
-    sampled = np.empty((len(targets), 2), dtype=np.float64)
+    if len(steps) > MAX_TIP_SAMPLES:
+        raise GeometryCapacityError("tip_sample_capacity_exceeded", len(steps), MAX_TIP_SAMPLES)
     output = 0
     previous = int(start)
     arc_code = 0
@@ -314,27 +293,145 @@ def _sample_tip_side(points, start, sign, targets):
             before = arc_code / _ARC_SCALE
             after = next_code / _ARC_SCALE
             slope = (points[following] - points[previous]) / (after - before)
-            while output < len(targets) and targets[output] <= after:
-                target = targets[output]
+            while output < len(steps) and steps[output] * radius <= after:
+                target = steps[output] * radius
                 if target == after:
-                    sampled[output] = points[following]
+                    sample = points[following]
                 elif target == before:
-                    sampled[output] = points[previous]
+                    sample = points[previous]
                 else:
-                    sampled[output] = points[previous] + slope * (target - before)
+                    sample = points[previous] + slope * (target - before)
+                yield sample
                 output += 1
         previous, arc_code = following, next_code
-        if output == len(targets):
+        if output == len(steps):
+            return
+    while output < len(steps):
+        yield points[previous]
+        output += 1
+
+
+def _stream_tip_shape(points, start, tip, radius, config):
+    """One shared lane: consume a sample pair, update bounded state, discard it.
+
+    Only seven width values are retained for the default exact median.
+    Integer regression sufficient sums replace the 61 midpoint values.
+    The complete median window precedes the first admissible base event.
+    Once that event arrives, the truncated fit is complete and we stop.
+    """
+    steps, width_samples, axis_samples = _tip_sampling_template(config)
+    if len(steps) > MAX_TIP_SAMPLES:
+        raise GeometryCapacityError("tip_sample_capacity_exceeded", len(steps), MAX_TIP_SAMPLES)
+    width_indices = np.flatnonzero(width_samples)
+    axis_indices = np.flatnonzero(axis_samples)
+    if len(width_indices) > MAX_WIDTH_SAMPLES:
+        raise GeometryCapacityError("width_sample_capacity_exceeded", len(width_indices), MAX_WIDTH_SAMPLES)
+    if not len(width_indices):
+        raise ValueError("Geometry requires at least one width sample")
+    width_window = []
+    base_detected = False
+    base = None
+    width = None
+    axis_count = 0
+    sum_xy = np.zeros(2, dtype=np.int64)
+    sum_code_xy = np.zeros(2, dtype=np.int64)
+    sum_parity_xy = np.zeros(2, dtype=np.int64)
+    sum_codes = 0
+    sum_parity = 0
+    axis_first_code = axis_last_code = 0
+    left = _iter_tip_side(points, start, -1, steps, radius)
+    right = _iter_tip_side(points, start, 1, steps, radius)
+    for index, (left_point, right_point) in enumerate(zip(left, right)):
+        left_point = _quantize(left_point, _PIXEL_SCALE)
+        right_point = _quantize(right_point, _PIXEL_SCALE)
+        midpoint = _quantize((left_point + right_point) * .5, _PIXEL_SCALE)
+        sample_width = _quantize(float(np.linalg.norm(left_point-right_point) / radius), _NORMAL_SCALE)
+        if width_samples[index]:
+            width_window.append(sample_width)
+        if index == width_indices[-1]:
+            width = _quantize(float(np.median(width_window)), _NORMAL_SCALE)
+        if axis_samples[index]:
+            if not base_detected:
+                code = int(np.rint(steps[index] * _NORMAL_SCALE))
+                pixel = np.rint(midpoint * _PIXEL_SCALE).astype(np.int64)
+                sum_xy += pixel
+                sum_code_xy += code * pixel
+                sum_parity_xy += (code & 1) * pixel
+                sum_codes += code
+                sum_parity += code & 1
+                if not axis_count:
+                    axis_first_code = code
+                axis_last_code = code
+                axis_count += 1
+        if (not base_detected and steps[index] >= config.width_end_r
+                and sample_width > config.base_width_factor * width):
+            base = midpoint
+            base_detected = True
+        if base_detected:
             break
-    if output < len(targets):
-        sampled[output:] = points[previous]
-    return sampled
+    if not base_detected:
+        base = midpoint
+    if axis_count >= 2:
+        # n*sum(w*pixel)-sum(w)*sum(pixel), using w=round(code-mean(code)).
+        # Except at half-integer means the rounding is a constant offset
+        # which cancels. At exact ties, keep one parity-weighted sum so the
+        # reference nearest-even coefficients remain exactly reproducible.
+        accumulated = axis_count * sum_code_xy - sum_codes * sum_xy
+        quotient, remainder = divmod(sum_codes, axis_count)
+        if 2 * remainder == axis_count:
+            parity_correction = axis_count * sum_parity_xy - sum_parity * sum_xy
+            accumulated += parity_correction if quotient & 1 else -parity_correction
+        # This table depends only on the configured sampling positions and
+        # prefix length; it is constant ROM, never a per-candidate sample RAM.
+        codes = tuple(int(np.rint(steps[i] * _NORMAL_SCALE)) for i in axis_indices[:axis_count])
+        divisor = _axis_fit_divisor(codes)
+        slope = _quantize(accumulated.astype(float) / divisor, _PIXEL_SCALE)
+        axis = _quantize(-slope, _PIXEL_SCALE)
+        axis_origin = _quantize(sum_xy.astype(float) / axis_count, _PIXEL_SCALE)
+    else:
+        axis = np.zeros(2, dtype=np.float64)
+        axis_origin = _quantize(tip, _PIXEL_SCALE)
+    axis /= max(1e-9, float(np.linalg.norm(axis)))
+    axis = _quantize(axis, _NORMAL_SCALE)
+    length = _quantize(float(np.linalg.norm(tip-base) / radius), _NORMAL_SCALE)
+    aspect = _quantize(length / max(.01, width), _NORMAL_SCALE)
+    return {"point": tip.tolist(), "base_point": base.tolist(),
+            "axis": axis.tolist(), "axis_origin": axis_origin.tolist(),
+            "width_r": width, "length_r": length,
+            "axis_fit_samples": axis_count,
+            "axis_fit_span_r": (axis_last_code-axis_first_code) / _NORMAL_SCALE if axis_count else 0.0,
+            "base_detected": base_detected, "aspect": aspect}
+
+
+def _project_tip_shape(shape, center, up, radius, config):
+    """Cheap per-request projection; no contour traversal and no cache mutation."""
+    tip = np.asarray(shape["point"], dtype=float)
+    axis = np.asarray(shape["axis"], dtype=float)
+    axis_origin = np.asarray(shape["axis_origin"], dtype=float)
+    right = _quantize(np.array([-up[1], up[0]]), _NORMAL_SCALE)
+    tip_local = _quantize(np.array([(tip-center) @ right, -(tip-center) @ up]) / radius, _NORMAL_SCALE)
+    origin_local = _quantize(np.array([(axis_origin-center) @ right,
+                             -(axis_origin-center) @ up]) / radius, _NORMAL_SCALE)
+    axis_local = _quantize(np.array([axis @ right, -axis @ up]), _NORMAL_SCALE)
+    root_x = _quantize(float(origin_local[0] + (config.root_y_r-origin_local[1]) *
+              axis_local[0] / axis_local[1]) if abs(axis_local[1]) > .15 else None, _NORMAL_SCALE)
+    width, length, aspect = shape['width_r'], shape['length_r'], shape['aspect']
+    has_branch_extent = bool(length > width)
+    broad_curled = bool(width > config.curled_width_r and aspect < config.curled_aspect_max)
+    return {"point": list(shape["point"]), "base_point": list(shape["base_point"]),
+            "tip_local": tip_local.tolist(), "axis_local": axis_local.tolist(),
+            "axis_origin": list(shape["axis_origin"]), "axis_origin_local": origin_local.tolist(),
+            "root_x_r": root_x, "width_r": width, "length_r": length,
+            "axis_fit_samples": shape["axis_fit_samples"], "axis_fit_residual_r": None,
+            "axis_fit_span_r": shape["axis_fit_span_r"], "base_detected": shape["base_detected"],
+            "aspect": aspect, "has_branch_extent": has_branch_extent,
+            "extension_warning": None if has_branch_extent else "short_contour_extent",
+            "extension_rejection_reason": "broad_curled" if broad_curled else None,
+            "extended": not broad_curled}
 
 
 def _measure_tip_impl(contour, tip, center, up, radius, config, *,
-                      points=None,
-                      start_index=None, points_quantized=False):
-    # Keep the same rounding boundaries as the independently tested candidate.
+                      points=None, start_index=None, points_quantized=False):
     tip = _quantize(tip, _PIXEL_SCALE)
     center = _quantize(center, _PIXEL_SCALE)
     up = _quantize(up, _NORMAL_SCALE)
@@ -342,104 +439,14 @@ def _measure_tip_impl(contour, tip, center, up, radius, config, *,
     if radius <= 0:
         raise ValueError("Quantized palm radius is not positive")
     pts = points if points_quantized else _quantize(
-        contour.reshape(-1, 2).astype(np.float64) if points is None else points,
-        _PIXEL_SCALE)
+        contour.reshape(-1, 2).astype(np.float64) if points is None else points, _PIXEL_SCALE)
     if start_index is None:
         raise ValueError("Core measurement requires the candidate contour index")
     start = int(start_index)
     if not 0 <= start < len(pts) or not np.array_equal(pts[start], tip):
         raise ValueError("Candidate contour index does not match its point")
-    steps, width_samples, shaft_samples = _tip_sampling_template(config)
-    sides = []
-    for sign in (-1, 1):
-        sides.append(_quantize(_sample_tip_side(pts, start, sign, steps * radius), _PIXEL_SCALE))
-    mid = _quantize((sides[0] + sides[1]) * 0.5, _PIXEL_SCALE)
-    widths = _quantize(np.linalg.norm(sides[0] - sides[1], axis=1) / radius,
-                       _NORMAL_SCALE)
-    width = _quantize(float(np.median(widths[width_samples])), _NORMAL_SCALE)
-    # The fixed local shaft window also distinguishes a rounded slender
-    # finger from a progressively widening needle/shadow. Do not truncate
-    # this window at an early base event: that would hide the widening.
-    shaft_widths = widths[shaft_samples]
-    shaft_width_ratio = _quantize(
-        float(shaft_widths.max() / shaft_widths.min())
-        if len(shaft_widths) >= 2 and np.isfinite(shaft_widths).all()
-        and shaft_widths.min() > 0 else float("inf"), _NORMAL_SCALE)
-    base_candidates = np.flatnonzero((steps >= config.width_end_r) &
-                                    (widths > config.base_width_factor * width))
-    base_index = int(base_candidates[0]) if len(base_candidates) else len(steps)-1
-    base = _quantize(mid[base_index], _PIXEL_SCALE)
-    length = _quantize(float(np.linalg.norm(tip - base) / radius), _NORMAL_SCALE)
-    # Estimate direction from every centerline point in the local straight
-    # shaft, instead of subtracting two contour samples. Pixel-scale changes
-    # to either endpoint otherwise rotate the extrapolated root appreciably.
-    # Regress both coordinates against arc length; this is a pair of bounded
-    # sums and needs no eigenvector, inverse matrix, or image-specific model.
-    axis_samples = ((steps >= config.axis_start_r - 1e-9) &
-                    (steps <= min(steps[base_index], config.axis_end_r) + 1e-9))
-    sample_steps = _quantize(steps[axis_samples], _NORMAL_SCALE)
-    sample_mid = _quantize(mid[axis_samples], _PIXEL_SCALE)
-    if len(sample_steps) >= 2:
-        step_codes = tuple(np.rint(sample_steps * _NORMAL_SCALE).astype(np.int64))
-        _, _, centered_steps = _axis_fit_constants(step_codes)
-        slope = _quantize(_centered_axis_slope(sample_mid, sample_steps), _PIXEL_SCALE)
-        # No identity/extension decision consumes the line-fit residual.
-        # Keep its compatibility field but omit the unused image arithmetic.
-        residual_r = None
-        axis = _quantize(-slope, _PIXEL_SCALE)
-        # A least-squares line passes through the sample centroid. The cap's
-        # extreme contour point need not lie on that line, especially with a
-        # rounded or asymmetric fingertip; using it would translate the fit.
-        axis_origin = _quantize(sample_mid.mean(axis=0), _PIXEL_SCALE)
-    else:
-        # A degenerate configuration is diagnosed through the existing
-        # horizontal/invalid-axis fallback, not fabricated finger states.
-        axis = _quantize(np.zeros(2, dtype=np.float64), _PIXEL_SCALE)
-        residual_r = None
-        axis_origin = _quantize(np.asarray(tip, dtype=np.float64), _PIXEL_SCALE)
-    axis /= max(1e-9, float(np.linalg.norm(axis)))
-    axis = _quantize(axis, _NORMAL_SCALE)
-    right = _quantize(np.array([-up[1], up[0]]), _NORMAL_SCALE)
-    tip_local = _quantize(
-        np.array([(tip-center) @ right, -(tip-center) @ up]) / radius, _NORMAL_SCALE)
-    origin_local = _quantize(np.array([(axis_origin-center) @ right,
-                             -(axis_origin-center) @ up]) / radius, _NORMAL_SCALE)
-    axis_local = _quantize(np.array([axis @ right, -axis @ up]), _NORMAL_SCALE)
-    root_x = _quantize(
-        float(origin_local[0] + (config.root_y_r-origin_local[1]) *
-              axis_local[0] / axis_local[1]) if abs(axis_local[1]) > .15 else None,
-        _NORMAL_SCALE)
-    aspect = _quantize(length / max(.01, width), _NORMAL_SCALE)
-    # An early contour-width event can be caused by a rough cap, rather than
-    # the real finger base. Record a suspiciously short extent, but do not use
-    # this same, potentially biased measurement as a hard extension veto.
-    # Keep the established broad-knuckle criterion until independent shaft
-    # evidence can distinguish a short bump from a rough-tipped long finger.
-    has_branch_extent = bool(length > width)
-    broad_curled = bool(width > config.curled_width_r and aspect < config.curled_aspect_max)
-    # The residual describes local line fit only. It is not a calibrated
-    # probability that the assigned finger identity is correct.
-    return {"point": tip.tolist(), "base_point": base.tolist(),
-            "tip_local": tip_local.tolist(), "axis_local": axis_local.tolist(),
-            "axis_origin": axis_origin.tolist(), "axis_origin_local": origin_local.tolist(),
-            "root_x_r": root_x, "width_r": width, "length_r": length,
-            "shaft_width_ratio": shaft_width_ratio,
-            "axis_fit_samples": int(len(sample_steps)), "axis_fit_residual_r": residual_r,
-            "axis_fit_span_r": float(np.ptp(sample_steps)) if len(sample_steps) else 0.0,
-            "base_detected": bool(len(base_candidates)),
-            "aspect": aspect,
-            "has_branch_extent": has_branch_extent,
-            "extension_warning": None if has_branch_extent else "short_contour_extent",
-            "extension_rejection_reason": "broad_curled" if broad_curled else None,
-            "extended": not broad_curled}
-
-
-
-
-
-
-
-
+    shape = _stream_tip_shape(pts, start, tip, radius, config)
+    return _project_tip_shape(shape, center, up, radius, config)
 
 
 
