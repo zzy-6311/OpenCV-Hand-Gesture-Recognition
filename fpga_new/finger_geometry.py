@@ -1,16 +1,22 @@
 """Finger identity from local contour axes and transverse palm position.
 
 No image names, truth labels, learned models, or previous frames are consumed.
-Identity and extension are separate: observed curled knuckles can occupy a
-finger slot while their extension bits stay false. Ordinary closed-knuckle
-supports use silhouette order; incomplete evidence falls back to transverse
-position with Q6 integers and at most 16 subsets. The production entry keeps
-these supports but omits curvature resampling and curve-driven refinements.
+Identity and extension are separate. Five-finger identity uses transverse
+root position with Q6 integers and at most 16 subsets. Closed-knuckle identity
+completion and its extra support list are removed. Weak fingertip promotion
+still uses the same local shaft measurement upstream.
+
+The deployed contour contract is integer CHAIN_APPROX_NONE: adjacent points
+are eight-connected, with repeated points permitted. Candidates carry their
+canonical first-occurrence contour index. There is no coordinate-index table,
+nearest-point search fallback, or stored edge-code plane. A shared pair of
+coordinate equality comparisons derives each Q4 step (0, 16 or 23) from the
+existing points; a shared wide accumulator preserves the original precision.
 
 Feature extraction rounds coordinates to 1/1 pixels and normalized
 features to 1/32. Local tip contour-length sums retain Q4 precision. Centerline
 regression uses integer centered-coordinate sums. Interpolation, square
-roots, division and angle evaluation still use floating point: this is a
+roots, division and point projection still use floating point: this is a
 tested numerical reference, not a complete fixed-point RTL implementation.
 The upstream mask, contour, palm center, axis and radius must already exist.
 """
@@ -61,6 +67,25 @@ _NORMAL_SCALE = 32
 _NORMAL_PRODUCT_SCALE = _NORMAL_SCALE * _NORMAL_SCALE
 _ARC_SCALE = 16
 
+# Engineering interface capacities, not a proof that every binary mask fits.
+# An overflowing frame is unavailable; points/candidates are never truncated.
+MAX_CONTOUR_POINTS = 2048
+MAX_RAW_CANDIDATES = 16
+MAX_TIP_SAMPLES = 61
+MAX_IDENTIFICATION_TIPS = 6
+MAX_MEASUREMENT_REQUESTS = 2 * MAX_RAW_CANDIDATES + 2 * MAX_IDENTIFICATION_TIPS
+MAX_MEASUREMENT_COMPUTATIONS = MAX_RAW_CANDIDATES + MAX_IDENTIFICATION_TIPS
+
+
+class GeometryCapacityError(RuntimeError):
+    """Finite hardware contract exceeded; caller must emit unavailable."""
+
+    def __init__(self, reason, actual, limit):
+        self.reason = str(reason)
+        self.actual = int(actual)
+        self.limit = int(limit)
+        super().__init__(f"{self.reason}: {self.actual} > {self.limit}")
+
 
 def _quantize(value, scale):
     """Round to the tested binary grid, nearest with ties to even.
@@ -82,11 +107,6 @@ def _quantize(value, scale):
     return float(out) if arr.ndim == 0 else out
 
 
-def _contour_arc_fixed(lengths):
-    """Quantize local edge lengths before the integer contour-length sum."""
-    codes = np.rint(np.asarray(lengths) * _ARC_SCALE).astype(np.int64)
-    accumulated = np.cumsum(codes, dtype=np.int64)
-    return np.r_[0., accumulated.astype(float) / _ARC_SCALE]
 
 
 @lru_cache(maxsize=64)
@@ -179,84 +199,141 @@ def _tip_sampling_template(config):
     return steps, width_samples, shaft_samples
 
 
-def _dense_contour_edge_lengths(points):
-    """Local arc step lookup for an original unit-grid CHAIN_APPROX_NONE contour.
+def _validate_dense_contour(points):
+    """PC contract check; the upstream CHAIN_APPROX_NONE trace guarantees this.
 
-    Interpolated, smoothed or sparse contours must use the general norm.
-    Horizontal/vertical edges use _ARC_SCALE; diagonals round to 23.
+    The deployed interface accepts only integer, eight-connected contour
+    neighbours (including zero-length repeats), never sparse approximations.
+    This host assertion is not an alternate hardware geometry path.
     """
-    delta = np.roll(points, -1, axis=0) - points
-    absolute = np.abs(delta)
-    if (np.equal(absolute, np.rint(absolute)).all() and
-            np.all(absolute <= 1)):
-        diagonal = (absolute[:, 0] == 1) & (absolute[:, 1] == 1)
-        nonzero = np.any(absolute != 0, axis=1)
-        codes = np.where(diagonal, 23, np.where(nonzero, _ARC_SCALE, 0))
-        return codes.astype(np.float64) / _ARC_SCALE
-    return np.linalg.norm(delta, axis=1)
+    if len(points) == 0 or not np.isfinite(points).all():
+        raise ValueError("Expected a nonempty finite dense contour")
+    if not np.equal(points, np.rint(points)).all():
+        raise ValueError("Dense contour coordinates must be integer pixels")
+    if np.any(np.abs(np.roll(points, -1, axis=0)-points) > 1):
+        raise ValueError("Expected CHAIN_APPROX_NONE neighbour steps")
 
 
 class TipMeasurementContext:
-    """Frame-local measurements for one immutable contour revision.
+    """One shared measurement service with 16 frame-local candidate records.
 
-    Create a new context after changing the contour; never retain it across
-    frames. The source contour must not be edited in place while this context
-    is in use. A different contour object automatically uses the uncached
-    path. Exact input keys deliberately distinguish even tiny axis changes.
+    The contour is immutable for this frame. Keys use the exact quantization
+    already performed by _measure_tip_impl, so tiny *pre-quantization* axis
+    differences no longer trigger duplicate work. A candidate's record can
+    be replaced if the identity stage uses a genuinely different quantized
+    axis. This is 16 storage slots, not 16 arithmetic engines.
 
-    Only raw measurements are cached, never slot/extension decisions. Every
-    caller owns its returned dictionary, including its nested point lists.
-    The bounded cache is a reference for a shared measurement service, not a
-    requirement to instantiate one arithmetic unit per cached candidate.
+    At most 16 initial candidates, 16 optional needle checks, 6 cap checks,
+    and 6 identity requests are allowed (44 requests). Needle/cap requests
+    hit the same record; at most 16 + 6 computations are needed. Counters
+    explicitly enforce both bounds; cache size alone is not a work bound.
     """
 
-    def __init__(self, contour, *, max_entries=32):
+    def __init__(self, contour):
+        if len(contour) > MAX_CONTOUR_POINTS:
+            raise GeometryCapacityError("contour_capacity_exceeded", len(contour), MAX_CONTOUR_POINTS)
         self._source_contour = contour
         self._points = contour.reshape(-1, 2).astype(np.float64)
         self._points.setflags(write=False)
-        self._offsets = np.arange(len(self._points))
-        self._offsets.setflags(write=False)
-        # Each contour edge has the same Euclidean length in either direction.
-        # Reordering these lengths preserves the original cumsum order.
-        self._edge_lengths = _dense_contour_edge_lengths(self._points)
-        self._edge_lengths.setflags(write=False)
-        self._max_entries = max(0, int(max_entries))
+        _validate_dense_contour(self._points)
+        self._points = _quantize(self._points, _PIXEL_SCALE)
+        self._points.setflags(write=False)
+        # No edge-code/edge-length RAM: steps are derived from existing points.
         self._measurements = {}
+        self.requests = 0
         self.computations = 0
         self.cache_hits = 0
 
     @staticmethod
-    def _array_key(value):
-        values = np.asarray(value)
-        # Preserve dtype as well as bits: float32 subtraction can otherwise
-        # differ from float64 subtraction of numerically identical inputs.
-        return values.dtype.str, values.shape, values.tobytes()
+    def _parameter_key(tip, center, up, radius, config):
+        # _measure_tip_impl converts each of these to float64 and rounds to
+        # exactly these grids *before* using it. No numerical precision is
+        # discarded by sharing equal rounded inputs.
+        return (tuple(_quantize(tip, _PIXEL_SCALE)),
+                tuple(_quantize(center, _PIXEL_SCALE)),
+                tuple(_quantize(up, _NORMAL_SCALE)),
+                float(_quantize(radius, _PIXEL_SCALE)), config)
 
-    def measure(self, contour, tip, center, up, radius, config=DEFAULT_CONFIG):
+    def measure(self, contour, tip, center, up, radius, config=DEFAULT_CONFIG, *, contour_index):
         if contour is not self._source_contour:
-            return _measure_tip_impl(contour, tip, center, up, radius, config)
-        key = (self._array_key(tip), self._array_key(center),
-               self._array_key(up), self._array_key(radius), config)
-        if key in self._measurements:
+            raise ValueError("Measurement context belongs to another immutable contour")
+        if self.requests >= MAX_MEASUREMENT_REQUESTS:
+            raise GeometryCapacityError("measurement_request_capacity_exceeded", self.requests + 1, MAX_MEASUREMENT_REQUESTS)
+        self.requests += 1
+        index = int(contour_index)
+        key = self._parameter_key(tip, center, up, radius, config)
+        if index != contour_index or not 0 <= index < len(self._points) or not np.array_equal(self._points[index], key[0]):
+            raise ValueError("Candidate contour index does not match its point")
+        cached = self._measurements.get(index)
+        if cached is not None and cached[0] == key:
             self.cache_hits += 1
-            return deepcopy(self._measurements[key])
+            return deepcopy(cached[1])
+        if cached is None and len(self._measurements) >= MAX_RAW_CANDIDATES:
+            raise GeometryCapacityError("measurement_candidate_capacity_exceeded", len(self._measurements) + 1, MAX_RAW_CANDIDATES)
+        if self.computations >= MAX_MEASUREMENT_COMPUTATIONS:
+            raise GeometryCapacityError("measurement_computation_capacity_exceeded", self.computations + 1, MAX_MEASUREMENT_COMPUTATIONS)
         result = _measure_tip_impl(contour, tip, center, up, radius, config,
-                                   points=self._points, offsets=self._offsets,
-                                   edge_lengths=self._edge_lengths)
+                                   points=self._points,
+                                   start_index=index,
+                                   points_quantized=True)
         self.computations += 1
-        if len(self._measurements) < self._max_entries:
-            self._measurements[key] = deepcopy(result)
+        self._measurements[index] = (key, deepcopy(result))
         return result
 
 
-def _measure_tip(contour, tip, center, up, radius, config, *, measurement_context=None):
+def _measure_tip(contour, tip, center, up, radius, config, *, contour_index, measurement_context=None):
     if measurement_context is not None:
-        return measurement_context.measure(contour, tip, center, up, radius, config)
-    return _measure_tip_impl(contour, tip, center, up, radius, config)
+        return measurement_context.measure(contour, tip, center, up, radius, config, contour_index=contour_index)
+    return _measure_tip_impl(contour, tip, center, up, radius, config, start_index=contour_index)
+
+
+def _sample_tip_side(points, start, sign, targets):
+    """Stream one contour side into fixed sampling slots, without chain RAM.
+
+    Keep just two contour endpoints and one Q4 arc accumulator. A point is
+    consumed at most once per side (including duplicate zero-length steps).
+    Output follows np.interp endpoint/duplicate behaviour; quantization is
+    still performed by the caller at the established pixel boundary.
+    """
+    count = len(points)
+    if count > MAX_CONTOUR_POINTS:
+        raise GeometryCapacityError("contour_capacity_exceeded", count, MAX_CONTOUR_POINTS)
+    if len(targets) > MAX_TIP_SAMPLES:
+        raise GeometryCapacityError("tip_sample_capacity_exceeded", len(targets), MAX_TIP_SAMPLES)
+    sampled = np.empty((len(targets), 2), dtype=np.float64)
+    output = 0
+    previous = int(start)
+    arc_code = 0
+    for _ in range(count - 1):
+        following = (previous + sign) % count
+        x_same = points[previous, 0] == points[following, 0]
+        y_same = points[previous, 1] == points[following, 1]
+        step_code = 0 if x_same and y_same else (_ARC_SCALE if x_same or y_same else 23)
+        next_code = arc_code + step_code
+        if step_code:
+            before = arc_code / _ARC_SCALE
+            after = next_code / _ARC_SCALE
+            slope = (points[following] - points[previous]) / (after - before)
+            while output < len(targets) and targets[output] <= after:
+                target = targets[output]
+                if target == after:
+                    sampled[output] = points[following]
+                elif target == before:
+                    sampled[output] = points[previous]
+                else:
+                    sampled[output] = points[previous] + slope * (target - before)
+                output += 1
+        previous, arc_code = following, next_code
+        if output == len(targets):
+            break
+    if output < len(targets):
+        sampled[output:] = points[previous]
+    return sampled
 
 
 def _measure_tip_impl(contour, tip, center, up, radius, config, *,
-                      points=None, offsets=None, edge_lengths=None):
+                      points=None,
+                      start_index=None, points_quantized=False):
     # Keep the same rounding boundaries as the independently tested candidate.
     tip = _quantize(tip, _PIXEL_SCALE)
     center = _quantize(center, _PIXEL_SCALE)
@@ -264,24 +341,18 @@ def _measure_tip_impl(contour, tip, center, up, radius, config, *,
     radius = _quantize(radius, _PIXEL_SCALE)
     if radius <= 0:
         raise ValueError("Quantized palm radius is not positive")
-    pts = _quantize(contour.reshape(-1, 2).astype(np.float64)
-                    if points is None else points, _PIXEL_SCALE)
-    start = int(np.argmin(np.sum((pts - tip) ** 2, axis=1)))
+    pts = points if points_quantized else _quantize(
+        contour.reshape(-1, 2).astype(np.float64) if points is None else points,
+        _PIXEL_SCALE)
+    if start_index is None:
+        raise ValueError("Core measurement requires the candidate contour index")
+    start = int(start_index)
+    if not 0 <= start < len(pts) or not np.array_equal(pts[start], tip):
+        raise ValueError("Candidate contour index does not match its point")
     steps, width_samples, shaft_samples = _tip_sampling_template(config)
-    offsets = np.arange(len(pts)) if offsets is None else offsets
     sides = []
     for sign in (-1, 1):
-        chain = pts[(start + sign * offsets) % len(pts)]
-        if edge_lengths is None:
-            lengths = np.linalg.norm(np.diff(chain, axis=0), axis=1)
-        else:
-            edge_ids = ((start - offsets[1:]) if sign < 0 else
-                        (start + offsets[:-1])) % len(pts)
-            lengths = edge_lengths[edge_ids]
-        arc = _contour_arc_fixed(lengths)
-        sides.append(_quantize(np.column_stack([
-            np.interp(steps * radius, arc, chain[:, k]) for k in (0, 1)]),
-            _PIXEL_SCALE))
+        sides.append(_quantize(_sample_tip_side(pts, start, sign, steps * radius), _PIXEL_SCALE))
     mid = _quantize((sides[0] + sides[1]) * 0.5, _PIXEL_SCALE)
     widths = _quantize(np.linalg.norm(sides[0] - sides[1], axis=1) / radius,
                        _NORMAL_SCALE)
@@ -363,106 +434,13 @@ def _measure_tip_impl(contour, tip, center, up, radius, config, *,
             "extended": not broad_curled}
 
 
-def shares_extended_branch(cap, observed):
-    """Reject a near-palm cap already covered by an observed finger shaft.
-
-    Use the measured axis line and width; a line from fingertip to palm center
-    is generally different when fingers spread. Missing axis measurements use
-    the conservative radial fallback. This veto marks ambiguous overlap, not
-    a proof that two observed points belong to the same anatomical finger.
-    """
-    cap_point = np.asarray(cap['tip_local'], dtype=float)
-    for finger in observed:
-        if not finger.get('extended') or finger.get('slot') == 0:
-            continue
-        tip = np.asarray(finger['tip_local'], dtype=float)
-        axis = np.asarray(finger.get('axis_local', []), dtype=float)
-        origin = np.asarray(finger.get('axis_origin_local', []), dtype=float)
-        reliable = axis.shape == (2,) and origin.shape == (2,) and np.isfinite(axis).all() and np.isfinite(origin).all() and (np.linalg.norm(axis) > 1e-09) and (finger.get('axis_fit_samples', 0) >= 2) and (finger.get('axis_fit_span_r', 0) > 0)
-        if reliable:
-            direction = axis / np.linalg.norm(axis)
-            reach = float(tip @ direction)
-            if reach <= 0:
-                reliable = False
-        if not reliable:
-            reach = float(np.linalg.norm(tip))
-            if reach <= 0:
-                continue
-            direction = tip / reach
-            origin = np.zeros(2, dtype=float)
-        along = float(cap_point @ direction)
-        if not 0 < along < reach:
-            continue
-        delta = cap_point - origin
-        across = abs(float(direction[0] * delta[1] - direction[1] * delta[0]))
-        if across <= 0.5 * float(finger['width_r']):
-            return True
-    return False
 
 
-def _complete_digit_topology(measured, supports, method="complete_digit_topology"):
-    """Use silhouette order only when all four non-thumb positions are observed.
-
-    Missing or competing caps leave the reference-line assignment unchanged.
-    The extension bits of existing candidates are never modified here.
-    """
-    others = [f for f in measured["features"] if f["slot"] != 0]
-    thumb = [f for f in measured["features"] if f["slot"] == 0]
-    if len(others) + len(supports) != 4:
-        measured["topology_used"] = False
-        return measured
-    ordered = sorted(others + supports,
-                     key=lambda f: np.arctan2(f["tip_local"][0], -f["tip_local"][1]),
-                     reverse=True)
-    for slot, feature in enumerate(ordered, 1):
-        feature["slot"] = slot
-    # Squared fixed-point costs belong to transverse root assignment, not this ordering.
-    measured["root_assignment"] = {key: measured[key] for key in
-                                  ("candidates", "score_margin_fixed_sq", "total_fixed_sq")}
-    measured.update(states=[bool(thumb)] + [bool(f["extended"]) for f in ordered],
-                    features=thumb + ordered, candidates=[], score_margin_fixed_sq=None,
-                    total_fixed_sq=None, method=method, topology_used=True)
-    return measured
 
 
-def refine_with_closed_caps(measured, contour, palm_center, up, radius,
-                            caps, config=DEFAULT_CONFIG, *, measurement_context=None):
-    """Retain short knuckles as closed positions, not additional fingertips.
 
-    Width is compared with fingers measured in this frame. No absolute pixel
-    dimensions or per-image values enter the topology gate.
-    """
-    if measured is None:
-        return measured
-    others = [f for f in measured["features"] if f["slot"] != 0]
-    thumb = [f for f in measured["features"] if f["slot"] == 0]
-    index = next((f for f in others if f["slot"] == 1), None)
-    min_width = min((f["width_r"] for f in others), default=0.0)
-    supports = []
-    for cap in caps:
-        if not cap.get("closed_support"):
-            continue
-        feature = _measure_tip(contour, np.asarray(cap["point"]), palm_center,
-                               up, radius, config, measurement_context=measurement_context)
-        # This gate admits new short caps. It does not veto an existing finger:
-        # a rough fingertip can bias its base measurement towards the cap.
-        if feature["length_r"] >= feature["width_r"] or feature["width_r"] < min_width:
-            continue
-        x, y = feature["tip_local"]
-        if y >= 0 or x > config.thumb_slope * -y:
-            continue
-        if (index is not None and x > index["tip_local"][0] and
-                (feature["root_x_r"] is None or feature["root_x_r"] > index["root_x_r"])):
-            continue
-        if thumb and abs(x - thumb[0]["tip_local"][0]) < feature["width_r"]:
-            continue
-        if shares_extended_branch(feature, others):
-            continue
-        feature.update(extended=False, extension_rejection_reason="closed_contour_support",
-                       tip_index=None, root_fixed=None, root_point=None, closed_support=True)
-        supports.append(feature)
-    measured["closed_support_candidates"] = supports
-    return _complete_digit_topology(measured, supports)
+
+
 
 
 def _is_lateral_thumb_branch(feature, center, up, radius, config):
@@ -491,8 +469,31 @@ def _is_lateral_thumb_branch(feature, center, up, radius, config):
                 base_y > config.root_y_r and base_x > abs(base_y))
 
 
+
+def _thumbward_candidate(features):
+    best = None
+    bx = by = 0
+    for feature in features:
+        x,y = (int(np.rint(v*32)) for v in feature['tip_local'])
+        if abs(x)>1712 or abs(y)>1712:
+            raise ValueError('250x180, R>=8 Q5 geometry contract exceeded')
+        if best is None:
+            best,bx,by=feature,x,y
+            continue
+        if y < 0 and by < 0:
+            larger = x*(-by) > bx*(-y)
+        elif y >= 0 and by >= 0:
+            larger = x > bx
+        elif y >= 0:
+            larger = x > 0 or (x == 0 and bx < 0)
+        else:
+            larger = bx < 0 or (bx == 0 and x > 0)
+        if larger: best,bx,by=feature,x,y
+    return best
+
+
 def recognize_fingers(mask, contour, palm_center, up, radius, tips, config=DEFAULT_CONFIG,
-                      *, closed_candidates=None, measurement_context=None):
+                      *, measurement_context=None):
     """Return (measurement, failure_reason); failure leaves fallback to caller."""
     if contour is None or len(contour) < 8 or not np.isfinite(radius) or radius <= 0:
         return None, "invalid_geometry"
@@ -505,7 +506,7 @@ def recognize_fingers(mask, contour, palm_center, up, radius, tips, config=DEFAU
     if measurement_context is None:
         measurement_context = TipMeasurementContext(contour)
     features = [_measure_tip(contour, np.asarray(t["point"], dtype=float), center, up, radius, config,
-                              measurement_context=measurement_context)
+                              contour_index=t["contour_index"], measurement_context=measurement_context)
                 for t in tips]
     for index, feature in enumerate(features):
         feature["tip_index"] = index
@@ -514,7 +515,7 @@ def recognize_fingers(mask, contour, palm_center, up, radius, tips, config=DEFAU
         return None, "palm_scan_unavailable"
     lo, hi = bounds
     # Select the most thumbward tip without an inverse trigonometric function.
-    first = max(features, key=lambda f: f["tip_local"][0] / max(1e-6, -f["tip_local"][1]), default=None)
+    first = _thumbward_candidate(features)
     # The five-finger relaxation needs four assignable non-thumb candidates.
     # A short invalid-axis bump that will be discarded must not manufacture
     # that evidence. Keep `first` eligible as the prospective thumb: a real
@@ -581,9 +582,4 @@ def recognize_fingers(mask, contour, palm_center, up, radius, tips, config=DEFAU
             "discarded_features": discarded,
             "candidates": ranked, "score_margin_fixed_sq": margin,
             "total_fixed_sq": ranked[0]["cost_fixed_sq"], "method": "root_geometry_fixed"}
-    if closed_candidates is not None:
-        measured = refine_with_closed_caps(measured, contour, center, up, radius,
-                                          closed_candidates, config,
-                                          measurement_context=measurement_context)
-        # FPGA deployment policy: keep direct/closed candidates only.
     return measured, None

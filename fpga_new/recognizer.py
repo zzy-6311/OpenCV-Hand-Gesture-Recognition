@@ -3,11 +3,20 @@
 Camera input is fixed 320x180; the PC adapter physically crops x=40:290.
 No board search, image rotation, ROI bitmap, shadow reconstruction or scene
 calibration remains. Preprocessing is fixed luminance threshold, 3x3 opening,
-one component filter and binary hole filling. Palm uses fixed 7x7 closing.
+right-entry binary reachability and four-sweep hole filling. Palm uses
+three 3x3 square dilations followed by three erosions in a shared work frame.
+Palm selection scans row-generated background boundaries against at most
+33 candidate positions, followed by two fixed nine-position refinements.
+No distance image or full boundary image/list is produced. Tip thickness
+and length use the existing contour geometry. The wrist reuses the
+entry interval already found during cleanup. RTL may reuse the expired palm
+work bank for the clipped hand mask; no extra survival pre-scan is required.
 Five-finger geometry and the previously validated low precision are preserved.
-DT uses 11-bit Q2 codes; geometry retains pixel/normal/arc/root grids.
-This Python numerical reference still contains frame-based component labeling,
-distance scans and contour geometry; it is not a finished one-pass RTL core.
+Candidate boundary distances use 11-bit Q2 codes; geometry retains
+pixel/normal/arc/root grids. The candidate table and arithmetic unit must
+be shared across passes in RTL, not unrolled into 33 parallel datapaths.
+This Python numerical reference still contains frame-based reachability,
+boundary scans and contour geometry; it is not a finished one-pass RTL core.
 Labels, filenames, playback state and past decisions never enter the core.
 """
 
@@ -59,241 +68,10 @@ CROP_WIDTH = 250
 CROP_HEIGHT = 180
 
 
-DT_FRACTION_BITS = 2
-
-
-DT_WORD_BITS = 11
-
-
-DT_SCALE = 1 << DT_FRACTION_BITS
-
-
-DT_INFINITY = (1 << DT_WORD_BITS) - 1
-
-
-DT_FINITE_MAX = DT_INFINITY - 1
-
-
-DT_AXIAL_WEIGHT = DT_SCALE
-
-
-DT_DIAGONAL_WEIGHT = (14 * DT_SCALE + 5) // 10
-
-
-DT_KNIGHT_WEIGHT = (21969 * DT_SCALE + 5000) // 10000
-
-
-class DistanceWorkspace:
-    """One lazily allocated DT state RAM owned by one recognition call.
-
-    For 250x180, a finite axial path is at most 4*(249+179)=1712,
-    below the 11-bit finite limit 2046. Q2 fractional precision is unchanged.
-    The ndarray remains uint16 in Python; this is a hardware-sharing reference,
-    not a claim that Python storage or synthesized RAM automatically uses 11 bits.
-
-    A codes result borrows this state and is valid only until the next DT call
-    with this workspace. The core runs peak first (only scalars escape), then
-    codes, and performs no further DT while consuming those codes. Nothing is
-    global or retained in RecognitionResult, so frames cannot share state.
-    """
-
-    def __init__(self, shape_hw):
-        self.shape = tuple(int(v) for v in shape_hw)
-        if len(self.shape) != 2 or min(self.shape) <= 0:
-            raise ValueError("Distance workspace requires a nonempty 2D shape")
-        self.state = None
-        self.allocations = 0
-        self.uses = 0
-
-    def reset(self, shape_hw, initial):
-        if tuple(shape_hw) != self.shape:
-            raise ValueError("Distance workspace shape does not match input")
-        height, width = self.shape
-        if self.state is None:
-            self.state = np.empty((height + 4, width + 4), dtype=np.uint16)
-            self.allocations += 1
-        self.state.fill(initial)
-        self.uses += 1
-        return self.state
-
-
-def _distance_transform_fixed(mask: np.ndarray, *, diagnostics=None,
-                           output="distance", valid_mask=None, threshold_pixels=None,
-                           workspace=None):
-    """Bounded integer chamfer5 recurrence at explicit logical precision.
-
-    All weights, horizontal propagation, threshold comparison, result adapter
-    and sentinels derive from DT_FRACTION_BITS and DT_WORD_BITS. uint16 is the
-    Python storage container, not a claim that hardware must use 16 bits.
-    int32 scratch models nonwrapping addition before bounded state writeback.
-    Exact-final-cap and unreachable outputs raise, never silently pass as valid
-    distances. Threshold mode intentionally caps at its comparison threshold.
-    All-foreground input returns the established explicit infinity sentinel.
-    """
-    source = np.asarray(mask)
-    if source.ndim != 2 or source.dtype != np.uint8 or source.size == 0:
-        raise ValueError("Distance input must be a nonempty 2D uint8 mask")
-    height, width = source.shape
-    if max(height, width) > 32768:
-        raise ValueError("Distance input dimensions exceed the bounded reference")
-    if workspace is not None:
-        if not isinstance(workspace, DistanceWorkspace):
-            raise TypeError("Expected a DistanceWorkspace or None")
-        if workspace.shape != source.shape:
-            raise ValueError("Distance workspace shape does not match input")
-    if output not in ("distance", "codes", "peak", "threshold"):
-        raise ValueError("Unsupported distance consumer")
-    if valid_mask is not None and (output != "peak" or np.shape(valid_mask) != source.shape):
-        raise ValueError("Distance validity mask must match a peak input")
-    threshold_code = None
-    if output == "threshold":
-        if threshold_pixels is None or np.ndim(threshold_pixels) != 0 or not np.isfinite(threshold_pixels):
-            raise ValueError("A finite distance threshold is required")
-        # Preserve NumPy's float32 result-array comparison, including its weak
-        # Python scalar and explicit NumPy float64 scalar promotion rules.
-        comparison_dtype = np.result_type(np.dtype(np.float32), threshold_pixels)
-        normalized_threshold = np.asarray(threshold_pixels, dtype=comparison_dtype).item()
-        threshold_code = int(np.ceil(float(normalized_threshold) * DT_SCALE))
-        if not 0 <= threshold_code <= DT_FINITE_MAX:
-            raise ValueError("Threshold exceeds the configured fixed-distance range")
-    if diagnostics is not None:
-        diagnostics["calls"] = diagnostics.get("calls", 0) + 1
-        diagnostics["pixels"] = diagnostics.get("pixels", 0) + source.size
-        diagnostics["configuration"] = [DT_FRACTION_BITS, DT_WORD_BITS,
-                                        DT_AXIAL_WEIGHT, DT_DIAGONAL_WEIGHT, DT_KNIGHT_WEIGHT]
-        diagnostics["python_storage_dtype"] = "uint16"
-        diagnostics["logical_word_bits"] = DT_WORD_BITS
-        diagnostics["fraction_bits"] = DT_FRACTION_BITS
-        shapes = diagnostics.setdefault("input_shapes", {})
-        shape_key = str((height, width))
-        shapes[shape_key] = shapes.get(shape_key, 0) + 1
-        manhattan = (height + width - 2) * DT_SCALE
-        diagnostics["max_grid_manhattan_upper_code"] = max(diagnostics.get("max_grid_manhattan_upper_code", 0), manhattan)
-        diagnostics["required_full_grid_logical_bits"] = max(diagnostics.get("required_full_grid_logical_bits", 0), (manhattan + 2).bit_length())
-        diagnostics["max_finite_representable"] = DT_FINITE_MAX / DT_SCALE
-        diagnostics[output + "_calls"] = diagnostics.get(output + "_calls", 0) + 1
-        if output == "threshold":
-            diagnostics["last_threshold_code"] = threshold_code
-            diagnostics["max_threshold_state_bits"] = max(diagnostics.get("max_threshold_state_bits", 0), max(1, threshold_code.bit_length()))
-            diagnostics["threshold_state_semantics"] = "min(distance_code, threshold_code); intentional truncation"
-    if threshold_code == 0:
-        if diagnostics is not None:
-            diagnostics["predicate_true_pixels"] = diagnostics.get("predicate_true_pixels", 0) + source.size
-        return np.ones(source.shape, dtype=bool)
-    if not np.any(source == 0):
-        if diagnostics is not None:
-            diagnostics["all_foreground_calls"] = diagnostics.get("all_foreground_calls", 0) + 1
-        if output == "threshold":
-            if diagnostics is not None:
-                diagnostics["predicate_true_pixels"] = diagnostics.get("predicate_true_pixels", 0) + source.size
-            return np.ones(source.shape, dtype=bool)
-        if output == "peak":
-            if valid_mask is None:
-                return (0, 0), float(np.finfo(np.float32).max)
-            positions = np.flatnonzero(valid_mask)
-            if not len(positions):
-                return (-1, -1), 0.0
-            y, x = divmod(int(positions[0]), width)
-            return (x, y), float(np.finfo(np.float32).max)
-        if output == "codes":
-            if workspace is not None:
-                state = workspace.reset(source.shape, DT_INFINITY)
-                return state[2:height + 2, 2:width + 2]
-            return np.full(source.shape, DT_INFINITY, np.uint16)
-        return np.full(source.shape, np.finfo(np.float32).max, np.float32)
-
-    infinity = DT_INFINITY
-    finite_max = DT_FINITE_MAX if threshold_code is None else threshold_code
-    big = 1 << 29  # Scratch sentinel, never stored as uint16.
-    initial = infinity if threshold_code is None else threshold_code
-    state = (np.full((height + 4, width + 4), initial, dtype=np.uint16)
-             if workspace is None else workspace.reset(source.shape, initial))
-    state[2:height + 2, 2:width + 2][source == 0] = 0
-    offsets = np.arange(width, dtype=np.int32) * DT_SCALE
-    work = np.empty(width, dtype=np.int32)
-    saturation_events = 0
-    max_preclip = 0
-    peak_code, peak_location = -1, (-1, -1)
-    final_capped = final_unreachable = observed_max = 0
-
-    def read_row(index):
-        row = state[index].astype(np.int32)
-        row[row == infinity] = big
-        return row
-
-    def sweep(y, direction):
-        nonlocal saturation_events, max_preclip
-        base = state[y, 2:width + 2].astype(np.int32)
-        base[base == infinity] = big
-        near = read_row(y - direction)
-        far = read_row(y - 2 * direction)
-        for values, weight in ((near[2:width + 2], DT_AXIAL_WEIGHT),
-                               (near[1:width + 1], DT_DIAGONAL_WEIGHT), (near[3:width + 3], DT_DIAGONAL_WEIGHT),
-                               (near[:width], DT_KNIGHT_WEIGHT), (near[4:width + 4], DT_KNIGHT_WEIGHT),
-                               (far[1:width + 1], DT_KNIGHT_WEIGHT), (far[3:width + 3], DT_KNIGHT_WEIGHT)):
-            np.add(values, weight, out=work)
-            np.minimum(base, work, out=base)
-        ordered = base if direction == 1 else base[::-1]
-        ordered -= offsets
-        np.minimum.accumulate(ordered, out=ordered)
-        ordered += offsets
-        finite = base < big
-        if diagnostics is not None:
-            saturation_events += int(np.count_nonzero(finite & (base > finite_max)))
-            max_preclip = max(max_preclip, int(np.max(base[finite], initial=0)))
-        np.minimum(base, finite_max, out=base)
-        base[~finite] = infinity
-        state[y, 2:width + 2] = base
-
-    for y in range(2, height + 2):
-        sweep(y, 1)
-    for y in range(height + 1, 1, -1):
-        sweep(y, -1)
-        if output == "peak":
-            row = state[y, 2:width + 2]
-            final_capped += int(np.count_nonzero(row == finite_max))
-            final_unreachable += int(np.count_nonzero(row == infinity))
-            observed_max = max(observed_max, int(np.max(row[row != infinity], initial=0)))
-            valid = None if valid_mask is None else np.asarray(valid_mask[y - 2]) != 0
-            if valid is not None and not np.any(valid):
-                continue
-            values = row if valid is None else np.where(valid, row.astype(np.int32), -1)
-            x = int(np.argmax(values))
-            value = int(values[x])
-            # Backward traversal visits later rows first. Equality must select
-            # the earlier row, matching minMaxLoc's first row-major maximum.
-            if value >= peak_code:
-                peak_code, peak_location = value, (x, y - 2)
-    core = state[2:height + 2, 2:width + 2]
-    if output == "threshold":
-        predicate = core >= threshold_code
-        if diagnostics is not None:
-            diagnostics["intentional_threshold_clipped_updates"] = diagnostics.get("intentional_threshold_clipped_updates", 0) + saturation_events
-            diagnostics["predicate_true_pixels"] = diagnostics.get("predicate_true_pixels", 0) + int(np.count_nonzero(predicate))
-        return predicate
-    capped = final_capped if output == "peak" else int(np.count_nonzero(core == finite_max))
-    unreachable = final_unreachable if output == "peak" else int(np.count_nonzero(core == infinity))
-    if diagnostics is not None:
-        for key, value in (("saturated_scan_updates", saturation_events),
-                           ("final_at_finite_cap_pixels", capped),
-                           ("unreachable_final_pixels", unreachable)):
-            diagnostics[key] = diagnostics.get(key, 0) + value
-        diagnostics["max_preclip_code"] = max(diagnostics.get("max_preclip_code", 0), max_preclip)
-        maximum = observed_max if output == "peak" else int(np.max(core[core != infinity], initial=0))
-        diagnostics["max_observed_finite_code"] = max(diagnostics.get("max_observed_finite_code", 0), maximum)
-        diagnostics["max_observed_finite_distance"] = diagnostics["max_observed_finite_code"] / DT_SCALE
-    if capped or unreachable:
-        raise ValueError(f"Distance outside configured Q{DT_FRACTION_BITS}/{DT_WORD_BITS}-bit range "
-                         f"({DT_FINITE_MAX / DT_SCALE:g} px); capped={capped}, unreachable={unreachable}")
-    if output == "peak":
-        return peak_location, max(0, peak_code) / DT_SCALE
-    if output == "codes":
-        # Borrow the bounded integer state. Consumers scale isolated samples
-        # or thresholds, never allocate a second floating-point distance map.
-        return core
-    result = core.astype(np.float32)
-    result *= np.float32(1.0 / DT_SCALE)
-    return result
+PALM_CANDIDATE_CAPACITY = 33
+PALM_SEED_COLUMN_STRIDE = 8
+PALM_SCORE_INFINITY = 2047
+PALM_SCORE_SCALE = 4
 
 
 PALM_MIN_RADIUS_PX = 8
@@ -434,18 +212,29 @@ def _active_rect(shape_hw, state):
 
 
 def segment_foreground(frame, state):
-    """8-bit fixed-coefficient luminance and one fixed threshold on black background.
+    """Exact BGR8 threshold with row-local unsigned arithmetic, no gray plane.
 
-    The host uses OpenCV's integer BGR-to-gray conversion. RTL can implement
-    its fixed coefficients with constant arithmetic; no color histogram,
-    adaptive skin box, background bitmap or per-frame calibration is used.
+    OpenCV's 15-bit integer gray is (3735*B+19235*G+9798*R+16384)>>15.
+    Comparing gray >=40 is exactly weighted_sum >=1294336 for every BGR8
+    value. The sum is at most 8355840 (23 unsigned bits). Host uint32
+    preserves the integer contract; RTL can use constant shifts/adds and
+    compare directly while the pixel arrives. Only the binary output frame
+    is kept. This removes a Python gray image, not necessarily a RAM from
+    an RTL design whose gray conversion already streams pixel by pixel.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    mask = cv2.inRange(gray, FOREGROUND_MIN_GRAY, 255)
+    mask = np.empty(frame.shape[:2], dtype=np.uint8)
+    threshold = FOREGROUND_MIN_GRAY * 32768 - 16384
+    for y, row in enumerate(frame):
+        weighted = row[:, 0].astype(np.uint32) * 3735
+        weighted += row[:, 1].astype(np.uint32) * 19235
+        weighted += row[:, 2].astype(np.uint32) * 9798
+        mask[y] = (weighted >= threshold).astype(np.uint8) * 255
     state.flags['segment_stats'] = {'method': 'fixed_black_luminance',
                                   'active_area': int(mask.size)}
     return mask
 
+
+ENTRY_SCAN_ROUNDS = 2
 
 HOLE_SCAN_ROUNDS = 2
 
@@ -486,37 +275,197 @@ def _fill_internal_holes(binary, *, inplace=False):
 
 
 def clean_mask(mask, state):
-    """Fixed 3x3 opening, one component filter, then bounded binary hole fill.
+    """Bounded binary reachability from the longest right entry interval.
 
-    The binary component filter is required to remove disconnected bright
-    board-edge fragments before wrist and palm-width measurements. Its
-    relative threshold is integer ceil(largest/4); absolute threshold is
-    ceil(45000/500). Areas fit 16 unsigned bits for this fixed crop.
+    The state needs two logical bits (background, unvisited, retained).
+    This is a multi-pass frame algorithm, not a one-pass pixel stream.
+    Eight-neighbour connectivity matches the original CCL convention.
     """
-    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _OPEN_KERNEL)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
-    largest = int(stats[1:, cv2.CC_STAT_AREA].max()) if count > 1 else 0
-    minimum = max(1, (CROP_WIDTH*CROP_HEIGHT + 499)//500, (largest + 3)//4)
-    lookup = np.zeros(count, np.uint8)
-    if count > 1:
-        lookup[1:] = (stats[1:, cv2.CC_STAT_AREA] >= minimum).astype(np.uint8)*255
-    kept = int(np.count_nonzero(lookup))
-    state.flags['segment_stats'].update(kept_components=kept,
-                                        min_area_used=minimum)
-    cleaned = lookup[labels]
-    del opened, labels
-    return _fill_internal_holes(cleaned, inplace=True) if kept else cleaned
+    state.entry_section = None
+    work = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _OPEN_KERNEL)
+    # A genuine inlet must contain an existing minimum wrist-height run.
+    # Per-column run length fits uint8 because the native height is 180.
+    # RTL can update these 250 counters while the opening stage emits.
+    column = -1
+    run_lengths = np.zeros(work.shape[1], dtype=np.uint8)
+    for row in work:
+        foreground = row != 0
+        run_lengths[foreground] += np.uint8(1)
+        run_lengths[~foreground] = 0
+        eligible = np.flatnonzero(run_lengths >= RECOG_WRIST_MIN_PIXELS)
+        if eligible.size:
+            column = max(column, int(eligible[-1]))
+    del run_lengths
+    minimum = max(1, (CROP_WIDTH*CROP_HEIGHT + 499)//500)
+    if column < 0:
+        work.fill(0)
+        state.flags['segment_stats'].update(kept_components=0, min_area_used=minimum)
+        return work
+    active = work[:, column] != 0
+    changes = np.diff(np.concatenate(([False], active, [False])).astype(np.int8))
+    starts, ends = np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)
+    best = int(np.argmax(ends-starts))
+    if int(ends[best]-starts[best]) < RECOG_WRIST_MIN_PIXELS:
+        work.fill(0)
+        state.flags['segment_stats'].update(kept_components=0, min_area_used=minimum)
+        return work
+    entry_section = (int(column), int(starts[best] + ends[best] - 1))
+    work[starts[best]:ends[best], column] = 1
+    height, width = work.shape
+    for _ in range(ENTRY_SCAN_ROUNDS):
+        for direction in (1, -1):
+            rows = range(height) if direction == 1 else range(height-1, -1, -1)
+            for y in rows:
+                row = work[y]
+                foreground = row != 0
+                starts_run = foreground & np.concatenate((np.ones(1, dtype=bool), ~foreground[:-1]))
+                indices = np.flatnonzero(starts_run)
+                if indices.size == 0:
+                    continue
+                seeds = row == 1
+                previous = y-direction
+                if 0 <= previous < height:
+                    near = work[previous] == 1
+                    seeds |= near
+                    seeds[1:] |= near[:-1]
+                    seeds[:-1] |= near[1:]
+                seeds &= foreground
+                active = np.concatenate((np.zeros(1, dtype=bool), np.maximum.reduceat(seeds, indices)))
+                run_ids = np.cumsum(starts_run, dtype=np.uint8)
+                row[foreground & active[run_ids]] = 1
+    retained = 0
+    for row in work:
+        retained += int(np.count_nonzero(row == 1))
+        row[:] = np.where(row == 1, 255, 0)
+    kept = int(retained >= minimum)
+    if kept:
+        state.entry_section = entry_section
+    else:
+        work.fill(0)
+    state.flags['segment_stats'].update(kept_components=kept, min_area_used=minimum)
+    return _fill_internal_holes(work, inplace=True) if kept else work
 
 
-def _estimate_palm_robust(mask, *, workspace=None):
-    """Fixed 7x7 palm-only closing followed by the existing Q2 peak scan.
+def _palm_seed_candidates(work, candidates):
+    """Emit at most 33 integer seeds; no 250-column run/midpoint table.
 
-    Closing does not change the silhouette used for finger geometry. The
-    window is fixed: no image-area square root or variable-sized kernel.
+    Columns 0,8,...,248 and 249 are the fixed sampling schedule. A column's
+    longest foreground run contributes its midpoint, first run wins ties.
+    Remember only the first occupied column as fallback if every scheduled
+    column is empty. RTL reads the existing binary bank column by column;
+    only current-run/best-run counters and one fallback point are required.
+    Host column temporaries are bounded by height 180, not frame area.
     """
-    work = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _PALM_CLOSE_KERNEL)
-    location, radius = _distance_transform_fixed(work, output='peak', workspace=workspace)
-    return location, radius
+    height, width = work.shape
+    count = 0
+    fallback = None
+    for x in range(width):
+        selected = x % PALM_SEED_COLUMN_STRIDE == 0 or x == width - 1
+        if not selected and fallback is not None:
+            continue
+        active = work[:, x] != 0
+        changes = np.diff(np.concatenate(([False], active, [False])).astype(np.int8))
+        starts, ends = np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)
+        if starts.size == 0:
+            continue
+        k = int(np.argmax(ends - starts))
+        point = (x, (int(starts[k]) + int(ends[k]) - 1) // 2)
+        if fallback is None:
+            fallback = point
+        if selected:
+            if count >= PALM_CANDIDATE_CAPACITY:
+                raise ValueError("palm candidate capacity exceeded")
+            candidates[count] = point
+            count += 1
+    if count == 0 and fallback is not None:
+        candidates[0] = fallback
+        count = 1
+    return count
+
+
+def _palm_score_candidates(work, candidates, count, scores):
+    """One row scan updates <=33 candidate scores with Q2 chamfer distance.
+
+    Generate background pixels adjacent to foreground with a three-row
+    window. Discard each row after scoring; never create an HxW boundary
+    bitmap or a frame-length bx/by coordinate list. The NumPy vector below
+    is bounded by 33 and represents one shared RTL arithmetic lane iterated
+    over candidate RAM, NOT 33 required parallel lanes. Each update is
+    abs/subtract, min/max, shifts/add, and a min-score comparison.
+
+    Native coordinates fit uint8; refinement coordinates use signed 9 bits
+    (host int16). Valid coordinate differences are <=249/179 and score
+    <=1354, fitting unsigned 11 bits. 2047 means no in-frame background;
+    out-of-frame pixels are NOT invented as background. Candidate validity
+    is encoded as score zero; no per-frame validity plane is needed.
+    Hardware needs at most two previous binary rows plus the current row,
+    a 33-entry position/score table, and the existing palm work frame.
+    """
+    height, width = work.shape
+    points = candidates[:count]
+    values = scores[:count]
+    values.fill(PALM_SCORE_INFINITY)
+    for index, (raw_x, raw_y) in enumerate(points):
+        x, y = int(raw_x), int(raw_y)
+        if not (0 <= x < width and 0 <= y < height) or not work[y, x]:
+            values[index] = 0
+    for y in range(height):
+        near = np.zeros(width, dtype=np.bool_)
+        for yy in range(max(0, y - 1), min(height, y + 2)):
+            occupied = work[yy] != 0
+            near |= occupied
+            near[1:] |= occupied[:-1]
+            near[:-1] |= occupied[1:]
+        near &= work[y] == 0
+        for raw_x in np.flatnonzero(near):
+            dx = np.abs(points[:, 0] - np.int16(raw_x))
+            dy = np.abs(points[:, 1] - np.int16(y))
+            distance = (np.maximum(dx, dy) << 2) + (np.minimum(dx, dy) << 1)
+            np.minimum(values, distance, out=values, casting='unsafe')
+
+
+def _palm_from_boundary_rows(work):
+    """Fixed three boundary passes: <=33 seeds, nine stride-2, nine stride-1.
+
+    One reusable table: 33x(2 int16 coordinates + uint16 score) = 198 host
+    bytes; hardware payload is 33x(9+9+11)=957 logical bits, reducible
+    to 891 bits with invalid refinements rejected before uint8 storage.
+    No retained table of every column run or every boundary coordinate.
+    Equal scores prefer smaller y then smaller x, matching the reference.
+    This is bounded multipass processing, not a one-pass pixel pipeline.
+    """
+    if work.shape != (CROP_HEIGHT, CROP_WIDTH):
+        raise ValueError("palm input must be the fixed 180x250 mask")
+    candidates = np.empty((PALM_CANDIDATE_CAPACITY, 2), dtype=np.int16)
+    scores = np.empty(PALM_CANDIDATE_CAPACITY, dtype=np.uint16)
+    count = _palm_seed_candidates(work, candidates)
+    if count == 0:
+        return (0, 0), 0.0
+    best_value, best_point = -1, (0, 0)
+    for phase in range(3):
+        if phase:
+            stride = 2 if phase == 1 else 1
+            cx, cy = best_point
+            count = 0
+            for dy in (-stride, 0, stride):
+                for dx in (-stride, 0, stride):
+                    candidates[count] = cx + dx, cy + dy
+                    count += 1
+        _palm_score_candidates(work, candidates, count, scores)
+        for index in range(count):
+            x, y = map(int, candidates[index])
+            value = int(scores[index])
+            if value > best_value or (value == best_value and
+                                     (y, x) < (best_point[1], best_point[0])):
+                best_value, best_point = value, (x, y)
+    return best_point, best_value / PALM_SCORE_SCALE
+
+
+def _estimate_palm_robust(mask):
+    work=mask.copy()
+    for _ in range(3):cv2.dilate(work,_PALM_CLOSE_KERNEL,dst=work,iterations=1)
+    for _ in range(3):cv2.erode(work,_PALM_CLOSE_KERNEL,dst=work,iterations=1)
+    return _palm_from_boundary_rows(work)
 
 
 def _to_local_points(points, origin, up, scale) -> np.ndarray:
@@ -621,93 +570,21 @@ def _circular_window_extrema(values, half_window):
     return (minima, maxima)
 
 
-def _sample_plane(plane: np.ndarray, point: np.ndarray) -> float:
-    """取某个浮点坐标处的像素值（就近取整，越界夹回）。"""
-    height, width = plane.shape[:2]
-    x = int(np.clip(round(float(point[0])), 0, width - 1))
-    y = int(np.clip(round(float(point[1])), 0, height - 1))
-    return float(plane[y, x])
+def _estimate_wrist(mask, palm_center, radius, entry_section=None):
+    """Reuse the accepted inlet computed by cleaning; no second pixel scan.
 
-
-def _protrusion_length(thickness: np.ndarray, tip_point, palm_center, radius: float) -> float:
-    """量"这根东西从指尖凸出来了多长"，按 R 归一化。
-
-    做法：从指尖沿直线朝掌心走，一路采样内部距离变换的厚度值，
-    找到**第一个"厚度 >= RECOG_TIP_PALM_THICK * R"** 的位置 —— 那里就算
-    已经进入掌区了。指尖到那里的距离就是凸出长度。
-
-    为什么需要它：真手指（哪怕小指这种很短的）都是一条**细长凸出**，
-    而拳头的指节凸起是**圆钝鼓包** —— 一出指尖厚度就上去了。
-    这个量是尺度无关的（按 R 归一化），而且语义正好就是"手指伸出来多少"。
+    Entry state is one 8-bit column, one 9-bit doubled vertical midpoint,
+    and one validity bit in a hardware implementation.
+    The section must be rightward and sufficiently separated from the palm.
+    Direction remains measured from the palm and this section, not fixed.
     """
-    tip = np.asarray(tip_point, dtype=np.float64).reshape(2)
-    palm = np.asarray(palm_center, dtype=np.float64).reshape(2)
-    total = float(np.linalg.norm(palm - tip))
-    if total < 1e-06:
-        return 0.0
-    steps = int(np.clip(total, 8, 400))
-    fractions = np.linspace(0.0, 1.0, steps)
-    xs = tip[0] + (palm[0] - tip[0]) * fractions
-    ys = tip[1] + (palm[1] - tip[1]) * fractions
-    height, width = thickness.shape[:2]
-    xi = np.clip(np.round(xs).astype(np.int32), 0, width - 1)
-    yi = np.clip(np.round(ys).astype(np.int32), 0, height - 1)
-    values = thickness[yi, xi]
-    threshold_code = int(np.ceil(float(np.float32(float(RECOG_TIP_PALM_THICK) * float(radius))) * DT_SCALE))
-    hit = np.nonzero((values == DT_INFINITY) | (values >= threshold_code))[0]
-    if hit.size == 0:
-        return total / float(radius)
-    return float(fractions[int(hit[0])]) * total / float(radius)
-
-
-def _right_entry_wrist(mask, palm_center, radius, column):
-    """Use a visible right-entry section only when no wrist valley is available.
-
-    One column's longest foreground run rejects separated border fragments.
-    A quarter-radius minimum baseline avoids amplifying a nearly coincident
-    palm/section pair. This is point arithmetic; no image is rotated.
-    """
-    cx, cy = float(palm_center[0]), float(palm_center[1])
+    if entry_section is None:
+        return None
+    column, middle_twice = entry_section
+    cx = float(palm_center[0])
     if column <= cx or 4 * (column - cx) < float(radius):
         return None
-    occupied = mask[:, column] != 0
-    changes = np.diff(np.r_[False, occupied, False].astype(np.int8))
-    starts, ends = np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)
-    if not starts.size:
-        return None
-    widths = ends - starts
-    chosen = int(np.argmax(widths))
-    if int(widths[chosen]) < int(RECOG_WRIST_MIN_PIXELS):
-        return None
-    middle = 0.5 * float(starts[chosen] + ends[chosen] - 1)
-    return np.array([float(column), middle], dtype=np.float64)
-
-
-def _estimate_wrist(mask, palm_center, radius):
-    """Measure column heights to the right of the palm; no image transpose."""
-    column_heights = np.count_nonzero(mask, axis=0)
-    columns = np.flatnonzero(column_heights)
-    if not columns.size:
-        return None
-    last = int(columns[-1])
-    cx = int(round(float(palm_center[0])))
-    start = min(last, cx + int(round(0.8 * float(radius))))
-    if last - start < 3:
-        return _right_entry_wrist(mask, palm_center, radius, last)
-    segment = column_heights[start:last + 1].astype(np.float32)
-    kernel = max(3, int(round(0.2 * float(radius))) | 1)
-    smoothed = cv2.blur(segment.reshape(-1, 1), (1, kernel)).ravel()
-    peak = float(smoothed.max())
-    if peak <= 0:
-        return None
-    left = np.r_[smoothed[0], smoothed[:-1]]
-    right = np.r_[smoothed[1:], smoothed[-1]]
-    candidates = np.flatnonzero((smoothed <= left) & (smoothed <= right) & (smoothed < 0.88 * peak))
-    column = start + (int(candidates[0]) if candidates.size else int(np.argmin(smoothed)))
-    ys = np.flatnonzero(mask[:, column])
-    if ys.size < int(RECOG_WRIST_MIN_PIXELS) or column <= palm_center[0]:
-        return _right_entry_wrist(mask, palm_center, radius, last)
-    return np.array([float(column), 0.5 * float(ys.min() + ys.max())], dtype=np.float64)
+    return np.array([float(column), 0.5 * float(middle_twice)], dtype=np.float64)
 
 
 def _truncate_forearm(mask: np.ndarray, palm_center, up, radius: float) -> np.ndarray:
@@ -734,13 +611,52 @@ def _truncate_forearm(mask: np.ndarray, palm_center, up, radius: float) -> np.nd
     return result
 
 
+def _first_contour_occurrence(points, index):
+    """Preserve first-occurrence ties using two shared equality comparators.
+
+    The contour producer can repeat a coordinate on a thin bridge. Measuring
+    the later visit changes its two local sides, so raw indices are not safe.
+    Scan the earlier coordinates without a coordinate table or squared-distance
+    nearest-point datapath. The canonical index then travels with the candidate.
+    """
+    x, y = points[index]
+    for earlier in range(index):
+        if points[earlier, 0] == x and points[earlier, 1] == y:
+            return earlier
+    return index
+
+
+from functools import cmp_to_key
+
+def _compare_tip_polar(a, b, palm_center):
+    # atan2 ascending order, finite vectors; signed-zero axes included for
+    # Python-reference compatibility. RTL signed integers have no -0.
+    def region(v):
+        x, y = v
+        if y < 0: return 0
+        if y > 0: return 2
+        if x < 0 or (x == 0 and np.signbit(x)):
+            return -1 if np.signbit(y) else 3
+        return 1
+    x1, y1 = a['local']; x2, y2 = b['local']
+    r1, r2 = region((x1,y1)), region((x2,y2))
+    if r1 != r2: return -1 if r1 < r2 else 1
+    # The local point transform has positive determinant. Within the same
+    # half-plane, integer pixel cross preserves angular order without a
+    # normalized floating product. Native offsets fit signed9; conservatively
+    # use signed19 for the two products and their difference in RTL.
+    cx, cy = map(int, palm_center)
+    x1, y1 = int(a['point'][0]) - cx, int(a['point'][1]) - cy
+    x2, y2 = int(b['point'][0]) - cx, int(b['point'][1]) - cy
+    cross = x1*y2-y1*x2
+    return -1 if cross > 0 else (1 if cross < 0 else 0)
+
 def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up,
-                       *, closed_candidates=None, measurement_context=None,
-                       workspace=None):
+                       *, measurement_context=None):
     """在轮廓上找指尖。返回（候选列表, 距离剖面）。
 
     判据（全部按 R 归一化）：
-      1. 到掌心的距离 >= 1.25R
+      1. 到掌心的距离 >= 1.0R（RECOG_TIP_MIN_DISTANCE）
       2. 是该距离剖面的**局部极大**（环形邻域窗口）
       3. **突出度**足够（极大值要比邻域低谷高出 >= 0.2R）
       4. 形态要"尖"：转折比够大，或夹角够小
@@ -767,19 +683,22 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
     candidate_indices = np.nonzero(keep)[0]
     if candidate_indices.size == 0:
         return [], distances
+    if candidate_indices.size > FG.MAX_RAW_CANDIDATES:
+        raise FG.GeometryCapacityError("raw_candidate_capacity_exceeded", candidate_indices.size, FG.MAX_RAW_CANDIDATES)
 
     # 剩下少数候选才算形态和厚度（贵的那部分）
-    thickness = _distance_transform_fixed(mask, output="codes", workspace=workspace)
+    # Tip measurements consume contour geometry; no distance plane is used.
     candidates = []
     for raw_index in candidate_indices:
         index = int(raw_index)
+        contour_index = _first_contour_occurrence(points, index)
         flat_turn, too_flat, too_sharp = _tip_shape_tests(contour, index, window)
-        inner = points[index] + (np.asarray(palm_center) - points[index]) * \
-            float(RECOG_TIP_THICKNESS_SAMPLE)
-        sample_code = _sample_plane(thickness, inner)
-        sample_pixels = (float(np.finfo(np.float32).max) if sample_code == DT_INFINITY
-                         else sample_code / DT_SCALE)
-        thickness_ratio = sample_pixels / float(radius)
+        feature = FG._measure_tip(contour, points[index],
+                                  np.asarray(palm_center, dtype=float),
+                                  np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG,
+                                  contour_index=contour_index,
+                                  measurement_context=measurement_context)
+        thickness_ratio = 0.5 * feature["width_r"]
         if flat_turn and \
                 thickness_ratio > RECOG_TIP_THICKNESS_MAX:
             continue
@@ -793,7 +712,7 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
             shaft = FG._measure_tip(contour, points[index],
                                     np.asarray(palm_center, dtype=float),
                                     np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG,
-                                    measurement_context=measurement_context)
+                                    contour_index=contour_index, measurement_context=measurement_context)
             if not (shaft["width_r"] >= 2.0 * RECOG_TIP_MIN_THICKNESS and
                     shaft["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r and
                     shaft["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max and
@@ -802,12 +721,20 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
                 continue
         # ★主力判据：凸出长度。真手指是细长凸出，指节凸起是圆钝鼓包。
         #   这一条同时管住了两头 —— 既排掉拳头的指节凸起，又保住很短的小指。
-        protrusion = _protrusion_length(thickness, points[index], palm_center, radius)
-        closed = protrusion < float(RECOG_TIP_PROTRUSION_MIN)
-        if closed and closed_candidates is None:
-            continue
+        protrusion = feature["length_r"]
+        # A finger crossing the fixed crop boundary has a censored cap: its
+        # two contour sides join along the crop edge, underestimating branch
+        # length. Reuse the measured shaft extent rather than a DT fallback.
+        # The inlet/right edge is excluded; wrist-side filtering already ran.
+        tip_x, tip_y = points[index]
+        clipped_cap = (tip_x == 0 or tip_y == 0 or tip_y == mask.shape[0] - 1)
+        censored_shaft = (clipped_cap and feature["extended"] and
+                          feature["has_branch_extent"] and
+                          feature["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r)
+        closed = protrusion < float(RECOG_TIP_PROTRUSION_MIN) and not censored_shaft
         candidates.append({
             "closed_support": closed,
+            "contour_index": contour_index,
             "point": points[index].copy(),
             "local": (float(local_points[index, 0]), float(local_points[index, 1])),
             "distance": float(distances[index]),
@@ -829,44 +756,37 @@ def _detect_fingertips(contour, mask: np.ndarray, palm_center, radius: float, up
             merged.append(item)
             if len(merged) >= int(RECOG_TIP_MAX_COUNT):
                 break
-        merged.sort(key=lambda item: float(np.arctan2(item["local"][1], item["local"][0])))
+        merged.sort(key=cmp_to_key(lambda a, b: _compare_tip_polar(a, b, palm_center)))
         return merged
 
     strong = merge([item for item in candidates if not item["closed_support"]])
-    if closed_candidates is not None:
-        caps = [item for item in merge(candidates) if item["closed_support"]]
-        promoted, remaining = [], []
-        for cap in caps:
-            # The mixed candidate merge can prefer a farther closed cap over
-            # a nearby strong tip. Keep the strong observation and avoid
-            # counting that same local contour cap again after promotion.
-            if any(float(np.linalg.norm(cap["point"] - tip["point"])) <
-                   RECOG_TIP_DEDUP * float(radius) for tip in strong):
-                continue
-            feature = FG._measure_tip(contour, np.asarray(cap["point"], dtype=float),
-                                      np.asarray(palm_center, dtype=float),
-                                      np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG,
-                                      measurement_context=measurement_context)
-            # Radial reach can underestimate a spread little finger. Require
-            # a real narrow shaft spanning the full existing axis window;
-            # aspect alone would also accept a tiny, needle-like mask burr.
-            if (feature["extended"] and feature["has_branch_extent"] and
-                    feature["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r and
-                    (feature["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max or
-                     FG._is_lateral_thumb_branch(
-                         feature, np.asarray(palm_center, dtype=float),
-                         np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG))):
-                promoted.append(dict(cap, closed_support=False,
-                                     promotion="contour_shaft_extent"))
-            else:
-                remaining.append(cap)
-        if len(strong) + len(promoted) <= 5:
-            strong.extend(promoted)
-            strong.sort(key=lambda item: float(np.arctan2(item["local"][1], item["local"][0])))
-            closed_candidates.extend(remaining)
-        else:
-            # Conflicting evidence cannot introduce more anatomical fingers.
-            closed_candidates.extend(caps)
+    caps = [item for item in merge(candidates) if item["closed_support"]]
+    promoted = []
+    for cap in caps:
+        # The mixed candidate merge can prefer a farther closed cap over
+        # a nearby strong tip. Keep the strong observation and avoid
+        # counting that same local contour cap again after promotion.
+        if any(float(np.linalg.norm(cap["point"] - tip["point"])) <
+               RECOG_TIP_DEDUP * float(radius) for tip in strong):
+            continue
+        feature = FG._measure_tip(contour, np.asarray(cap["point"], dtype=float),
+                                  np.asarray(palm_center, dtype=float),
+                                  np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG,
+                                  contour_index=cap["contour_index"], measurement_context=measurement_context)
+        # Radial reach can underestimate a spread little finger. Require
+        # a real narrow shaft spanning the full existing axis window;
+        # aspect alone would also accept a tiny, needle-like mask burr.
+        if (feature["extended"] and feature["has_branch_extent"] and
+                feature["length_r"] >= FG.DEFAULT_CONFIG.axis_end_r and
+                (feature["aspect"] >= FG.DEFAULT_CONFIG.curled_aspect_max or
+                 FG._is_lateral_thumb_branch(
+                     feature, np.asarray(palm_center, dtype=float),
+                     np.asarray(up, dtype=float), radius, FG.DEFAULT_CONFIG))):
+            promoted.append(dict(cap, closed_support=False,
+                                 promotion="contour_shaft_extent"))
+    if len(strong) + len(promoted) <= 5:
+        strong.extend(promoted)
+        strong.sort(key=cmp_to_key(lambda a, b: _compare_tip_polar(a, b, palm_center)))
     return strong, distances
 
 
@@ -981,11 +901,10 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
     if mask is None or int(np.count_nonzero(mask)) == 0:
         return None
     segment_stats = state.flags.get("segment_stats") or {}
-    workspace = getattr(state, "dt_workspace", None)
     palm_center = segment_stats.get("palm_center")
     radius = segment_stats.get("palm_radius")
     if palm_center is None or not radius:
-        palm_center, radius = _estimate_palm_robust(mask, workspace=workspace)
+        palm_center, radius = _estimate_palm_robust(mask)
         if float(radius) < float(PALM_MIN_RADIUS_PX):
             return None
     palm_center = np.array([float(palm_center[0]), float(palm_center[1])], dtype=np.float64)
@@ -996,7 +915,7 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
     if not np.isfinite(radius) or radius > (mask.shape[0] - 1) + (mask.shape[1] - 1):
         state.flags["geometry_rejected"] = "invalid_palm_radius"
         return None
-    wrist = _estimate_wrist(mask, palm_center, radius)
+    wrist = _estimate_wrist(mask, palm_center, radius, getattr(state, "entry_section", None))
     if wrist is None:
         up = np.array([-1.0, 0.0], dtype=np.float64)
     else:
@@ -1013,13 +932,15 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
     contour = max(contours, key=cv2.contourArea)
     if int(contour.shape[0]) < 8:
         return None
-    closed_caps = []
+    if len(contour) > FG.MAX_CONTOUR_POINTS:
+        raise FG.GeometryCapacityError("contour_capacity_exceeded", len(contour), FG.MAX_CONTOUR_POINTS)
+    contour.setflags(write=False)
     # One immutable contour context is shared by collection and identification.
     # It is local to this frame and is never retained in RecognitionResult.
     measurement_context = FG.TipMeasurementContext(contour)
     tips, _profile = _detect_fingertips(
-        contour, hand, palm_center, radius, up, closed_candidates=closed_caps,
-        measurement_context=measurement_context, workspace=workspace
+        contour, hand, palm_center, radius, up,
+        measurement_context=measurement_context
     )
     # Main geometry does not consume webs, hull, span or display finger lines.
     # Webs and display finger lines are PC-only detailed-render diagnostics.
@@ -1046,7 +967,7 @@ def _recognize(mask: np.ndarray, state) -> Optional[dict]:
         "finger_count": len(tips),
     }
     states, extensions, angles_used, match_detail, expect_len = _finger_states(
-        hand, palm_center, up, radius, tips, gaps, contour=contour, closed_candidates=closed_caps,
+        hand, palm_center, up, radius, tips, gaps, contour=contour,
         measurement_context=measurement_context
     )
     if states is None:
@@ -1072,7 +993,6 @@ def _finger_states(
     tips,
     web_gaps=None,
     contour=None,
-    closed_candidates=None,
     measurement_context=None,
 ):
     """Return geometry-based states or an explicit unavailable result.
@@ -1085,7 +1005,7 @@ def _finger_states(
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         contour = max(contours, key=cv2.contourArea) if contours else None
     measured, geometry_failure = FG.recognize_fingers(
-        mask, contour, palm_center, up, radius, tips or [], closed_candidates=closed_candidates,
+        mask, contour, palm_center, up, radius, tips or [],
         measurement_context=measurement_context
     )
     if measured is not None:
@@ -1094,8 +1014,7 @@ def _finger_states(
         for feature in measured["features"]:
             slot = feature["slot"]
             extensions[slot] = feature["length_r"]
-            x, y = feature["tip_local"]
-            angles_used[slot] = float(np.degrees(np.arctan2(x, -y)))
+            # PC-only ray-angle diagnostics are filled during detailed rendering.
         measured["anchor"] = "local_finger_axis"
         return (measured["states"], extensions, angles_used, measured, [0.0] * 5)
     # Geometry failure is unavailable recognition, never a fabricated fist.
@@ -1537,12 +1456,18 @@ def recognize_cropped(frame):
     if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8 or frame.shape != (CROP_HEIGHT, CROP_WIDTH, 3):
         raise ValueError('Core input must be exactly 250x180 BGR uint8')
     started = perf_counter()
-    state = SimpleNamespace(flags={}, dt_workspace=DistanceWorkspace(frame.shape[:2]))
+    state = SimpleNamespace(flags={})
     mask = segment_foreground(frame, state)
     thresholded = perf_counter()
     mask = clean_mask(mask, state)
     cleaned = perf_counter()
-    result = _recognize(mask, state)
+    try:
+        result = _recognize(mask, state)
+    except FG.GeometryCapacityError as exc:
+        state.flags['geometry_rejected'] = exc.reason
+        state.flags['capacity_rejected'] = {'reason': exc.reason,
+                                          'actual': exc.actual, 'limit': exc.limit}
+        result = None
     finished = perf_counter()
     timings = {'segmentation': (thresholded-started)*1000,
                'cleanup': (cleaned-thresholded)*1000,
@@ -1582,6 +1507,11 @@ def _with_render_diagnostics(result):
     if result is None or not result.get("_diagnostics_pending"):
         return result
     result = dict(result)
+    angles = [0.0] * 5
+    for feature in result.get("finger_match", {}).get("features", []):
+        x,y = feature["tip_local"]
+        angles[feature["slot"]] = float(np.degrees(np.arctan2(x,-y)))
+    result["finger_ray_angles"] = angles
     contour, tips = result["contour"], result["tips"]
     palm_center, radius, up = result["palm_center"], result["palm_radius"], result["up"]
     gaps = _detect_gaps(contour, tips, palm_center, radius, up)
@@ -1632,4 +1562,6 @@ FOREGROUND_MIN_GRAY = 40
 _OPEN_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
-_PALM_CLOSE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
+
+_PALM_CLOSE_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
